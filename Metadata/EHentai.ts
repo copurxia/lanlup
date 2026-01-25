@@ -25,7 +25,7 @@ class EHentaiMetadataPlugin extends BasePlugin {
         { name: "search_gid", type: "bool", desc: "Search using gID from title (falls back to title)" },
         { name: "enablepanda", type: "bool", desc: "Use ExHentai (enable to search for fjorded content without star cookie)" },
         { name: "jpntitle", type: "bool", desc: "Save the original title when available instead of the English or romanised title" },
-        { name: "additionaltags", type: "bool", desc: "Fetch additional timestamp (time posted) and uploader metadata" },
+        { name: "additionaltags", type: "bool", desc: "Fetch additional updated_at (time posted) and uploader metadata" },
         { name: "expunged", type: "bool", desc: "Search only expunged galleries" },
         { name: "debug", type: "bool", desc: "Write verbose debug logs to data/logs/plugins.log" }
       ],
@@ -414,7 +414,8 @@ class EHentaiMetadataPlugin extends BasePlugin {
           tags.push(`uploader:${data.uploader}`);
         }
         if (data.posted) {
-          tags.push(`timestamp:${data.posted}`);
+          // Use updated_at namespace so the backend can map it to archives.updated_at.
+          tags.push(`updated_at:${data.posted}`);
         }
       }
 
