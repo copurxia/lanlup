@@ -107,7 +107,7 @@ class TwitterMetadataPlugin extends BasePlugin {
         success: true,
         data: {
           title,
-          description,
+          summary: description,
           tags: merged,
         },
       });
