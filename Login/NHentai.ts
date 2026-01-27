@@ -20,7 +20,7 @@ class NHentaiLoginPlugin extends BasePlugin {
         { name: "csrftoken", type: "string", desc: "csrftoken cookie (optional)" }
       ],
       permissions: ["net=nhentai.net"],
-      update_url: "https://git.copur.xyz/copur/lanlu/raw/branch/main/plugins/Login/NHentai.ts"
+      update_url: "https://git.copur.xyz/copur/lanlup/raw/branch/master/Login/NHentai.ts"
     };
   }
 

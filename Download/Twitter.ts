@@ -53,7 +53,7 @@ class TwitterDownloadPlugin extends BasePlugin {
         "net=registry.npmjs.org",
         "net=raw.githubusercontent.com",
       ],
-      update_url: "https://git.copur.xyz/copur/lanlu/raw/branch/main/plugins/Download/Twitter.ts",
+      update_url: "https://git.copur.xyz/copur/lanlup/raw/branch/master/Download/Twitter.ts",
     };
   }
 

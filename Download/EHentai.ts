@@ -30,7 +30,7 @@ class EHentaiDownloadPlugin extends BasePlugin {
       ],
       url_regex: "https?://e(-|x)hentai.org/g/.*/.*",
       permissions: ["net=e-hentai.org", "net=exhentai.org", "net=ehgt.org", "net=*.hath.network", "net=jsr.io"],
-      update_url: "https://git.copur.xyz/copur/lanlu/raw/branch/main/plugins/Download/EHentai.ts"
+      update_url: "https://git.copur.xyz/copur/lanlup/raw/branch/master/Download/EHentai.ts"
     };
   }
 

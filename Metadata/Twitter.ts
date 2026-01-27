@@ -35,7 +35,7 @@ class TwitterMetadataPlugin extends BasePlugin {
         "net=registry.npmjs.org",
         "net=raw.githubusercontent.com",
       ],
-      update_url: "https://git.copur.xyz/copur/lanlu/raw/branch/main/plugins/Metadata/Twitter.ts",
+      update_url: "https://git.copur.xyz/copur/lanlup/raw/branch/master/Metadata/Twitter.ts",
     };
   }
 

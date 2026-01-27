@@ -23,7 +23,7 @@ class EHentaiLoginPlugin extends BasePlugin {
         { name: "igneous", type: "string", desc: "igneous cookie(optional, if present you can view exhentai without Europe and America IP)" }
       ],
       permissions: ["net=exhentai.org", "net=e-hentai.org", "net=forums.e-hentai.org"],
-      update_url: "https://git.copur.xyz/copur/lanlu/raw/branch/main/plugins/Login/EHentai.ts"
+      update_url: "https://git.copur.xyz/copur/lanlup/raw/branch/master/Login/EHentai.ts"
     };
   }
 

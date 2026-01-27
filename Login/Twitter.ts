@@ -29,7 +29,7 @@ class TwitterLoginPlugin extends BasePlugin {
         { name: "ct0", type: "string", desc: "Optional csrf token cookie (ct0). Leave blank to auto-derive." },
       ],
       permissions: ["net=x.com"],
-      update_url: "https://git.copur.xyz/copur/lanlu/raw/branch/main/plugins/Login/Twitter.ts",
+      update_url: "https://git.copur.xyz/copur/lanlup/raw/branch/master/Login/Twitter.ts",
     };
   }
 

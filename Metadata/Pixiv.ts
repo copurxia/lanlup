@@ -130,7 +130,7 @@ class PixivMetadataPlugin extends BasePlugin {
       cooldown: 1,
       permissions: ["net=www.pixiv.net"],
       update_url:
-        "https://git.copur.xyz/copur/lanlu/raw/branch/main/plugins/Metadata/Pixiv.ts",
+        "https://git.copur.xyz/copur/lanlup/raw/branch/master/Metadata/Pixiv.ts",
     };
   }
 

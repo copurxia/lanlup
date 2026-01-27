@@ -69,7 +69,7 @@ class PixivDownloadPlugin extends BasePlugin {
       url_regex:
         'https?://(www\\.)?pixiv\\.net/(?:[a-z]{2}/)?artworks/\\d+.*|https?://(www\\.)?pixiv\\.net/member_illust\\.php\\?illust_id=\\d+.*',
       permissions: ['net=www.pixiv.net', 'net=i.pximg.net', 'net=*.pximg.net'],
-      update_url: 'https://git.copur.xyz/copur/lanlu/raw/branch/main/plugins/Download/Pixiv.ts',
+      update_url: 'https://git.copur.xyz/copur/lanlup/raw/branch/master/Download/Pixiv.ts',
     };
   }
 

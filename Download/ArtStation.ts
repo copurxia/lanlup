@@ -50,7 +50,7 @@ class ArtStationDownloadPlugin extends BasePlugin {
       ],
       url_regex: "https?://(www\\.artstation\\.com/[^/]+|[^/]+\\.artstation\\.com)/?.*",
       permissions: ["net"],  // Allow all network for FlareSolverr support
-      update_url: "https://git.copur.xyz/copur/lanlu/raw/branch/main/plugins/Download/ArtStation.ts"
+      update_url: "https://git.copur.xyz/copur/lanlup/raw/branch/master/Download/ArtStation.ts"
     };
   }
 

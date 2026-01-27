@@ -26,7 +26,7 @@ class PixivLoginPlugin extends BasePlugin {
         { name: 'device_token', type: 'string', desc: 'Optional device_token cookie value' },
       ],
       permissions: ['net=www.pixiv.net'],
-      update_url: 'https://git.copur.xyz/copur/lanlu/raw/branch/main/plugins/Login/Pixiv.ts',
+      update_url: 'https://git.copur.xyz/copur/lanlup/raw/branch/master/Login/Pixiv.ts',
     };
   }
 

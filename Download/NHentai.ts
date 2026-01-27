@@ -45,7 +45,7 @@ class NHentaiDownloadPlugin extends BasePlugin {
       parameters: [],
       url_regex: "https?://nhentai\\.net/g/\\d+/?",
       permissions: ["net=nhentai.net", "net=i1.nhentai.net", "net=i2.nhentai.net", "net=i3.nhentai.net", "net=i4.nhentai.net", "net=i5.nhentai.net", "net=i6.nhentai.net", "net=i7.nhentai.net"],
-      update_url: "https://git.copur.xyz/copur/lanlu/raw/branch/main/plugins/Download/NHentai.ts"
+      update_url: "https://git.copur.xyz/copur/lanlup/raw/branch/master/Download/NHentai.ts"
     };
   }
 
