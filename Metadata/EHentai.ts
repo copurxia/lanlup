@@ -138,6 +138,7 @@ class EHentaiMetadataPlugin extends BasePlugin {
     if (!gID) {
       // 搜索matching gallery
       const searchResult = await this.lookupGallery(
+        lrrInfo.archive_id,
         lrrInfo.archive_title,
         lrrInfo.existing_tags,
         lrrInfo.thumbnail_hash,
@@ -185,6 +186,7 @@ class EHentaiMetadataPlugin extends BasePlugin {
   }
 
   private async lookupGallery(
+    archiveId: string,
     title: string,
     tags: string,
     thumbhash: string,
@@ -197,18 +199,53 @@ class EHentaiMetadataPlugin extends BasePlugin {
     debug: boolean
   ): Promise<PluginResult> {
     try {
-      // 缩略图以图搜图（通过 upload.e-hentai.org 的 file search）
-      if (thumbhash && usethumbs) {
-        const thumbFile = await this.resolveThumbnailFilePath(thumbhash);
-        if (thumbFile) {
-          await this.dlog(debug, "lookup:file_search:start", { thumbhash: `${thumbhash.slice(0, 8)}…`, file: thumbFile });
-          const result = await this.fileSearchByUpload(thumbFile, cookies);
-          if (result.success) {
-            return result;
+      // Reverse image search (LANraragi-style):
+      // 1) Export cover from archive via host RPC and compute SHA-1 (original bytes)
+      // 2) Try EH `f_shash` search first (fast)
+      // 3) Fallback to uploading a JPEG (more compatible)
+      if (usethumbs && archiveId) {
+        try {
+          const cover = await this.callHost<{
+            archiveId: string;
+            entryName: string;
+            originalPath: string;
+            originalSha1: string;
+            uploadPath: string;
+            uploadSha1: string;
+          }>("archive.exportCoverForSearch", {
+            archiveId,
+            exportJpeg: true,
+            maxSide: 1280,
+            jpegQuality: 85
+          });
+
+          await this.dlog(debug, "lookup:cover_exported", {
+            archiveId,
+            entryName: cover.entryName,
+            originalSha1: cover.originalSha1 ? `${cover.originalSha1.slice(0, 8)}…` : "",
+            uploadPath: cover.uploadPath || ""
+          });
+
+          if (cover.originalSha1) {
+            const url = `${domain}?f_shash=${cover.originalSha1}&fs_similar=on&fs_covers=on`;
+            await this.dlog(debug, "lookup:shash_search:start", { sha1: `${cover.originalSha1.slice(0, 8)}…` });
+            const result = await this.ehentaiParse(url, cookies);
+            if (result.success) {
+              return result;
+            }
+            await this.dlog(debug, "lookup:shash_search:miss", { error: result.error || "unknown" });
           }
-          await this.logWarn("lookup:file_search:miss", { error: result.error || "unknown" });
-        } else {
-          await this.logWarn("lookup:file_search:no_thumb_file", { thumbhash: `${thumbhash.slice(0, 8)}…` });
+
+          if (cover.uploadPath) {
+            await this.dlog(debug, "lookup:file_upload_search:start", { file: cover.uploadPath });
+            const result = await this.fileSearchByUpload(cover.uploadPath, cookies);
+            if (result.success) {
+              return result;
+            }
+            await this.logWarn("lookup:file_upload_search:miss", { error: result.error || "unknown" });
+          }
+        } catch (e) {
+          await this.logWarn("lookup:cover_export_failed", { archiveId, error: e instanceof Error ? e.message : String(e) });
         }
       }
 
