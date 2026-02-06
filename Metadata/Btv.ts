@@ -52,6 +52,7 @@ type VolumeMeta = {
   title: string;
   summary: string;
   tags: string;
+  cover?: string;
   release_date?: string;
   isbn?: string;
   source_url: string;
@@ -106,7 +107,7 @@ class BtvMetadataPlugin extends BasePlugin {
       ],
       oneshot_arg: "Bangumi subject URL or subject id",
       cooldown: 1,
-      permissions: ["net=api.bgm.tv", "net=bangumi.tv"],
+      permissions: ["net=api.bgm.tv", "net=bangumi.tv","net=lain.bgm.tv"],
       update_url:
         "https://git.copur.xyz/copur/lanlup/raw/branch/master/Metadata/Btv.ts",
     };
@@ -163,6 +164,10 @@ class BtvMetadataPlugin extends BasePlugin {
 
       const primaryTitle = this.pickTitle(subject.name_cn, subject.name, preferNameCn) || String(subjectId);
       const summary = this.cleanSummary(subject.summary || "");
+      const seriesCover = await this.cacheCoverForResult(
+        this.collectCoverUrls(subject.images),
+        `series_${subjectId}`,
+      );
 
       this.reportProgress(100, "元数据获取完成");
       this.outputResult({
@@ -171,10 +176,12 @@ class BtvMetadataPlugin extends BasePlugin {
           title: primaryTitle,
           summary,
           tags: mergedTags,
+          cover: seriesCover,
           tankoubon: {
             title: primaryTitle,
             summary,
             tags: mergedTags,
+            cover: seriesCover,
             source_url: `${BtvMetadataPlugin.WEB_BASE}/subject/${subjectId}`,
           },
           archives: volumes,
@@ -221,6 +228,7 @@ class BtvMetadataPlugin extends BasePlugin {
       const isbn = this.extractInfoboxValue(detail?.infobox, ["ISBN", "isbn"]);
       const releaseDate = this.normalizeDate(this.extractInfoboxValue(detail?.infobox, ["发售日", "出版", "date"]));
       const coverUrls = this.collectCoverUrls(detail?.images, rel.images, rel.image);
+      const cover = await this.cacheCoverForResult(coverUrls, `vol_${rel.id}`);
 
       const vTags = this.mergeCsvTags(
         this.buildVolumeTags(detail, rel.id),
@@ -232,6 +240,7 @@ class BtvMetadataPlugin extends BasePlugin {
         title: bestTitle,
         summary: detailSummary,
         tags: vTags,
+        cover,
         release_date: releaseDate || undefined,
         isbn: isbn || undefined,
         source_url: `${BtvMetadataPlugin.WEB_BASE}/subject/${rel.id}`,
@@ -558,6 +567,66 @@ class BtvMetadataPlugin extends BasePlugin {
     if (v < min) return min;
     if (v > max) return max;
     return Math.trunc(v);
+  }
+
+  private async cacheCoverForResult(urls: string[], key: string): Promise<string> {
+    if (!Array.isArray(urls) || urls.length === 0) return "";
+
+    const pluginDir = String(this.input?.pluginDir || "").trim();
+    const namespace = String(this.getPluginInfo().namespace || "btvmeta").trim();
+    if (!pluginDir || !namespace) return "";
+
+    const cacheDir = `${pluginDir}/cache/covers`;
+    await Deno.mkdir(cacheDir, { recursive: true });
+
+    const safeKey = String(key || "cover")
+      .toLowerCase()
+      .replace(/[^a-z0-9._-]+/g, "_")
+      .replace(/^_+|_+$/g, "") || "cover";
+
+    for (const rawUrl of urls) {
+      const imageUrl = String(rawUrl || "").trim();
+      if (!imageUrl) continue;
+      try {
+        const response = await fetch(imageUrl, {
+          headers: {
+            "user-agent": BtvMetadataPlugin.USER_AGENT,
+            "accept": "image/*,*/*;q=0.8",
+          },
+        });
+        if (!response.ok) continue;
+        const bytes = new Uint8Array(await response.arrayBuffer());
+        if (!bytes.length) continue;
+
+        const ext = this.detectImageExtension(imageUrl, response.headers.get("content-type") || "");
+        const fileName = `${safeKey}.${ext}`;
+        const outputPath = `${cacheDir}/${fileName}`;
+        await Deno.writeFile(outputPath, bytes);
+        return `plugins/${namespace}/cache/covers/${fileName}`;
+      } catch {
+        continue;
+      }
+    }
+
+    return "";
+  }
+
+  private detectImageExtension(url: string, contentType: string): string {
+    const ct = String(contentType || "").toLowerCase();
+    if (ct.includes("image/avif")) return "avif";
+    if (ct.includes("image/webp")) return "webp";
+    if (ct.includes("image/png")) return "png";
+    if (ct.includes("image/gif")) return "gif";
+    if (ct.includes("image/jpeg") || ct.includes("image/jpg")) return "jpg";
+
+    const clean = String(url || "").split("?")[0].split("#")[0];
+    const m = clean.match(/\.([a-zA-Z0-9]{2,5})$/);
+    if (!m?.[1]) return "jpg";
+    const ext = m[1].toLowerCase();
+    if (["jpg", "jpeg", "png", "webp", "gif", "avif"].includes(ext)) {
+      return ext === "jpeg" ? "jpg" : ext;
+    }
+    return "jpg";
   }
 }
 
