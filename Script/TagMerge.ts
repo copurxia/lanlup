@@ -26,12 +26,16 @@ function nsKey(ns: string, value: string): string {
   return `${ns}\u0000${value}`;
 }
 
+function isOtherLike(ns: string): boolean {
+  return ns === "other" || ns === "";
+}
+
 /**
  * Script plugin: merge duplicate tags using host-exposed operations.
  *
  * Rules:
  * 1) Same namespace: if tagA.name equals tagB.translation_text, merge A -> B
- * 2) namespace === "other": if other:VALUE equals another tag's VALUE or translation_text, merge other -> that tag
+ * 2) namespace === "other" or empty: if other/empty:VALUE equals another tag's VALUE or translation_text, merge -> that tag
  *
  * Host RPC methods required:
  * - tags.list (paginated)
@@ -102,7 +106,7 @@ class TagMergeScriptPlugin extends BasePlugin {
         tags.push({ id, namespace: ns, name, translation_text: t });
         idToNs.set(id, ns);
 
-        if (ns !== "other") {
+        if (!isOtherLike(ns)) {
           const nameKey = norm(name);
           if (nameKey) {
             let set = canonicalCandidates.get(nameKey);
@@ -149,7 +153,7 @@ class TagMergeScriptPlugin extends BasePlugin {
       const nameKey = norm(it.name);
       if (!nameKey) continue;
 
-      if (ns === "other") {
+      if (isOtherLike(ns)) {
         const set = canonicalCandidates.get(nameKey);
         if (!set || set.size !== 1) continue;
         const [targetId] = [...set.values()];
@@ -182,7 +186,7 @@ class TagMergeScriptPlugin extends BasePlugin {
       const finalTarget = resolve(targetId);
       if (finalTarget === sourceId) continue;
       // For rule (2), ensure target isn't "other".
-      if (idToNs.get(sourceId) === "other" && idToNs.get(finalTarget) === "other") continue;
+      if (isOtherLike(idToNs.get(sourceId) ?? "") && isOtherLike(idToNs.get(finalTarget) ?? "")) continue;
       merges.push({ sourceId, targetId: finalTarget });
     }
 
@@ -211,4 +215,3 @@ class TagMergeScriptPlugin extends BasePlugin {
 }
 
 await new TagMergeScriptPlugin().handleCommand();
-
