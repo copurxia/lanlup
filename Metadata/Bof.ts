@@ -75,8 +75,13 @@ class BofMetadataPlugin extends BasePlugin {
       cooldown: 1,
       permissions: [
         "net=bookof.moe",
-        "net=img.mxomo.com",
+        "net=img.bookof.moe",
+        "net=kmimg.moex.ink",
+        "net=moex.ink",
         "net=mxomo.com",
+        "net=img.mxomo.com",
+        "net=i.mxomo.com",
+        "net=pic.mxomo.com",
       ],
       update_url:
         "https://git.copur.xyz/copur/lanlup/raw/branch/master/Metadata/Bof.ts",
@@ -139,10 +144,13 @@ class BofMetadataPlugin extends BasePlugin {
       const primaryTitle = series.title || series.originalTitle || seriesId;
       const summary = this.cleanSummary(series.summary || "");
       const seriesCoverUrls = this.pickSeriesCoverUrls(volumes);
-      const seriesCover = await this.cacheCoverForResult(
+      let seriesCover = await this.cacheCoverForResult(
         seriesCoverUrls,
         `series_${seriesId}`,
       );
+      if (!seriesCover && seriesCoverUrls.length > 0) {
+        seriesCover = seriesCoverUrls[0];
+      }
 
       const volumeMetas = await this.buildVolumeMetas(
         volumes,
@@ -298,7 +306,7 @@ class BofMetadataPlugin extends BasePlugin {
 
     const coverFrameRaw = this.extractFirst(
       html,
-      /window\.iframe_action\.location\.href\s*=\s*"([^"]+)"/i,
+      /window\.iframe_action\.location\.href\s*=\s*['"]([^'"]+)['"]/i,
     );
     let coverFrameUrl = "";
     if (coverFrameRaw) {
@@ -327,17 +335,16 @@ class BofMetadataPlugin extends BasePlugin {
     if (!html) return [];
 
     const results: BofVolumeInfo[] = [];
-    const re = /datainfo-V=([^,]+),([^,]*),([^,]*),([^,]*),([^,]*),([^\s,]+)/g;
+    // Align with KomgaBangumi: datainfo-V=ID,Title,Type,Unknown,CoverURL,Unknown
+    const re = /datainfo-V=\d+,[^,]+,[^,]+,[^,]+,([^,]+),[^,]+/g;
     let match;
     while ((match = re.exec(html)) !== null) {
-      const id = String(match[1] || "").trim();
-      const title = this.decodeHtmlEntities(String(match[2] || "").trim());
-      const coverRaw = String(match[5] || "").trim();
+      const coverRaw = String(match[1] || "").trim();
       if (!coverRaw) continue;
       const coverUrl = /^https?:\/\//i.test(coverRaw)
         ? coverRaw
         : `${BofMetadataPlugin.WEB_BASE}${coverRaw.startsWith("/") ? "" : "/"}${coverRaw}`;
-      results.push({ id, title, coverUrl });
+      results.push({ id: "", title: "", coverUrl });
     }
 
     return results;
@@ -373,7 +380,10 @@ class BofMetadataPlugin extends BasePlugin {
       const bestTitle = vol.title || `Volume ${i + 1}`;
       const volumeNo = this.extractVolumeNo(bestTitle) ?? (i + 1);
       const coverUrls = vol.coverUrl ? [vol.coverUrl] : [];
-      const cover = await this.cacheCoverForResult(coverUrls, `vol_${vol.id || i + 1}`);
+      let cover = await this.cacheCoverForResult(coverUrls, `vol_${vol.id || i + 1}`);
+      if (!cover && coverUrls.length > 0) {
+        cover = coverUrls[0];
+      }
       const tags = this.mergeCsvTags(
         `source:${seriesUrl}`,
       );
