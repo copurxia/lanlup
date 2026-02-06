@@ -98,12 +98,6 @@ class BtvMetadataPlugin extends BasePlugin {
           desc: "Prefer Chinese title when available.",
           default_value: "1",
         },
-        {
-          name: "merge_existing",
-          type: "bool",
-          desc: "Merge fetched tags with existing tags.",
-          default_value: "1",
-        },
       ],
       oneshot_arg: "Bangumi subject URL or subject id",
       cooldown: 1,
@@ -121,7 +115,6 @@ class BtvMetadataPlugin extends BasePlugin {
       const type = this.clampInt(Number(params.type ?? BtvMetadataPlugin.DEFAULT_TYPE), 1, 6);
       const searchLimit = this.clampInt(Number(params.search_limit ?? 8), 1, 20);
       const preferNameCn = !!params.prefer_name_cn;
-      const mergeExisting = !!params.merge_existing;
       const accessToken = String(params.access_token ?? "").trim();
 
       const subjectId =
@@ -158,9 +151,7 @@ class BtvMetadataPlugin extends BasePlugin {
 
       this.reportProgress(85, "构建元数据输出...");
       const fetchedTags = this.buildSeriesTags(subject, type, subjectId);
-      const mergedTags = mergeExisting
-        ? this.mergeCsvTags(String(input.existingTags || ""), fetchedTags)
-        : fetchedTags;
+      const mergedTags = fetchedTags;
 
       const primaryTitle = this.pickTitle(subject.name_cn, subject.name, preferNameCn) || String(subjectId);
       const summary = this.cleanSummary(subject.summary || "");

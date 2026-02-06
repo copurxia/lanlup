@@ -64,12 +64,6 @@ class BofMetadataPlugin extends BasePlugin {
           desc: "Search candidate limit (1-20).",
           default_value: "8",
         },
-        {
-          name: "merge_existing",
-          type: "bool",
-          desc: "Merge fetched tags with existing tags.",
-          default_value: "1",
-        },
       ],
       oneshot_arg: "Bookof series URL or series id",
       cooldown: 1,
@@ -94,7 +88,6 @@ class BofMetadataPlugin extends BasePlugin {
       const params = this.getParams();
 
       const searchLimit = this.clampInt(Number(params.search_limit ?? 8), 1, 20);
-      const mergeExisting = !!params.merge_existing;
 
       const seriesId =
         this.extractSeriesId(String(input.oneshotParam || "")) ||
@@ -137,9 +130,7 @@ class BofMetadataPlugin extends BasePlugin {
 
       this.reportProgress(80, "构建元数据输出...");
       const fetchedTags = this.buildSeriesTags(series, seriesUrl);
-      const mergedTags = mergeExisting
-        ? this.mergeCsvTags(String(input.existingTags || ""), fetchedTags)
-        : fetchedTags;
+      const mergedTags = fetchedTags;
 
       const primaryTitle = series.title || series.originalTitle || seriesId;
       const summary = this.cleanSummary(series.summary || "");
