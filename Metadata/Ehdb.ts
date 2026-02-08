@@ -7,6 +7,16 @@ import {
   PluginResult,
 } from "../base_plugin.ts";
 
+type EhdbCandidate = {
+  gID: string;
+  gToken: string;
+  title: string;
+  titleAlt: string;
+  score: number;
+  posted?: string;
+  cover?: string;
+};
+
 /**
  * EHDB元数据插件
  * 从本地PostgreSQL数据库查询并获取画廊标签和元数据
@@ -492,7 +502,7 @@ class EhdbMetadataPlugin extends BasePlugin {
     if (artist) {
       const artistLower = artist.toLowerCase();
       const queryWithArtist = `
-        SELECT gid, token, title, title_jpn,
+        SELECT gid, token, title, title_jpn, thumb,
                ts_rank(title_tsv, to_tsquery('simple', $1)) as rank
         FROM gallery
         WHERE title_tsv @@ to_tsquery('simple', $1)
@@ -506,7 +516,7 @@ class EhdbMetadataPlugin extends BasePlugin {
           JSON.stringify([`group:${artistLower}`]),
         ]);
         if (result.rows && result.rows.length > 0) {
-          return this.selectBestMatch(result.rows, core);
+          return await this.selectBestMatch(result.rows, core);
         }
       } catch (error) {
         await this.logWarn("search:fulltext_error", { error: String(error) });
@@ -516,7 +526,7 @@ class EhdbMetadataPlugin extends BasePlugin {
 
     // 回退：不带 artist 过滤
     const query = `
-      SELECT gid, token, title, title_jpn,
+      SELECT gid, token, title, title_jpn, thumb,
              ts_rank(title_tsv, to_tsquery('simple', $1)) as rank
       FROM gallery
       WHERE title_tsv @@ to_tsquery('simple', $1)
@@ -524,7 +534,7 @@ class EhdbMetadataPlugin extends BasePlugin {
     `;
     try {
       const result = await this.dbClient.queryObject(query, [tsquery]);
-      return this.selectBestMatch(result.rows, core);
+      return await this.selectBestMatch(result.rows, core);
     } catch (error) {
       await this.logWarn("search:fulltext_error", { error: String(error) });
       return { success: false, error: "Fulltext search failed" };
@@ -550,7 +560,7 @@ class EhdbMetadataPlugin extends BasePlugin {
       const idx1 = params.length + 1;
       const idx2 = params.length + 2;
       const queryWithArtist = `
-        SELECT gid, token, title, title_jpn
+        SELECT gid, token, title, title_jpn, thumb
         FROM gallery
         WHERE ${conditions.join(" AND ")}
           AND (tags @> $${idx1}::jsonb OR tags @> $${idx2}::jsonb)
@@ -566,19 +576,19 @@ class EhdbMetadataPlugin extends BasePlugin {
         paramsWithArtist,
       );
       if (result.rows && result.rows.length > 0) {
-        return this.selectBestMatch(result.rows, keywords.join(" "));
+        return await this.selectBestMatch(result.rows, keywords.join(" "));
       }
     }
 
     // 回退：不带 artist 过滤
     const query = `
-      SELECT gid, token, title, title_jpn
+      SELECT gid, token, title, title_jpn, thumb
       FROM gallery
       WHERE ${conditions.join(" AND ")}
       ORDER BY posted DESC LIMIT 10
     `;
     const result = await this.dbClient.queryObject(query, params);
-    return this.selectBestMatch(result.rows, keywords.join(" "));
+    return await this.selectBestMatch(result.rows, keywords.join(" "));
   }
 
   /**
@@ -593,7 +603,7 @@ class EhdbMetadataPlugin extends BasePlugin {
     if (artist) {
       const artistLower = artist.toLowerCase();
       const queryWithArtist = `
-        SELECT gid, token, title, title_jpn,
+        SELECT gid, token, title, title_jpn, thumb,
                GREATEST(similarity(title, $1), similarity(title_jpn, $1)) as sim
         FROM gallery
         WHERE (title % $1 OR title_jpn % $1)
@@ -606,20 +616,20 @@ class EhdbMetadataPlugin extends BasePlugin {
         JSON.stringify([`group:${artistLower}`]),
       ]);
       if (result.rows && result.rows.length > 0) {
-        return this.selectBestMatch(result.rows, core);
+        return await this.selectBestMatch(result.rows, core);
       }
     }
 
     // 回退：不带 artist 过滤
     const query = `
-      SELECT gid, token, title, title_jpn,
+      SELECT gid, token, title, title_jpn, thumb,
              GREATEST(similarity(title, $1), similarity(title_jpn, $1)) as sim
       FROM gallery
       WHERE (title % $1 OR title_jpn % $1)
       ORDER BY sim DESC, posted DESC LIMIT 10
     `;
     const result = await this.dbClient.queryObject(query, [core]);
-    return this.selectBestMatch(result.rows, core);
+    return await this.selectBestMatch(result.rows, core);
   }
 
   /**
@@ -630,29 +640,36 @@ class EhdbMetadataPlugin extends BasePlugin {
   // Higher threshold to reduce false-positive matches when only generic tokens overlap.
   private static readonly MIN_SIMILARITY_SCORE = 35;
 
-  private selectBestMatch(rows: any[], input: string): PluginResult {
+  private async selectBestMatch(
+    rows: any[],
+    input: string,
+  ): Promise<PluginResult> {
     if (!rows || rows.length === 0) {
       return { success: false, error: "No results found" };
     }
 
-    // 计算每个结果的相似度评分
-    let bestRow = rows[0];
-    let bestScore = this.calculateSimilarity(
-      input,
-      bestRow.title,
-      bestRow.title_jpn,
-    );
+    const ranked: EhdbCandidate[] = rows
+      .map((row) => {
+        const title = String(row?.title || "").trim();
+        const titleAlt = String(row?.title_jpn || "").trim();
+        return {
+          gID: String(row?.gid || "").trim(),
+          gToken: String(row?.token || "").trim(),
+          title: titleAlt || title,
+          titleAlt: title || titleAlt,
+          score: this.calculateSimilarity(input, title, titleAlt),
+          posted: this.normalizePostedValue(row?.posted),
+          cover: this.extractCandidateCover(row),
+        };
+      })
+      .filter((item) => item.gID && item.gToken)
+      .sort((a, b) => b.score - a.score);
 
-    for (let i = 1; i < rows.length; i++) {
-      const row = rows[i];
-      const score = this.calculateSimilarity(input, row.title, row.title_jpn);
-      if (score > bestScore) {
-        bestScore = score;
-        bestRow = row;
-      }
+    if (ranked.length === 0) {
+      return { success: false, error: "No valid gallery rows found" };
     }
 
-    // 相似度过低则抛弃
+    const bestScore = ranked[0].score;
     if (bestScore < EhdbMetadataPlugin.MIN_SIMILARITY_SCORE) {
       return {
         success: false,
@@ -661,15 +678,73 @@ class EhdbMetadataPlugin extends BasePlugin {
       };
     }
 
+    const passThreshold = ranked.filter((item) =>
+      item.score >= EhdbMetadataPlugin.MIN_SIMILARITY_SCORE
+    );
+    const candidates = passThreshold.length > 0 ? passThreshold : [ranked[0]];
+
+    const picked = candidates.length === 1 ? candidates[0] : candidates[
+      await this.hostSelect(
+        "EHDB 候选匹配",
+        candidates.map((item) => ({
+          label: item.title || `g/${item.gID}`,
+          description: [
+            item.titleAlt && item.titleAlt !== item.title
+              ? `原题: ${item.titleAlt}`
+              : "",
+            item.posted ? `发布时间: ${item.posted}` : "",
+            `gid:${item.gID}`,
+            `匹配分: ${item.score.toFixed(2)}`,
+          ].filter(Boolean).join(" | "),
+          cover: item.cover,
+        })),
+        {
+          message: `为“${input}”选择 EHDB 匹配项`,
+          defaultIndex: 0,
+          timeoutSeconds: 120,
+        },
+      )
+    ] || candidates[0];
+
     return {
       success: true,
       data: {
-        gID: bestRow.gid.toString(),
-        gToken: bestRow.token.trim(),
-        title: bestRow.title,
-        title_jpn: bestRow.title_jpn,
+        gID: picked.gID,
+        gToken: picked.gToken,
+        title: picked.titleAlt || picked.title,
+        title_jpn: picked.title,
       },
     };
+  }
+
+  private normalizePostedValue(value: unknown): string {
+    const raw = String(value ?? "").trim();
+    if (!raw) return "";
+    if (!/^\d+$/.test(raw)) return raw;
+
+    const numeric = Number(raw);
+    if (!Number.isFinite(numeric)) return raw;
+    const ms = numeric > 1_000_000_000_000 ? numeric : numeric * 1000;
+    const dt = new Date(ms);
+    if (Number.isNaN(dt.getTime())) return raw;
+    return dt.toISOString().slice(0, 10);
+  }
+
+  private extractCandidateCover(row: any): string {
+    const keys = [
+      "cover",
+      "cover_url",
+      "thumbnail",
+      "thumbnail_url",
+      "thumb",
+      "image",
+      "image_url",
+    ];
+    for (const key of keys) {
+      const v = String(row?.[key] ?? "").trim();
+      if (v) return v;
+    }
+    return "";
   }
 
   private async getTagsFromDatabase(gID: string): Promise<PluginResult> {
