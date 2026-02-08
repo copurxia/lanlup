@@ -323,11 +323,38 @@ class BtvMetadataPlugin extends BasePlugin {
       const titleCn = this.normalizeTitleForSearch(it.name_cn || "");
       const titleJa = this.normalizeTitleForSearch(it.name || "");
       const score = this.titleSimilarity(normalized, titleCn || titleJa);
-      return { id: it.id, score };
+      return {
+        id: it.id,
+        score,
+        title: this.pickTitle(it.name_cn, it.name, true) || `subject:${it.id}`,
+        subtitle: this.pickTitle(it.name, it.name_cn, false) || "",
+        date: String(it.date || "").trim(),
+      };
     });
 
     scored.sort((a, b) => b.score - a.score);
-    return scored[0]?.id ?? null;
+    if (scored.length === 1) return scored[0].id;
+
+    const selectedIndex = await this.hostSelect(
+      "Bangumi 候选匹配",
+      scored.map((item) => ({
+        label: item.title,
+        description: [
+          item.subtitle ? `原名: ${item.subtitle}` : "",
+          item.date ? `日期: ${item.date}` : "",
+          `匹配分: ${item.score.toFixed(2)}`,
+        ]
+          .filter(Boolean)
+          .join(" | "),
+      })),
+      {
+        message: `为“${title}”选择匹配条目`,
+        defaultIndex: 0,
+        timeoutSeconds: 120,
+      },
+    );
+
+    return scored[selectedIndex]?.id ?? scored[0]?.id ?? null;
   }
 
   private async fetchJson<T>(

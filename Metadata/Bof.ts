@@ -226,20 +226,44 @@ class BofMetadataPlugin extends BasePlugin {
     const html = await this.fetchText(url);
     if (!html) return null;
 
-    const results = this.parseSearchResults(html);
+    const results = this.parseSearchResults(html).slice(0, Math.max(1, limit));
     if (results.length === 0) return null;
 
     const scored = results.map((it) => {
       const candidate = this.normalizeTitleForSearch(it.title);
       const score = this.titleSimilarity(normalized, candidate);
-      return { id: it.id, score };
+      return {
+        id: it.id,
+        score,
+        title: it.title,
+        author: it.author,
+        date: it.date,
+      };
     });
 
     scored.sort((a, b) => b.score - a.score);
-    const best = scored[0];
-    if (best && best.score > 0) return best.id;
+    if (scored.length === 1) return scored[0].id;
 
-    return results[0]?.id || null;
+    const selectedIndex = await this.hostSelect(
+      "Bookof 候选匹配",
+      scored.map((item) => ({
+        label: item.title,
+        description: [
+          item.author ? `作者: ${item.author}` : "",
+          item.date ? `日期: ${item.date}` : "",
+          `匹配分: ${item.score.toFixed(2)}`,
+        ]
+          .filter(Boolean)
+          .join(" | "),
+      })),
+      {
+        message: `为“${title}”选择匹配条目`,
+        defaultIndex: 0,
+        timeoutSeconds: 120,
+      },
+    );
+
+    return scored[selectedIndex]?.id || scored[0]?.id || null;
   }
 
   private parseSearchResults(html: string): BofSearchItem[] {
