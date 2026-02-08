@@ -116,7 +116,6 @@ class BtvMetadataPlugin extends BasePlugin {
       const searchLimit = this.clampInt(Number(params.search_limit ?? 8), 1, 20);
       const preferNameCn = !!params.prefer_name_cn;
       const accessToken = String(params.access_token ?? "").trim();
-
       const subjectId =
         this.extractSubjectId(String(input.oneshotParam || "")) ||
         this.extractSubjectIdFromTags(String(input.existingTags || "")) ||
@@ -329,6 +328,7 @@ class BtvMetadataPlugin extends BasePlugin {
         title: this.pickTitle(it.name_cn, it.name, true) || `subject:${it.id}`,
         subtitle: this.pickTitle(it.name, it.name_cn, false) || "",
         date: String(it.date || "").trim(),
+        cover: it.images?.common || it.images?.medium || it.images?.small || it.images?.grid || "",
       };
     });
 
@@ -346,6 +346,7 @@ class BtvMetadataPlugin extends BasePlugin {
         ]
           .filter(Boolean)
           .join(" | "),
+        cover: item.cover,
       })),
       {
         message: `为“${title}”选择匹配条目`,

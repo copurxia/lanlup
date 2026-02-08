@@ -88,7 +88,6 @@ class BofMetadataPlugin extends BasePlugin {
       const params = this.getParams();
 
       const searchLimit = this.clampInt(Number(params.search_limit ?? 8), 1, 20);
-
       const seriesId =
         this.extractSeriesId(String(input.oneshotParam || "")) ||
         this.extractSeriesIdFromTags(String(input.existingTags || "")) ||
