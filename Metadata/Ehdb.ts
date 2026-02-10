@@ -17,6 +17,17 @@ type EhdbCandidate = {
   cover?: string;
 };
 
+type TankoubonArchivesResponse = {
+  archiveIds?: string[];
+};
+
+type ArchiveMetadataResponse = {
+  archiveId?: string;
+  title?: string;
+  existingTags?: string;
+  thumbnailHash?: string;
+};
+
 /**
  * EHDB元数据插件
  * 从本地PostgreSQL数据库查询并获取画廊标签和元数据
@@ -96,6 +107,16 @@ class EhdbMetadataPlugin extends BasePlugin {
     try {
       this.reportProgress(5, "初始化数据库连接...");
       const params = this.getParams();
+      const targetType = this.normalizeTargetType(params.__target_type);
+      const targetId = String(params.__target_id || input.archiveId || "").trim();
+      const collectionMode = this.isCollectionTargetType(targetType);
+
+      if (collectionMode) {
+        await this.logInfo("run:collection_mode", {
+          target_type: targetType,
+          target_id: targetId,
+        });
+      }
 
       // 获取连接字符串
       this.connectionString = params.connection_string || "";
@@ -109,6 +130,7 @@ class EhdbMetadataPlugin extends BasePlugin {
 
       await this.logInfo("run:start", {
         archive_id: input.archiveId || "",
+        target_type: targetType || "archive",
         has_oneshot: !!input.oneshotParam,
         title_len: (input.archiveTitle || "").length,
         has_thumbhash: !!(input.thumbnailHash || ""),
@@ -121,6 +143,14 @@ class EhdbMetadataPlugin extends BasePlugin {
       await this.connectDatabase();
 
       this.reportProgress(40, "开始搜索画廊...");
+
+      if (collectionMode) {
+        const collectionResult = await this.getTagsForCollection(targetId);
+        this.reportProgress(100, "元数据获取完成");
+        await this.disconnectDatabase();
+        this.outputResult(collectionResult);
+        return;
+      }
 
       // 从 input 中获取必要信息
       const lrrInfo = {
@@ -156,6 +186,82 @@ class EhdbMetadataPlugin extends BasePlugin {
         // ignore
       }
     }
+  }
+
+  private normalizeTargetType(raw: unknown): string {
+    return String(raw || "").trim().toLowerCase();
+  }
+
+  private isCollectionTargetType(targetType: string): boolean {
+    return targetType === "tankoubon" || targetType === "tank";
+  }
+
+  private async getTagsForCollection(tankoubonId: string): Promise<PluginResult> {
+    if (!tankoubonId) {
+      return {
+        success: false,
+        error: "Missing tankoubon target id",
+      };
+    }
+
+    const members = await this.callHost<TankoubonArchivesResponse>(
+      "tankoubon.listArchives",
+      { tankoubonId },
+    );
+    const archiveIds = Array.isArray(members?.archiveIds)
+      ? members.archiveIds.filter((v) => !!String(v || "").trim())
+      : [];
+
+    if (archiveIds.length === 0) {
+      return {
+        success: false,
+        error: `No member archives found in collection ${tankoubonId}`,
+      };
+    }
+
+    const patches: Array<Record<string, unknown>> = [];
+
+    for (let i = 0; i < archiveIds.length; i += 1) {
+      const archiveId = String(archiveIds[i]).trim();
+      this.reportProgress(
+        Math.min(95, 10 + Math.floor(((i + 1) / archiveIds.length) * 80)),
+        `处理合集成员 ${i + 1}/${archiveIds.length}`,
+      );
+
+      const meta = await this.callHost<ArchiveMetadataResponse>(
+        "archive.getMetadata",
+        { archiveId },
+      );
+
+      const lrrInfo = {
+        archive_title: String(meta?.title || ""),
+        existing_tags: String(meta?.existingTags || ""),
+        thumbnail_hash: String(meta?.thumbnailHash || ""),
+        oneshot_param: "",
+        archive_id: archiveId,
+      };
+
+      const result = await this.searchGallery(lrrInfo);
+      if (!result.success || !result.data) {
+        return {
+          success: false,
+          error: `Collection member scrape failed for archive ${archiveId}: ${result.error || "unknown error"}`,
+        };
+      }
+
+      patches.push({
+        archive_id: archiveId,
+        title: String(result.data.title || ""),
+        tags: String(result.data.tags || ""),
+      });
+    }
+
+    return {
+      success: true,
+      data: {
+        archives: patches,
+      },
+    };
   }
 
   private async connectDatabase(): Promise<void> {

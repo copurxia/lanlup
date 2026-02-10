@@ -15,6 +15,17 @@ type EhGalleryCandidate = {
   cover?: string;
 };
 
+type TankoubonArchivesResponse = {
+  archiveIds?: string[];
+};
+
+type ArchiveMetadataResponse = {
+  archiveId?: string;
+  title?: string;
+  existingTags?: string;
+  thumbnailHash?: string;
+};
+
 /**
  * E-Hentai元数据插件
  * 从E-Hentai搜索并获取画廊标签和元数据
@@ -102,9 +113,33 @@ class EHentaiMetadataPlugin extends BasePlugin {
       this.reportProgress(5, "初始化元数据搜索...");
       const params = this.getParams();
       const debug = !!params.debug;
+      const targetType = this.normalizeTargetType(params.__target_type);
+      const targetId = String(params.__target_id || input.archiveId || "").trim();
+
+      if (this.isCollectionTargetType(targetType)) {
+        await this.logInfo("run:collection_mode", {
+          target_type: targetType,
+          target_id: targetId,
+        });
+        const collectionResult = await this.getTagsForCollection(
+          targetId,
+          params.lang || "",
+          params.usethumbs || false,
+          params.search_gid || false,
+          params.enablepanda || false,
+          params.jpntitle || false,
+          params.additionaltags || false,
+          params.expunged || false,
+          input.loginCookies || [],
+          debug,
+        );
+        this.outputResult(collectionResult);
+        return;
+      }
 
       await this.logInfo("run:start", {
         archive_id: input.archiveId || "",
+        target_type: targetType || "archive",
         has_oneshot: !!input.oneshotParam,
         title_len: (input.archiveTitle || "").length,
         has_thumbhash: !!(input.thumbnailHash || ""),
@@ -153,6 +188,105 @@ class EHentaiMetadataPlugin extends BasePlugin {
         error: `Plugin execution failed: ${errorMessage}`,
       });
     }
+  }
+
+  private normalizeTargetType(raw: unknown): string {
+    return String(raw || "").trim().toLowerCase();
+  }
+
+  private isCollectionTargetType(targetType: string): boolean {
+    return targetType === "tankoubon" || targetType === "tank";
+  }
+
+  private async getTagsForCollection(
+    tankoubonId: string,
+    lang: string,
+    usethumbs: boolean,
+    search_gid: boolean,
+    enablepanda: boolean,
+    jpntitle: boolean,
+    additionaltags: boolean,
+    expunged: boolean,
+    loginCookies: Array<{ name: string; value: string; domain?: string; path?: string }>,
+    debug: boolean,
+  ): Promise<PluginResult> {
+    if (!tankoubonId) {
+      return {
+        success: false,
+        error: "Missing tankoubon target id",
+      };
+    }
+
+    const members = await this.callHost<TankoubonArchivesResponse>(
+      "tankoubon.listArchives",
+      { tankoubonId },
+    );
+    const archiveIds = Array.isArray(members?.archiveIds)
+      ? members.archiveIds.filter((v) => !!String(v || "").trim())
+      : [];
+
+    if (archiveIds.length === 0) {
+      return {
+        success: false,
+        error: `No member archives found in collection ${tankoubonId}`,
+      };
+    }
+
+    const patches: Array<Record<string, unknown>> = [];
+
+    for (let i = 0; i < archiveIds.length; i += 1) {
+      const archiveId = String(archiveIds[i]).trim();
+      this.reportProgress(
+        Math.min(95, 10 + Math.floor(((i + 1) / archiveIds.length) * 80)),
+        `处理合集成员 ${i + 1}/${archiveIds.length}`,
+      );
+
+      const meta = await this.callHost<ArchiveMetadataResponse>(
+        "archive.getMetadata",
+        { archiveId },
+      );
+
+      const lrrInfo = {
+        archive_title: String(meta?.title || ""),
+        existing_tags: String(meta?.existingTags || ""),
+        thumbnail_hash: String(meta?.thumbnailHash || ""),
+        login_cookies: loginCookies,
+        oneshot_param: "",
+        archive_id: archiveId,
+        debug,
+      };
+
+      const result = await this.getTags(
+        lrrInfo,
+        lang,
+        usethumbs,
+        search_gid,
+        enablepanda,
+        jpntitle,
+        additionaltags,
+        expunged,
+      );
+
+      if (!result.success || !result.data) {
+        return {
+          success: false,
+          error: `Collection member scrape failed for archive ${archiveId}: ${result.error || "unknown error"}`,
+        };
+      }
+
+      patches.push({
+        archive_id: archiveId,
+        title: String(result.data.title || ""),
+        tags: String(result.data.tags || ""),
+      });
+    }
+
+    return {
+      success: true,
+      data: {
+        archives: patches,
+      },
+    };
   }
 
   private async getTags(
