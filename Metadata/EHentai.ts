@@ -615,9 +615,13 @@ class EHentaiMetadataPlugin extends BasePlugin {
         return { success: true, data: { gID: only.gID, gToken: only.gToken } };
       }
 
+      // Prefer EH API thumbnails for selector UI (same source as EHDB/ref crawler).
+      const resolvedCandidates = await this.enrichCandidatesWithApiCovers(
+        candidates,
+      );
       const selectedIndex = await this.hostSelect(
         "E-Hentai 候选匹配",
-        candidates.map((item, idx) => ({
+        resolvedCandidates.map((item, idx) => ({
           label: item.title || `候选 ${idx + 1}`,
           description: `gid:${item.gID} | ${item.url}`,
           cover: item.cover,
@@ -628,7 +632,7 @@ class EHentaiMetadataPlugin extends BasePlugin {
           timeoutSeconds: 120,
         },
       );
-      const picked = candidates[selectedIndex] || candidates[0];
+      const picked = resolvedCandidates[selectedIndex] || resolvedCandidates[0];
       return {
         success: true,
         data: { gID: picked.gID, gToken: picked.gToken },
@@ -674,31 +678,120 @@ class EHentaiMetadataPlugin extends BasePlugin {
         Math.max(0, match.index - 350),
         Math.min(html.length, re.lastIndex + 600),
       );
-      const cover = this.extractCoverFromContext(context);
+      const cover = this.extractCoverFromContext(context, url);
 
       candidates.push({ gID, gToken, title, url, cover: cover || undefined });
     }
     return candidates;
   }
 
-  private extractCoverFromContext(context: string): string {
+  private extractCoverFromContext(context: string, baseUrl: string): string {
     const img = context.match(
-      /<(?:img|source)[^>]+(?:data-src|src)="([^"]+)"/i,
+      /<(?:img|source)[^>]+(?:data-src|data-lazy-src|src)="([^"]+)"/i,
     );
     if (img?.[1]) {
-      const src = img[1].trim();
-      return src.startsWith("//") ? `https:${src}` : src;
+      return this.normalizeCoverUrl(img[1], baseUrl);
     }
 
     const style = context.match(
-      /background(?:-image)?\s*:\s*url\(['"]?([^'"\)]+)['"]?\)/i,
+      /url\(\s*['"]?([^'"\)]+)['"]?\s*\)/i,
     );
     if (style?.[1]) {
-      const src = style[1].trim();
-      return src.startsWith("//") ? `https:${src}` : src;
+      return this.normalizeCoverUrl(style[1], baseUrl);
     }
 
     return "";
+  }
+
+  private normalizeCoverUrl(raw: string, baseUrl: string): string {
+    const value = this.htmlUnescape(String(raw || "").trim());
+    if (!value) return "";
+
+    if (value.startsWith("data:image/")) {
+      return value;
+    }
+
+    try {
+      if (value.startsWith("//")) {
+        return new URL(`https:${value}`).toString();
+      }
+      if (/^https?:\/\//i.test(value)) {
+        return new URL(value).toString();
+      }
+      return new URL(value, baseUrl).toString();
+    } catch {
+      return "";
+    }
+  }
+
+  private async enrichCandidatesWithApiCovers(
+    candidates: EhGalleryCandidate[],
+  ): Promise<EhGalleryCandidate[]> {
+    if (candidates.length === 0) return candidates;
+
+    const thumbMap = await this.fetchThumbMapFromApi(candidates);
+    if (thumbMap.size === 0) {
+      return candidates;
+    }
+
+    return candidates.map((item) => {
+      const key = `${item.gID}:${item.gToken}`;
+      const apiCover = thumbMap.get(key) || "";
+      if (!apiCover || apiCover === item.cover) {
+        return item;
+      }
+      return { ...item, cover: apiCover };
+    });
+  }
+
+  private async fetchThumbMapFromApi(
+    candidates: EhGalleryCandidate[],
+  ): Promise<Map<string, string>> {
+    const gidlist = candidates
+      .map((item) => [parseInt(item.gID, 10), item.gToken] as [number, string])
+      .filter((item) => Number.isFinite(item[0]) && !!item[1]);
+    if (gidlist.length === 0) {
+      return new Map();
+    }
+
+    try {
+      const response = await fetch("https://api.e-hentai.org/api.php", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "User-Agent": EHentaiMetadataPlugin.USER_AGENT,
+        },
+        body: JSON.stringify({
+          method: "gdata",
+          gidlist,
+          namespace: 1,
+        }),
+      });
+
+      if (!response.ok) {
+        return new Map();
+      }
+
+      const json = await response.json();
+      const list = Array.isArray(json?.gmetadata) ? json.gmetadata : [];
+      const out = new Map<string, string>();
+
+      for (const item of list) {
+        const gid = String(item?.gid || "").trim();
+        const token = String(item?.token || "").trim();
+        if (!gid || !token) continue;
+        const cover = this.normalizeCoverUrl(
+          String(item?.thumb || ""),
+          "https://e-hentai.org/",
+        );
+        if (cover) {
+          out.set(`${gid}:${token}`, cover);
+        }
+      }
+      return out;
+    } catch {
+      return new Map();
+    }
   }
 
   private extractDirectGallery(
