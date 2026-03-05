@@ -65,7 +65,7 @@ class BofMetadataPlugin extends BasePlugin {
           default_value: "8",
         },
       ],
-      oneshot_arg: "Bookof series URL or series id",
+      oneshot_arg: "Bookof series URL, series id, or search keyword",
       cooldown: 1,
       permissions: [
         "net=bookof.moe",
@@ -87,17 +87,27 @@ class BofMetadataPlugin extends BasePlugin {
       this.reportProgress(5, "初始化 Bookof 元数据抓取...");
       const params = this.getParams();
 
-      const searchLimit = this.clampInt(Number(params.search_limit ?? 8), 1, 20);
-      const seriesId =
-        this.extractSeriesId(String(input.oneshotParam || "")) ||
-        this.extractSeriesIdFromTags(String(input.existingTags || "")) ||
-        await this.searchSeriesId(String(input.archiveTitle || ""), searchLimit);
+      const searchLimit = this.clampInt(
+        Number(params.search_limit ?? 8),
+        1,
+        20,
+      );
+      const oneshotParam = String(input.oneshotParam || "").trim();
+      const existingTags = String(input.existingTags || "");
+      const archiveTitle = String(input.archiveTitle || "");
+      const searchKeywords = this.collectSearchKeywords(
+        oneshotParam,
+        archiveTitle,
+      );
+      const seriesId = this.extractSeriesId(oneshotParam) ||
+        this.extractSeriesIdFromTags(existingTags) ||
+        await this.searchSeriesIdByKeywords(searchKeywords, searchLimit);
 
       if (!seriesId) {
         this.outputResult({
           success: false,
           error:
-            "No Bookof series id found. Provide oneshotParam (series URL/ID), source tag, or searchable title.",
+            "No Bookof series id found. Provide oneshotParam (series URL/ID/keyword), source tag, or searchable title.",
         });
         return;
       }
@@ -178,7 +188,8 @@ class BofMetadataPlugin extends BasePlugin {
     const resp = await fetch(url, {
       headers: {
         "user-agent": BofMetadataPlugin.USER_AGENT,
-        "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "accept":
+          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "accept-language": "zh-CN,zh;q=0.9,en;q=0.6",
       },
     });
@@ -190,7 +201,7 @@ class BofMetadataPlugin extends BasePlugin {
     const raw = value.trim();
     if (!raw) return null;
 
-    if (/^[0-9a-zA-Z_-]+$/.test(raw)) {
+    if (/^\d+$/.test(raw)) {
       return raw;
     }
 
@@ -202,7 +213,9 @@ class BofMetadataPlugin extends BasePlugin {
 
   private extractSeriesIdFromTags(existingTags: string): string | null {
     if (!existingTags) return null;
-    const m = existingTags.match(/source:\s*(?:https?:\/\/)?bookof\.moe\/b\/([^\s,]+)\.htm/i);
+    const m = existingTags.match(
+      /source:\s*(?:https?:\/\/)?bookof\.moe\/b\/([^\s,]+)\.htm/i,
+    );
     if (m?.[1]) return m[1];
     return null;
   }
@@ -217,37 +230,163 @@ class BofMetadataPlugin extends BasePlugin {
       .trim();
   }
 
-  private async searchSeriesId(title: string, limit: number): Promise<string | null> {
-    const normalized = this.normalizeTitleForSearch(title);
-    if (!normalized) return null;
+  private collectSearchKeywords(
+    oneshotParam: string,
+    archiveTitle: string,
+  ): string[] {
+    const out: string[] = [];
+    const oneshot = String(oneshotParam || "").trim();
+    if (oneshot && !this.extractSeriesId(oneshot)) {
+      out.push(...this.extractSearchKeywords(oneshot, 3));
+    }
+    out.push(...this.extractSearchKeywords(archiveTitle, 4));
+    return this.dedupeStrings(out).slice(0, 6);
+  }
 
-    const url = `${BofMetadataPlugin.WEB_BASE}/data_list.php?s=${encodeURIComponent(normalized)}&p=1`;
-    const html = await this.fetchText(url);
-    if (!html) return null;
+  private extractSearchKeywords(
+    rawTitle: string,
+    limitCount?: number,
+  ): string[] {
+    const input = String(rawTitle || "").trim();
+    if (!input) return [];
 
-    const results = this.parseSearchResults(html).slice(0, Math.max(1, limit));
-    if (results.length === 0) return null;
+    const titleNoExt = input
+      .replace(/\.(?:zip|cbz|cbr|rar|7z|pdf|epub)$/i, "")
+      .trim();
+    const bracketParts = Array.from(titleNoExt.matchAll(/\[([^\[\]]+)\]/g))
+      .map((m) => String(m[1] || "").trim())
+      .filter(Boolean);
 
-    const scored = results.map((it) => {
-      const candidate = this.normalizeTitleForSearch(it.title);
-      const score = this.titleSimilarity(normalized, candidate);
-      return {
-        id: it.id,
-        score,
-        title: it.title,
-        author: it.author,
-        date: it.date,
-      };
-    });
+    let titlePart = "";
+    let authorParts: string[] = [];
+    const authorCandidate = bracketParts.find((p) => /[×xX]/.test(p));
+    if (authorCandidate) {
+      authorParts = authorCandidate
+        .split(/[×xX]/)
+        .map((s) => s.trim())
+        .filter(Boolean);
+      for (const part of bracketParts) {
+        if (part === authorCandidate) continue;
+        titlePart = part.trim();
+        break;
+      }
+    } else {
+      if (bracketParts.length > 0) titlePart = bracketParts[0].trim();
+      if (bracketParts.length > 1) authorParts = [bracketParts[1].trim()];
+    }
+
+    const titleParts = titlePart
+      ? titlePart.split("_").map((t) => t.trim()).filter(Boolean)
+      : [];
+    const grouped = [...titleParts, ...authorParts]
+      .map((t) => this.sanitizeSearchKeyword(t))
+      .filter(Boolean);
+
+    const minimalProcessedTitle = this.sanitizeSearchKeyword(
+      titleNoExt
+        .replace(/[\(\[【（]?境外版[\)\]】）]?\s*/g, "")
+        .replace(/[\(\[【（]?单行本[\)\]】）]?\s*$/g, "")
+        .replace(/[\(\[【（]?\d+卷[\)\]】）]?\s*$/g, "")
+        .replace(/\[.*?\]/g, "")
+        .replace(/【.*?】/g, "")
+        .replace(/[（()）]/g, " ")
+        .replace(/[_-]?\s*$/g, "")
+        .trim(),
+    );
+    const fallback = this.sanitizeSearchKeyword(
+      titleNoExt
+        .replace(/\[.*?\]/g, " ")
+        .replace(/【.*?】/g, " ")
+        .replace(/[（(][^）)]*[）)]/g, " ")
+        .trim(),
+    );
+
+    let finalTitles = this.dedupeStrings([
+      minimalProcessedTitle,
+      ...grouped,
+      fallback,
+    ]);
+    if (typeof limitCount === "number") {
+      if (limitCount <= 0) return [];
+      finalTitles = finalTitles.slice(0, limitCount);
+    }
+    return finalTitles;
+  }
+
+  private sanitizeSearchKeyword(raw: string): string {
+    return String(raw || "")
+      .replace(/[:：•·․,，。'’?？!！~⁓～]/g, " ")
+      .replace(/／/g, "/")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  private dedupeStrings(input: string[]): string[] {
+    const out: string[] = [];
+    const seen = new Set<string>();
+    for (const item of input) {
+      const clean = String(item || "").trim();
+      if (!clean) continue;
+      const key = clean.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(clean);
+    }
+    return out;
+  }
+
+  private async searchSeriesIdByKeywords(
+    keywords: string[],
+    limit: number,
+  ): Promise<string | null> {
+    const normalizedKeywords = this.dedupeStrings(
+      keywords
+        .map((k) => this.normalizeTitleForSearch(k))
+        .filter(Boolean),
+    );
+    if (normalizedKeywords.length === 0) return null;
+
+    const candidateMap = new Map<string, {
+      id: string;
+      score: number;
+      title: string;
+      author: string;
+      date?: string;
+      matchedKeyword: string;
+    }>();
+
+    for (const keyword of normalizedKeywords) {
+      const results = await this.searchSeriesItems(keyword, limit);
+      for (const it of results) {
+        const candidate = this.normalizeTitleForSearch(it.title);
+        const score = this.titleSimilarity(keyword, candidate);
+        const prev = candidateMap.get(it.id);
+        if (!prev || score > prev.score) {
+          candidateMap.set(it.id, {
+            id: it.id,
+            score,
+            title: it.title,
+            author: it.author,
+            date: it.date,
+            matchedKeyword: keyword,
+          });
+        }
+      }
+    }
+
+    const scored = Array.from(candidateMap.values());
+    if (scored.length === 0) return null;
 
     scored.sort((a, b) => b.score - a.score);
     if (scored.length === 1) return scored[0].id;
 
+    const keywordSummary = normalizedKeywords.slice(0, 3).join(" / ");
     const selectedIndex = await this.hostSelect(
       "Bookof 候选匹配",
       scored.map((item) => ({
         label: item.title,
         description: [
+          item.matchedKeyword ? `词: ${item.matchedKeyword}` : "",
           item.author ? `作者: ${item.author}` : "",
           item.date ? `日期: ${item.date}` : "",
           `匹配分: ${item.score.toFixed(2)}`,
@@ -256,13 +395,31 @@ class BofMetadataPlugin extends BasePlugin {
           .join(" | "),
       })),
       {
-        message: `为“${title}”选择匹配条目`,
+        message: keywordSummary
+          ? `按关键词选择匹配条目：${keywordSummary}`
+          : "选择匹配条目",
         defaultIndex: 0,
         timeoutSeconds: 120,
       },
     );
 
     return scored[selectedIndex]?.id || scored[0]?.id || null;
+  }
+
+  private async searchSeriesItems(
+    keyword: string,
+    limit: number,
+  ): Promise<BofSearchItem[]> {
+    const normalized = this.normalizeTitleForSearch(keyword);
+    if (!normalized) return [];
+
+    const url = `${BofMetadataPlugin.WEB_BASE}/data_list.php?s=${
+      encodeURIComponent(normalized)
+    }&p=1`;
+    const html = await this.fetchText(url);
+    if (!html) return [];
+
+    return this.parseSearchResults(html).slice(0, Math.max(1, limit));
   }
 
   private parseSearchResults(html: string): BofSearchItem[] {
@@ -281,10 +438,16 @@ class BofMetadataPlugin extends BasePlugin {
   }
 
   private parseSeriesHtml(id: string, html: string): BofSeriesInfo | null {
-    const titleRaw = this.extractFirst(html, /class="name_main"[^>]*>([\s\S]*?)<\//i);
+    const titleRaw = this.extractFirst(
+      html,
+      /class="name_main"[^>]*>([\s\S]*?)<\//i,
+    );
     const title = this.decodeHtmlEntities(this.stripHtml(titleRaw)).trim();
 
-    const nameSubts = this.extractAll(html, /class="name_subt"[^>]*>([\s\S]*?)<\//gi)
+    const nameSubts = this.extractAll(
+      html,
+      /class="name_subt"[^>]*>([\s\S]*?)<\//gi,
+    )
       .map((t) => this.decodeHtmlEntities(this.stripHtml(t)).trim())
       .filter(Boolean);
 
@@ -297,7 +460,10 @@ class BofMetadataPlugin extends BasePlugin {
       infoText = nameSubts.length > 1 ? nameSubts[1] : seriesNameStr;
     }
 
-    const summaryRaw = this.extractFirst(html, /id="div_desctext"[^>]*>([\s\S]*?)<\//i);
+    const summaryRaw = this.extractFirst(
+      html,
+      /id="div_desctext"[^>]*>([\s\S]*?)<\//i,
+    );
     const summary = this.decodeHtmlEntities(this.stripHtml(summaryRaw))
       .replace(/[\r\n]+/g, "\n")
       .replace(/\【.*?\】$/g, "")
@@ -327,7 +493,9 @@ class BofMetadataPlugin extends BasePlugin {
       if (/^https?:\/\//i.test(coverFrameRaw)) {
         coverFrameUrl = coverFrameRaw;
       } else {
-        coverFrameUrl = `${BofMetadataPlugin.WEB_BASE}${coverFrameRaw.startsWith("/") ? "" : "/"}${coverFrameRaw}`;
+        coverFrameUrl = `${BofMetadataPlugin.WEB_BASE}${
+          coverFrameRaw.startsWith("/") ? "" : "/"
+        }${coverFrameRaw}`;
       }
     }
 
@@ -357,7 +525,9 @@ class BofMetadataPlugin extends BasePlugin {
       if (!coverRaw) continue;
       const coverUrl = /^https?:\/\//i.test(coverRaw)
         ? coverRaw
-        : `${BofMetadataPlugin.WEB_BASE}${coverRaw.startsWith("/") ? "" : "/"}${coverRaw}`;
+        : `${BofMetadataPlugin.WEB_BASE}${
+          coverRaw.startsWith("/") ? "" : "/"
+        }${coverRaw}`;
       results.push({ id: "", title: "", coverUrl });
     }
 
@@ -394,7 +564,10 @@ class BofMetadataPlugin extends BasePlugin {
       const bestTitle = vol.title || `Volume ${i + 1}`;
       const volumeNo = this.extractVolumeNo(bestTitle) ?? (i + 1);
       const coverUrls = vol.coverUrl ? [vol.coverUrl] : [];
-      let cover = await this.cacheCoverForResult(coverUrls, `vol_${vol.id || i + 1}`);
+      let cover = await this.cacheCoverForResult(
+        coverUrls,
+        `vol_${vol.id || i + 1}`,
+      );
       if (!cover && coverUrls.length > 0) {
         cover = coverUrls[0];
       }
@@ -442,7 +615,7 @@ class BofMetadataPlugin extends BasePlugin {
       .replace(/&amp;/g, "&")
       .replace(/&lt;/g, "<")
       .replace(/&gt;/g, ">")
-      .replace(/&quot;/g, "\"")
+      .replace(/&quot;/g, '"')
       .replace(/&#39;/g, "'")
       .replace(/&#x27;/g, "'")
       .replace(/&#x2F;/g, "/");
@@ -520,11 +693,15 @@ class BofMetadataPlugin extends BasePlugin {
     return Math.trunc(v);
   }
 
-  private async cacheCoverForResult(urls: string[], key: string): Promise<string> {
+  private async cacheCoverForResult(
+    urls: string[],
+    key: string,
+  ): Promise<string> {
     if (!Array.isArray(urls) || urls.length === 0) return "";
 
     const pluginDir = String(this.input?.pluginDir || "").trim();
-    const namespace = String(this.getPluginInfo().namespace || "bofmeta").trim();
+    const namespace = String(this.getPluginInfo().namespace || "bofmeta")
+      .trim();
     if (!pluginDir || !namespace) return "";
 
     const cacheDir = `${pluginDir}/cache/covers`;
@@ -549,7 +726,10 @@ class BofMetadataPlugin extends BasePlugin {
         const bytes = new Uint8Array(await response.arrayBuffer());
         if (!bytes.length) continue;
 
-        const ext = this.detectImageExtension(imageUrl, response.headers.get("content-type") || "");
+        const ext = this.detectImageExtension(
+          imageUrl,
+          response.headers.get("content-type") || "",
+        );
         const fileName = `${safeKey}.${ext}`;
         const outputPath = `${cacheDir}/${fileName}`;
         await Deno.writeFile(outputPath, bytes);

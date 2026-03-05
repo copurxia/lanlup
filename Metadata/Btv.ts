@@ -99,9 +99,9 @@ class BtvMetadataPlugin extends BasePlugin {
           default_value: "1",
         },
       ],
-      oneshot_arg: "Bangumi subject URL or subject id",
+      oneshot_arg: "Bangumi subject URL, subject id, or search keyword",
       cooldown: 1,
-      permissions: ["net=api.bgm.tv", "net=bangumi.tv","net=lain.bgm.tv"],
+      permissions: ["net=api.bgm.tv", "net=bangumi.tv", "net=lain.bgm.tv"],
       update_url:
         "https://git.copur.xyz/copur/lanlup/raw/branch/master/Metadata/Btv.ts",
     };
@@ -112,15 +112,29 @@ class BtvMetadataPlugin extends BasePlugin {
       this.reportProgress(5, "初始化 Bangumi 元数据抓取...");
       const params = this.getParams();
 
-      const type = this.clampInt(Number(params.type ?? BtvMetadataPlugin.DEFAULT_TYPE), 1, 6);
-      const searchLimit = this.clampInt(Number(params.search_limit ?? 8), 1, 20);
+      const type = this.clampInt(
+        Number(params.type ?? BtvMetadataPlugin.DEFAULT_TYPE),
+        1,
+        6,
+      );
+      const searchLimit = this.clampInt(
+        Number(params.search_limit ?? 8),
+        1,
+        20,
+      );
       const preferNameCn = !!params.prefer_name_cn;
       const accessToken = String(params.access_token ?? "").trim();
-      const subjectId =
-        this.extractSubjectId(String(input.oneshotParam || "")) ||
-        this.extractSubjectIdFromTags(String(input.existingTags || "")) ||
-        await this.searchSubjectId(
-          String(input.archiveTitle || ""),
+      const oneshotParam = String(input.oneshotParam || "").trim();
+      const existingTags = String(input.existingTags || "");
+      const archiveTitle = String(input.archiveTitle || "");
+      const searchKeywords = this.collectSearchKeywords(
+        oneshotParam,
+        archiveTitle,
+      );
+      const subjectId = this.extractSubjectId(oneshotParam) ||
+        this.extractSubjectIdFromTags(existingTags) ||
+        await this.searchSubjectIdByKeywords(
+          searchKeywords,
           type,
           searchLimit,
           accessToken,
@@ -130,7 +144,7 @@ class BtvMetadataPlugin extends BasePlugin {
         this.outputResult({
           success: false,
           error:
-            "No Bangumi subject id found. Provide oneshotParam (subject URL/ID), source tag, or searchable title.",
+            "No Bangumi subject id found. Provide oneshotParam (subject URL/ID/keyword), source tag, or searchable title.",
         });
         return;
       }
@@ -152,7 +166,9 @@ class BtvMetadataPlugin extends BasePlugin {
       const fetchedTags = this.buildSeriesTags(subject, type, subjectId);
       const mergedTags = fetchedTags;
 
-      const primaryTitle = this.pickTitle(subject.name_cn, subject.name, preferNameCn) || String(subjectId);
+      const primaryTitle =
+        this.pickTitle(subject.name_cn, subject.name, preferNameCn) ||
+        String(subjectId);
       const summary = this.cleanSummary(subject.summary || "");
       const seriesCover = await this.cacheCoverForResult(
         this.collectCoverUrls(subject.images),
@@ -186,7 +202,10 @@ class BtvMetadataPlugin extends BasePlugin {
     }
   }
 
-  private async fetchVolumeMetadata(subjectId: number, accessToken: string): Promise<VolumeMeta[]> {
+  private async fetchVolumeMetadata(
+    subjectId: number,
+    accessToken: string,
+  ): Promise<VolumeMeta[]> {
     const related = await this.fetchJson<BgmRelatedSubject[]>(
       `${BtvMetadataPlugin.API_BASE}/v0/subjects/${subjectId}/subjects`,
       accessToken,
@@ -198,8 +217,12 @@ class BtvMetadataPlugin extends BasePlugin {
     const volumes = related
       .filter((s) => String(s.relation || "").trim() === "单行本")
       .sort((a, b) => {
-        const aNum = this.extractVolumeNo(this.pickTitle(a.name_cn, a.name, true));
-        const bNum = this.extractVolumeNo(this.pickTitle(b.name_cn, b.name, true));
+        const aNum = this.extractVolumeNo(
+          this.pickTitle(a.name_cn, a.name, true),
+        );
+        const bNum = this.extractVolumeNo(
+          this.pickTitle(b.name_cn, b.name, true),
+        );
         if (aNum !== null && bNum !== null && aNum !== bNum) {
           return aNum - bNum;
         }
@@ -216,8 +239,14 @@ class BtvMetadataPlugin extends BasePlugin {
       const volumeNo = this.extractVolumeNo(bestTitle) ?? (i + 1);
       const detailSummary = this.cleanSummary(detail?.summary || "");
       const isbn = this.extractInfoboxValue(detail?.infobox, ["ISBN", "isbn"]);
-      const releaseDate = this.normalizeDate(this.extractInfoboxValue(detail?.infobox, ["发售日", "出版", "date"]));
-      const coverUrls = this.collectCoverUrls(detail?.images, rel.images, rel.image);
+      const releaseDate = this.normalizeDate(
+        this.extractInfoboxValue(detail?.infobox, ["发售日", "出版", "date"]),
+      );
+      const coverUrls = this.collectCoverUrls(
+        detail?.images,
+        rel.images,
+        rel.image,
+      );
       const cover = await this.cacheCoverForResult(coverUrls, `vol_${rel.id}`);
 
       const vTags = this.mergeCsvTags(
@@ -241,7 +270,10 @@ class BtvMetadataPlugin extends BasePlugin {
     return results;
   }
 
-  private buildVolumeTags(subject: BgmSubject | null, subjectId: number): string {
+  private buildVolumeTags(
+    subject: BgmSubject | null,
+    subjectId: number,
+  ): string {
     const tags: string[] = [];
     tags.push(`source:${BtvMetadataPlugin.WEB_BASE}/subject/${subjectId}`);
     if (!subject) return tags.join(", ");
@@ -260,7 +292,11 @@ class BtvMetadataPlugin extends BasePlugin {
     return this.dedupeCsv(tags.join(","));
   }
 
-  private buildSeriesTags(subject: BgmSubject, type: number, subjectId: number): string {
+  private buildSeriesTags(
+    subject: BgmSubject,
+    type: number,
+    subjectId: number,
+  ): string {
     const tags: string[] = [];
     tags.push(`source:${BtvMetadataPlugin.WEB_BASE}/subject/${subjectId}`);
     tags.push(`btv:type:${type}`);
@@ -274,33 +310,236 @@ class BtvMetadataPlugin extends BasePlugin {
       tags.push(...selected);
     }
 
-    if (typeof subject.score === "number" && Number.isFinite(subject.score) && subject.score > 0) {
+    if (
+      typeof subject.score === "number" && Number.isFinite(subject.score) &&
+      subject.score > 0
+    ) {
       tags.push(`${Math.round(subject.score)}分`);
     }
-    if (typeof subject.rank === "number" && Number.isFinite(subject.rank) && subject.rank > 0) {
+    if (
+      typeof subject.rank === "number" && Number.isFinite(subject.rank) &&
+      subject.rank > 0
+    ) {
       tags.push(`rank:${subject.rank}`);
     }
 
     return this.dedupeCsv(tags.join(","));
   }
 
-  private async fetchSubject(subjectId: number, accessToken: string): Promise<BgmSubject | null> {
+  private async fetchSubject(
+    subjectId: number,
+    accessToken: string,
+  ): Promise<BgmSubject | null> {
     return await this.fetchJson<BgmSubject>(
       `${BtvMetadataPlugin.API_BASE}/v0/subjects/${subjectId}`,
       accessToken,
     );
   }
 
-  private async searchSubjectId(
-    title: string,
+  private collectSearchKeywords(
+    oneshotParam: string,
+    archiveTitle: string,
+  ): string[] {
+    const out: string[] = [];
+    const oneshot = String(oneshotParam || "").trim();
+    if (oneshot && !this.extractSubjectId(oneshot)) {
+      out.push(...this.extractSearchKeywords(oneshot, 3));
+    }
+    out.push(...this.extractSearchKeywords(archiveTitle, 4));
+    return this.dedupeStrings(out).slice(0, 6);
+  }
+
+  private extractSearchKeywords(
+    rawTitle: string,
+    limitCount?: number,
+  ): string[] {
+    const input = String(rawTitle || "").trim();
+    if (!input) return [];
+
+    const titleNoExt = input
+      .replace(/\.(?:zip|cbz|cbr|rar|7z|pdf|epub)$/i, "")
+      .trim();
+    const bracketParts = Array.from(titleNoExt.matchAll(/\[([^\[\]]+)\]/g))
+      .map((m) => String(m[1] || "").trim())
+      .filter(Boolean);
+
+    let titlePart = "";
+    let authorParts: string[] = [];
+    const authorCandidate = bracketParts.find((p) => /[×xX]/.test(p));
+    if (authorCandidate) {
+      authorParts = authorCandidate
+        .split(/[×xX]/)
+        .map((s) => s.trim())
+        .filter(Boolean);
+      for (const part of bracketParts) {
+        if (part === authorCandidate) continue;
+        titlePart = part.trim();
+        break;
+      }
+    } else {
+      if (bracketParts.length > 0) titlePart = bracketParts[0].trim();
+      if (bracketParts.length > 1) authorParts = [bracketParts[1].trim()];
+    }
+
+    const titleParts = titlePart
+      ? titlePart.split("_").map((t) => t.trim()).filter(Boolean)
+      : [];
+    const grouped = [...titleParts, ...authorParts]
+      .map((t) => this.sanitizeSearchKeyword(t))
+      .filter(Boolean);
+
+    const minimalProcessedTitle = this.sanitizeSearchKeyword(
+      titleNoExt
+        .replace(/[\(\[【（]?境外版[\)\]】）]?\s*/g, "")
+        .replace(/[\(\[【（]?单行本[\)\]】）]?\s*$/g, "")
+        .replace(/[\(\[【（]?\d+卷[\)\]】）]?\s*$/g, "")
+        .replace(/\[.*?\]/g, "")
+        .replace(/【.*?】/g, "")
+        .replace(/[（()）]/g, " ")
+        .replace(/[_-]?\s*$/g, "")
+        .trim(),
+    );
+    const fallback = this.sanitizeSearchKeyword(
+      titleNoExt
+        .replace(/\[.*?\]/g, " ")
+        .replace(/【.*?】/g, " ")
+        .replace(/[（(][^）)]*[）)]/g, " ")
+        .trim(),
+    );
+
+    let finalTitles = this.dedupeStrings([
+      minimalProcessedTitle,
+      ...grouped,
+      fallback,
+    ]);
+    if (typeof limitCount === "number") {
+      if (limitCount <= 0) return [];
+      finalTitles = finalTitles.slice(0, limitCount);
+    }
+    return finalTitles;
+  }
+
+  private sanitizeSearchKeyword(raw: string): string {
+    return String(raw || "")
+      .replace(/[:：•·․,，。'’?？!！~⁓～]/g, " ")
+      .replace(/／/g, "/")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  private dedupeStrings(input: string[]): string[] {
+    const out: string[] = [];
+    const seen = new Set<string>();
+    for (const item of input) {
+      const clean = String(item || "").trim();
+      if (!clean) continue;
+      const key = clean.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(clean);
+    }
+    return out;
+  }
+
+  private async searchSubjectIdByKeywords(
+    keywords: string[],
     type: number,
     limit: number,
     accessToken: string,
   ): Promise<number | null> {
-    const normalized = this.normalizeTitleForSearch(title);
-    if (!normalized) return null;
+    const normalizedKeywords = this.dedupeStrings(
+      keywords
+        .map((k) => this.normalizeTitleForSearch(k))
+        .filter(Boolean),
+    );
+    if (normalizedKeywords.length === 0) return null;
 
-    const url = `${BtvMetadataPlugin.API_BASE}/v0/search/subjects?keyword=${encodeURIComponent(normalized)}&limit=${limit}&offset=0`;
+    const candidateMap = new Map<number, {
+      id: number;
+      score: number;
+      title: string;
+      subtitle: string;
+      date: string;
+      cover: string;
+      matchedKeyword: string;
+    }>();
+
+    for (const keyword of normalizedKeywords) {
+      const items = await this.searchSubjects(
+        keyword,
+        type,
+        limit,
+        accessToken,
+      );
+      for (const it of items) {
+        const titleCn = this.normalizeTitleForSearch(it.name_cn || "");
+        const titleJa = this.normalizeTitleForSearch(it.name || "");
+        const score = Math.max(
+          this.titleSimilarity(keyword, titleCn),
+          this.titleSimilarity(keyword, titleJa),
+        );
+        const prev = candidateMap.get(it.id);
+        if (!prev || score > prev.score) {
+          candidateMap.set(it.id, {
+            id: it.id,
+            score,
+            title: this.pickTitle(it.name_cn, it.name, true) ||
+              `subject:${it.id}`,
+            subtitle: this.pickTitle(it.name, it.name_cn, false) || "",
+            date: String(it.date || "").trim(),
+            cover: it.images?.common || it.images?.medium || it.images?.small ||
+              it.images?.grid || "",
+            matchedKeyword: keyword,
+          });
+        }
+      }
+    }
+
+    const scored = Array.from(candidateMap.values());
+    if (scored.length === 0) return null;
+
+    scored.sort((a, b) => b.score - a.score);
+    if (scored.length === 1) return scored[0].id;
+
+    const keywordSummary = normalizedKeywords.slice(0, 3).join(" / ");
+    const selectedIndex = await this.hostSelect(
+      "Bangumi 候选匹配",
+      scored.map((item) => ({
+        label: item.title,
+        description: [
+          item.matchedKeyword ? `词: ${item.matchedKeyword}` : "",
+          item.subtitle ? `原名: ${item.subtitle}` : "",
+          item.date ? `日期: ${item.date}` : "",
+          `匹配分: ${item.score.toFixed(2)}`,
+        ]
+          .filter(Boolean)
+          .join(" | "),
+        cover: item.cover,
+      })),
+      {
+        message: keywordSummary
+          ? `按关键词选择匹配条目：${keywordSummary}`
+          : "选择匹配条目",
+        defaultIndex: 0,
+        timeoutSeconds: 120,
+      },
+    );
+
+    return scored[selectedIndex]?.id ?? scored[0]?.id ?? null;
+  }
+
+  private async searchSubjects(
+    keyword: string,
+    type: number,
+    limit: number,
+    accessToken: string,
+  ): Promise<BgmSubject[]> {
+    const normalized = this.normalizeTitleForSearch(keyword);
+    if (!normalized) return [];
+
+    const url = `${BtvMetadataPlugin.API_BASE}/v0/search/subjects?keyword=${
+      encodeURIComponent(normalized)
+    }&limit=${limit}&offset=0`;
     const result = await this.fetchJson<BgmSearchResult>(url, accessToken, {
       method: "POST",
       body: JSON.stringify({
@@ -315,47 +554,9 @@ class BtvMetadataPlugin extends BasePlugin {
 
     const items = result?.data;
     if (!Array.isArray(items) || items.length === 0) {
-      return null;
+      return [];
     }
-
-    const scored = items.map((it) => {
-      const titleCn = this.normalizeTitleForSearch(it.name_cn || "");
-      const titleJa = this.normalizeTitleForSearch(it.name || "");
-      const score = this.titleSimilarity(normalized, titleCn || titleJa);
-      return {
-        id: it.id,
-        score,
-        title: this.pickTitle(it.name_cn, it.name, true) || `subject:${it.id}`,
-        subtitle: this.pickTitle(it.name, it.name_cn, false) || "",
-        date: String(it.date || "").trim(),
-        cover: it.images?.common || it.images?.medium || it.images?.small || it.images?.grid || "",
-      };
-    });
-
-    scored.sort((a, b) => b.score - a.score);
-    if (scored.length === 1) return scored[0].id;
-
-    const selectedIndex = await this.hostSelect(
-      "Bangumi 候选匹配",
-      scored.map((item) => ({
-        label: item.title,
-        description: [
-          item.subtitle ? `原名: ${item.subtitle}` : "",
-          item.date ? `日期: ${item.date}` : "",
-          `匹配分: ${item.score.toFixed(2)}`,
-        ]
-          .filter(Boolean)
-          .join(" | "),
-        cover: item.cover,
-      })),
-      {
-        message: `为“${title}”选择匹配条目`,
-        defaultIndex: 0,
-        timeoutSeconds: 120,
-      },
-    );
-
-    return scored[selectedIndex]?.id ?? scored[0]?.id ?? null;
+    return items.slice(0, Math.max(1, limit));
   }
 
   private async fetchJson<T>(
@@ -394,7 +595,9 @@ class BtvMetadataPlugin extends BasePlugin {
     }
   }
 
-  private collectCoverUrls(...sets: Array<BgmImageSet | string | undefined>): string[] {
+  private collectCoverUrls(
+    ...sets: Array<BgmImageSet | string | undefined>
+  ): string[] {
     const urls: string[] = [];
     for (const item of sets) {
       if (!item) continue;
@@ -431,7 +634,9 @@ class BtvMetadataPlugin extends BasePlugin {
 
   private extractSubjectIdFromTags(existingTags: string): number | null {
     if (!existingTags) return null;
-    const m = existingTags.match(/source:\s*https?:\/\/[^\s,]*bangumi\.tv\/subject\/(\d+)/i);
+    const m = existingTags.match(
+      /source:\s*https?:\/\/[^\s,]*bangumi\.tv\/subject\/(\d+)/i,
+    );
     if (m?.[1]) {
       const id = Number(m[1]);
       return Number.isFinite(id) && id > 0 ? id : null;
@@ -562,7 +767,9 @@ class BtvMetadataPlugin extends BasePlugin {
 
     const direct = s.match(/^(\d{4})[-/年](\d{1,2})[-/月](\d{1,2})/);
     if (direct) {
-      return `${direct[1]}-${direct[2].padStart(2, "0")}-${direct[3].padStart(2, "0")}`;
+      return `${direct[1]}-${direct[2].padStart(2, "0")}-${
+        direct[3].padStart(2, "0")
+      }`;
     }
 
     const ym = s.match(/^(\d{4})[-/年](\d{1,2})/);
@@ -588,11 +795,15 @@ class BtvMetadataPlugin extends BasePlugin {
     return Math.trunc(v);
   }
 
-  private async cacheCoverForResult(urls: string[], key: string): Promise<string> {
+  private async cacheCoverForResult(
+    urls: string[],
+    key: string,
+  ): Promise<string> {
     if (!Array.isArray(urls) || urls.length === 0) return "";
 
     const pluginDir = String(this.input?.pluginDir || "").trim();
-    const namespace = String(this.getPluginInfo().namespace || "btvmeta").trim();
+    const namespace = String(this.getPluginInfo().namespace || "btvmeta")
+      .trim();
     if (!pluginDir || !namespace) return "";
 
     const cacheDir = `${pluginDir}/cache/covers`;
@@ -617,7 +828,10 @@ class BtvMetadataPlugin extends BasePlugin {
         const bytes = new Uint8Array(await response.arrayBuffer());
         if (!bytes.length) continue;
 
-        const ext = this.detectImageExtension(imageUrl, response.headers.get("content-type") || "");
+        const ext = this.detectImageExtension(
+          imageUrl,
+          response.headers.get("content-type") || "",
+        );
         const fileName = `${safeKey}.${ext}`;
         const outputPath = `${cacheDir}/${fileName}`;
         await Deno.writeFile(outputPath, bytes);
