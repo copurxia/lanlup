@@ -86,16 +86,17 @@ class NfoMetadataPlugin extends BasePlugin {
   protected async runPlugin(input: PluginInput): Promise<void> {
     try {
       const params = this.getParams();
-      const targetId = String(input.archiveId || "").trim();
+      const metadata = this.readMetadataObject(input);
+      const targetId = String(input.targetId || "").trim();
       if (!targetId) {
-        this.outputResult({ success: false, error: "Missing archiveId/targetId" });
+        this.outputResult({ success: false, error: "Missing targetId" });
         return;
       }
 
       const targetType = String((params.__target_type as string) || "archive").trim().toLowerCase();
       const tagWithSource = this.readBoolParam(params, "tag_with_source", true);
       if (targetType === "tankoubon" || targetType === "tank") {
-        await this.runTankoubonMode(targetId, tagWithSource);
+        await this.runTankoubonMode(targetId, tagWithSource, metadata);
         return;
       }
 
@@ -104,7 +105,7 @@ class NfoMetadataPlugin extends BasePlugin {
         applyEpisodeSort: this.readBoolParam(params, "apply_episode_sort", true),
         includeEpisodePlot: this.readBoolParam(params, "include_episode_plot", true),
         tagWithSource,
-      });
+      }, metadata);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       this.outputResult({ success: false, error: `NFO plugin execution failed: ${message}` });
@@ -119,6 +120,7 @@ class NfoMetadataPlugin extends BasePlugin {
       includeEpisodePlot: boolean;
       tagWithSource: boolean;
     },
+    metadata: any,
   ): Promise<void> {
     this.reportProgress(10, "Listing adjacent files...");
     const listing = await this.callHost<AdjacentFilesResponse>("archive.listAdjacentFiles", { archiveId });
@@ -129,8 +131,8 @@ class NfoMetadataPlugin extends BasePlugin {
       .map((f) => f.raw)
       .filter((file) => file.toLowerCase().endsWith(".nfo"));
 
-    let archiveTitle = "";
-    let archiveSummary = "";
+    let archiveTitle = String(metadata.title || "");
+    let archiveSummary = String(metadata.description || "");
     let seasonNumberHint = 0;
     let selectedSource: SourceTagCandidate | null = null;
     const discoveredTags = new Set<string>();
@@ -225,7 +227,7 @@ class NfoMetadataPlugin extends BasePlugin {
 
     const pages = [...pagePatches.values()];
 
-    let tags = String(this.input?.existingTags || "").trim();
+    let tags = this.metadataTagsToCsv(metadata.tags);
     tags = this.mergeTagList(tags, [...discoveredTags]);
     const parentTvshow = await this.readTvshowInfoForArchive(archiveId);
     tags = this.mergeTagList(tags, parentTvshow.genreTags);
@@ -239,20 +241,21 @@ class NfoMetadataPlugin extends BasePlugin {
       }
     }
 
+    const next = this.cloneMetadataObject(metadata);
+    if (archiveTitle.trim()) {
+      next.title = archiveTitle;
+    }
+    next.description = archiveSummary;
+    next.tags = this.metadataTagsFromCsv(tags);
+    next.assets = this.metadataSetAssetValue(next.assets, "cover", archiveCover);
+    next.archive = [];
+    (next as Record<string, unknown>).pages = pages;
+
     this.reportProgress(100, "NFO metadata done");
-    this.outputResult({
-      success: true,
-      data: {
-        title: archiveTitle,
-        summary: archiveSummary,
-        tags,
-        cover: archiveCover,
-        pages,
-      },
-    });
+    this.outputResult({ success: true, data: next });
   }
 
-  private async runTankoubonMode(tankoubonId: string, tagWithSource: boolean): Promise<void> {
+  private async runTankoubonMode(tankoubonId: string, tagWithSource: boolean, metadata: any): Promise<void> {
     this.reportProgress(10, "Listing collection archives...");
     const listing = await this.callHost<TankoubonArchivesResponse>("tankoubon.listArchives", {
       tankoubonId,
@@ -275,13 +278,15 @@ class NfoMetadataPlugin extends BasePlugin {
         }
       }
 
-      patches.push({
-        archive_id: archiveId,
+      patches.push(this.cloneMetadataObject({
         title: seasonMeta.title,
-        summary: seasonMeta.summary,
-        tags: patchTags,
-        cover: seasonMeta.cover,
-      });
+        type: 0,
+        description: seasonMeta.summary,
+        tags: this.metadataTagsFromCsv(patchTags),
+        assets: this.metadataSetAssetValue([], "cover", seasonMeta.cover),
+        archive: [],
+        archive_id: archiveId,
+      }));
     }
 
     const collectionTags = this.mergeTagList("", collectionMeta?.genreTags || []);
@@ -299,17 +304,21 @@ class NfoMetadataPlugin extends BasePlugin {
       }
     }
 
+    const next = this.cloneMetadataObject(metadata);
+    const collectionTitle = String(collectionMeta?.title || "").trim();
+    if (collectionTitle) {
+      next.title = collectionTitle;
+    }
+    const collectionSummary = String(collectionMeta?.summary || "").trim();
+    if (collectionSummary) {
+      next.description = collectionSummary;
+    }
+    next.tags = this.metadataTagsFromCsv(outputTags);
+    next.assets = this.metadataSetAssetValue(next.assets, "cover", collectionCover);
+    next.archive = patches.map((item) => this.cloneMetadataObject(item as any));
+
     this.reportProgress(100, "Collection NFO metadata done");
-    this.outputResult({
-      success: true,
-      data: {
-        title: collectionMeta?.title || "",
-        summary: collectionMeta?.summary || "",
-        tags: outputTags,
-        cover: collectionCover,
-        archives: patches,
-      },
-    });
+    this.outputResult({ success: true, data: next });
   }
 
   private readBoolParam(params: Record<string, unknown>, key: string, defaultValue: boolean): boolean {

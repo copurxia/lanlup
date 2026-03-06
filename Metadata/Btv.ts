@@ -111,6 +111,7 @@ class BtvMetadataPlugin extends BasePlugin {
     try {
       this.reportProgress(5, "初始化 Bangumi 元数据抓取...");
       const params = this.getParams();
+      const metadata = this.readMetadataObject(input);
 
       const type = this.clampInt(
         Number(params.type ?? BtvMetadataPlugin.DEFAULT_TYPE),
@@ -125,8 +126,8 @@ class BtvMetadataPlugin extends BasePlugin {
       const preferNameCn = !!params.prefer_name_cn;
       const accessToken = String(params.access_token ?? "").trim();
       const oneshotParam = String(input.oneshotParam || "").trim();
-      const existingTags = String(input.existingTags || "");
-      const archiveTitle = String(input.archiveTitle || "");
+      const existingTags = this.metadataTagsToCsv(metadata.tags);
+      const archiveTitle = String(metadata.title || "");
       const searchKeywords = this.collectSearchKeywords(
         oneshotParam,
         archiveTitle,
@@ -175,23 +176,67 @@ class BtvMetadataPlugin extends BasePlugin {
         `series_${subjectId}`,
       );
 
+      const next = this.cloneMetadataObject(metadata);
+      if (primaryTitle.trim()) {
+        next.title = primaryTitle;
+      }
+      if (summary.trim()) {
+        next.description = summary;
+      }
+      if (mergedTags.trim()) {
+        next.tags = this.metadataTagsFromCsv(mergedTags);
+      }
+      if (seriesCover.trim()) {
+        next.assets = this.metadataSetAssetValue(next.assets, "cover", seriesCover);
+      }
+      next.archive = volumes.map((item) => {
+        return this.cloneMetadataObject({
+          title: item.title,
+          type: 0,
+          description: item.summary,
+          tags: this.metadataTagsFromCsv(item.tags),
+          assets: this.metadataSetAssetValue([], "cover", item.cover || ""),
+          archive: [],
+          volume_no: item.volume_no,
+          release_date: item.release_date || "",
+          isbn: item.isbn || "",
+          source_url: item.source_url,
+        });
+      });
+      if (!String(next.title || "").trim()) {
+        const fallbackTitle = String((next.archive?.[0] as any)?.title || "").trim();
+        if (fallbackTitle) {
+          next.title = fallbackTitle;
+        }
+      }
+      if (!String(next.description || "").trim()) {
+        const fallbackSummary = String(
+          (next.archive?.[0] as any)?.description || "",
+        ).trim();
+        if (fallbackSummary) {
+          next.description = fallbackSummary;
+        }
+      }
+      if (!Array.isArray(next.tags) || next.tags.length === 0) {
+        next.tags = this.metadataTagsFromCsv(
+          `source:${BtvMetadataPlugin.WEB_BASE}/subject/${subjectId}, btv:type:${type}`,
+        );
+      }
+      if (!Array.isArray(next.assets) || next.assets.length === 0) {
+        const firstArchiveAssets = (next.archive?.[0] as any)?.assets as
+          | Array<{ key?: string; value?: string }>
+          | undefined;
+        const fallbackCover = this.metadataGetAssetValue(firstArchiveAssets as any, "cover");
+        if (fallbackCover) {
+          next.assets = this.metadataSetAssetValue(next.assets, "cover", fallbackCover);
+        }
+      }
+      next.source_url = `${BtvMetadataPlugin.WEB_BASE}/subject/${subjectId}`;
+
       this.reportProgress(100, "元数据获取完成");
       this.outputResult({
         success: true,
-        data: {
-          title: primaryTitle,
-          summary,
-          tags: mergedTags,
-          cover: seriesCover,
-          tankoubon: {
-            title: primaryTitle,
-            summary,
-            tags: mergedTags,
-            cover: seriesCover,
-            source_url: `${BtvMetadataPlugin.WEB_BASE}/subject/${subjectId}`,
-          },
-          archives: volumes,
-        },
+        data: next,
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);

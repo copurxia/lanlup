@@ -21,9 +21,7 @@ type TankoubonArchivesResponse = {
 
 type ArchiveMetadataResponse = {
   archiveId?: string;
-  title?: string;
-  existingTags?: string;
-  thumbnailHash?: string;
+  metadata?: Record<string, unknown>;
 };
 
 /**
@@ -112,9 +110,10 @@ class EHentaiMetadataPlugin extends BasePlugin {
     try {
       this.reportProgress(5, "初始化元数据搜索...");
       const params = this.getParams();
+      const metadata = this.readMetadataObject(input);
       const debug = !!params.debug;
       const targetType = this.normalizeTargetType(params.__target_type);
-      const targetId = String(params.__target_id || input.archiveId || "").trim();
+      const targetId = String(params.__target_id || input.targetId || "").trim();
 
       if (this.isCollectionTargetType(targetType)) {
         await this.logInfo("run:collection_mode", {
@@ -122,6 +121,7 @@ class EHentaiMetadataPlugin extends BasePlugin {
           target_id: targetId,
         });
         const collectionResult = await this.getTagsForCollection(
+          metadata,
           targetId,
           params.lang || "",
           params.usethumbs || false,
@@ -138,11 +138,11 @@ class EHentaiMetadataPlugin extends BasePlugin {
       }
 
       await this.logInfo("run:start", {
-        archive_id: input.archiveId || "",
+        archive_id: input.targetId || "",
         target_type: targetType || "archive",
         has_oneshot: !!input.oneshotParam,
-        title_len: (input.archiveTitle || "").length,
-        has_thumbhash: !!(input.thumbnailHash || ""),
+        title_len: (metadata.title || "").length,
+        has_thumbhash: !!(metadata.thumbnail_hash || ""),
         login_cookie_count: (input.loginCookies || []).length,
         usethumbs: !!params.usethumbs,
         search_gid: !!params.search_gid,
@@ -155,12 +155,12 @@ class EHentaiMetadataPlugin extends BasePlugin {
 
       // 从 input 中获取必要信息
       const lrrInfo = {
-        archive_title: input.archiveTitle || "",
-        existing_tags: input.existingTags || "",
-        thumbnail_hash: input.thumbnailHash || "",
+        archive_title: metadata.title || "",
+        existing_tags: this.metadataTagsToCsv(metadata.tags),
+        thumbnail_hash: String(metadata.thumbnail_hash || ""),
         login_cookies: input.loginCookies || [],
         oneshot_param: input.oneshotParam || "",
-        archive_id: input.archiveId || "",
+        archive_id: input.targetId || "",
         debug,
       };
 
@@ -177,8 +177,22 @@ class EHentaiMetadataPlugin extends BasePlugin {
         params.expunged || false,
       );
 
+      if (!result.success) {
+        this.outputResult(result);
+        return;
+      }
+
+      const payload = (result.data || {}) as Record<string, unknown>;
+      const next = this.cloneMetadataObject(metadata);
+      const nextTitle = String(payload.title || "").trim();
+      if (nextTitle) {
+        next.title = nextTitle;
+      }
+      next.tags = this.metadataTagsFromCsv(String(payload.tags || ""));
+      next.archive = [];
+
       this.reportProgress(100, "元数据获取完成");
-      this.outputResult(result);
+      this.outputResult({ success: true, data: next });
     } catch (error) {
       const errorMessage = error instanceof Error
         ? error.message
@@ -199,6 +213,7 @@ class EHentaiMetadataPlugin extends BasePlugin {
   }
 
   private async getTagsForCollection(
+    rootMetadata: any,
     tankoubonId: string,
     lang: string,
     usethumbs: boolean,
@@ -245,11 +260,12 @@ class EHentaiMetadataPlugin extends BasePlugin {
         "archive.getMetadata",
         { archiveId },
       );
+      const archiveMeta = this.cloneMetadataObject((meta?.metadata || {}) as any);
 
       const lrrInfo = {
-        archive_title: String(meta?.title || ""),
-        existing_tags: String(meta?.existingTags || ""),
-        thumbnail_hash: String(meta?.thumbnailHash || ""),
+        archive_title: String(archiveMeta.title || ""),
+        existing_tags: this.metadataTagsToCsv(archiveMeta.tags),
+        thumbnail_hash: String(archiveMeta.thumbnail_hash || ""),
         login_cookies: loginCookies,
         oneshot_param: "",
         archive_id: archiveId,
@@ -275,17 +291,23 @@ class EHentaiMetadataPlugin extends BasePlugin {
       }
 
       patches.push({
-        archive_id: archiveId,
-        title: String(result.data.title || ""),
-        tags: String(result.data.tags || ""),
+        ...this.cloneMetadataObject({
+          ...archiveMeta,
+          archive_id: archiveId,
+          volume_no: i + 1,
+          title: String(result.data.title || archiveMeta.title || ""),
+          tags: this.metadataTagsFromCsv(String(result.data.tags || "")),
+          archive: [],
+        }),
       });
     }
 
+    const next = this.cloneMetadataObject((rootMetadata || {}) as any);
+    next.archive = patches.map((item) => this.cloneMetadataObject(item as any));
+
     return {
       success: true,
-      data: {
-        archives: patches,
-      },
+      data: next,
     };
   }
 

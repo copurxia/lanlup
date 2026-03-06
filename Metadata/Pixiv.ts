@@ -157,6 +157,7 @@ class PixivMetadataPlugin extends BasePlugin {
     try {
       this.reportProgress(5, "初始化 Pixiv 元数据抓取...");
       const params = this.getParams();
+      const metadata = this.readMetadataObject(input);
 
       const lang = String(params.lang || "en").trim() || "en";
       const mergeExisting = !!params.merge_existing;
@@ -169,8 +170,8 @@ class PixivMetadataPlugin extends BasePlugin {
       const illustId =
         this.extractIllustId(String(meta?.illustId || "").trim()) ||
         this.extractIllustId(String(input.oneshotParam || "").trim()) ||
-        this.extractIllustIdFromSourceTag(String(input.existingTags || "")) ||
-        this.extractIllustIdFromTitle(String(input.archiveTitle || ""));
+        this.extractIllustIdFromSourceTag(this.metadataTagsToCsv(metadata.tags)) ||
+        this.extractIllustIdFromTitle(String(metadata.title || ""));
 
       if (!illustId) {
         this.outputResult({
@@ -200,17 +201,19 @@ class PixivMetadataPlugin extends BasePlugin {
           ? this.mergeTags(tags, `updated_at:${updatedAt}`)
           : tags;
         const merged = mergeExisting
-          ? this.mergeTags(String(input.existingTags || ""), tagsWithUpdatedAt)
+          ? this.mergeTags(this.metadataTagsToCsv(metadata.tags), tagsWithUpdatedAt)
           : tagsWithUpdatedAt;
+
+        const next = this.cloneMetadataObject(metadata);
+        next.title = title;
+        next.description = summary;
+        next.tags = this.metadataTagsFromCsv(merged);
+        next.archive = [];
 
         this.reportProgress(100, "从 meta.json 获取元数据完成");
         this.outputResult({
           success: true,
-          data: {
-            title,
-            summary,
-            tags: merged,
-          },
+          data: next,
         });
         return;
       }
@@ -241,17 +244,19 @@ class PixivMetadataPlugin extends BasePlugin {
         ? this.mergeTags(tags, `updated_at:${updatedAt}`)
         : tags;
       const merged = mergeExisting
-        ? this.mergeTags(String(input.existingTags || ""), tagsWithUpdatedAt)
+        ? this.mergeTags(this.metadataTagsToCsv(metadata.tags), tagsWithUpdatedAt)
         : tagsWithUpdatedAt;
+
+      const next = this.cloneMetadataObject(metadata);
+      next.title = title;
+      next.description = summary;
+      next.tags = this.metadataTagsFromCsv(merged);
+      next.archive = [];
 
       this.reportProgress(100, "元数据获取完成");
       this.outputResult({
         success: true,
-        data: {
-          title,
-          summary,
-          tags: merged,
-        },
+        data: next,
       });
     } catch (error) {
       const errorMessage = error instanceof Error
@@ -283,7 +288,7 @@ class PixivMetadataPlugin extends BasePlugin {
   }
 
   private async tryLoadMetaJson(input: PluginInput): Promise<PixivMetaJson | null> {
-    const archiveId = String(input.archiveId || "").trim();
+    const archiveId = String(input.targetId || "").trim();
     const pluginDir = String(input.pluginDir || "").trim();
     if (!archiveId || !pluginDir) return null;
 

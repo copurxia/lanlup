@@ -48,13 +48,15 @@ class NHentaiMetadataPlugin extends BasePlugin {
       // Accept legacy param name `add_uploaded` (older plugin versions) in addition to `additionaltags`.
       const addUploaded = this.coerceBoolLike((params as any).additionaltags ?? (params as any).add_uploaded);
 
+      const metadata = this.readMetadataObject(input);
+
       this.loginCookies = this.buildCookieString(
         (input.loginCookies || []) as Array<{ name: string; value: string; domain?: string; path?: string }>,
       );
 
       const oneshot = String(input.oneshotParam || "").trim();
-      const existingTags = String(input.existingTags || "");
-      const title = String(input.archiveTitle || "").trim();
+      const existingTags = this.metadataTagsToCsv(metadata.tags);
+      const title = String(metadata.title || "").trim();
 
       const galleryId =
         this.extractGalleryId(oneshot) ||
@@ -69,8 +71,22 @@ class NHentaiMetadataPlugin extends BasePlugin {
 
       this.reportProgress(30, `获取画廊 ${galleryId} 元数据...`);
       const result = await this.fetchGalleryMetadata(galleryId, addUploaded);
+      if (!result.success) {
+        this.outputResult(result);
+        return;
+      }
+
+      const data = (result.data || {}) as Record<string, unknown>;
+      const next = this.cloneMetadataObject(metadata);
+      const nextTitle = String(data.title || "").trim();
+      if (nextTitle) {
+        next.title = nextTitle;
+      }
+      next.tags = this.metadataTagsFromCsv(String(data.tags || ""));
+      next.archive = [];
+
       this.reportProgress(100, "元数据获取完成");
-      this.outputResult(result);
+      this.outputResult({ success: true, data: next });
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
       this.outputResult({ success: false, error: `Plugin execution failed: ${errorMessage}` });

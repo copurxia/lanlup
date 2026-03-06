@@ -43,17 +43,18 @@ class TwitterMetadataPlugin extends BasePlugin {
     try {
       this.reportProgress(5, "Initializing X metadata...");
       const params = this.getParams();
+      const metadata = this.readMetadataObject(input);
       const mergeExisting = !!params.merge_existing;
       const prefixId = !!params.prefix_id;
       const stripNewlines = !!params.strip_newlines;
 
       const oneshot = String(input.oneshotParam || "").trim();
-      const existingTags = String(input.existingTags || "");
+      const existingTags = this.metadataTagsToCsv(metadata.tags);
 
       const tweetId =
         this.extractTweetId(oneshot) ||
         this.extractTweetIdFromSourceTag(existingTags) ||
-        this.extractTweetIdFromTitle(String(input.archiveTitle || ""));
+        this.extractTweetIdFromTitle(String(metadata.title || ""));
 
       if (!tweetId) {
         this.outputResult({
@@ -101,15 +102,16 @@ class TwitterMetadataPlugin extends BasePlugin {
       const createdAt = this.normalizeToEpochSeconds(tweetLegacy?.createdAt);
       const tags = this.buildTags(tweetId, tweetUrl, screenName, displayName, createdAt);
       const merged = mergeExisting ? this.mergeTags(existingTags, tags) : tags;
+      const next = this.cloneMetadataObject(metadata);
+      next.title = title;
+      next.description = description;
+      next.tags = this.metadataTagsFromCsv(merged);
+      next.archive = [];
 
       this.reportProgress(100, "Metadata fetched");
       this.outputResult({
         success: true,
-        data: {
-          title,
-          summary: description,
-          tags: merged,
-        },
+        data: next,
       });
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);

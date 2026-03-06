@@ -29,11 +29,12 @@ class OpfSidecarMetadataPlugin extends BasePlugin {
     try {
       this.reportProgress(5, "扫描归档旁路元数据文件...");
       const params = this.getParams();
-      const archiveId = String(input.archiveId || "").trim();
+      const archiveId = String(input.targetId || "").trim();
       if (!archiveId) {
-        this.outputResult({ success: false, error: "Missing archiveId" });
+        this.outputResult({ success: false, error: "Missing targetId" });
         return;
       }
+      const metadata = this.readMetadataObject(input);
 
       const preferredFromParam = String(params.sidecar_name || "metadata.opf").trim();
       const preferredFromOneshot = String(input.oneshotParam || "").trim();
@@ -88,16 +89,22 @@ class OpfSidecarMetadataPlugin extends BasePlugin {
       }
 
       const deduped = this.dedupeTags(tags).join(", ");
-      const merged = mergeExisting ? this.mergeTags(String(input.existingTags || ""), deduped) : deduped;
+      const merged = mergeExisting ? this.mergeTags(this.metadataTagsToCsv(metadata.tags), deduped) : deduped;
+
+      const next = this.cloneMetadataObject(metadata);
+      if (title.trim()) {
+        next.title = title;
+      }
+      if (summary.trim()) {
+        next.description = summary;
+      }
+      next.tags = this.metadataTagsFromCsv(merged);
+      next.archive = [];
 
       this.reportProgress(100, "OPF 元数据导入完成");
       this.outputResult({
         success: true,
-        data: {
-          title,
-          summary,
-          tags: merged,
-        },
+        data: next,
       });
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
