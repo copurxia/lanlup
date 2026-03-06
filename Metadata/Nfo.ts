@@ -41,7 +41,21 @@ type SeasonMeta = {
   genreTags: string[];
   seasonNumber: number;
   cover: string;
+  backdrop: string;
+  clearlogo: string;
 };
+
+type TvshowMeta = {
+  title: string;
+  summary: string;
+  sourceTag: string;
+  genreTags: string[];
+  cover: string;
+  backdrop: string;
+  clearlogo: string;
+};
+
+type ArtworkKey = "backdrop" | "clearlogo";
 
 class NfoMetadataPlugin extends BasePlugin {
   getPluginInfo(): PluginInfo {
@@ -50,7 +64,7 @@ class NfoMetadataPlugin extends BasePlugin {
       type: "metadata",
       namespace: "nfo",
       author: "codex",
-      version: "1.2.1",
+      version: "1.2.2",
       description:
         "Parses season/tvshow/episode NFO files, applies per-file page metadata by path, episode sorting, and cover hiding.",
       parameters: [
@@ -224,6 +238,8 @@ class NfoMetadataPlugin extends BasePlugin {
       seasonNumberHint,
       episodeCoverFallback,
     );
+    const archiveBackdrop = await this.findArchiveArtworkForArchive(archiveId, files, seasonNumberHint, "backdrop");
+    const archiveClearlogo = await this.findArchiveArtworkForArchive(archiveId, files, seasonNumberHint, "clearlogo");
 
     const pages = [...pagePatches.values()];
 
@@ -248,6 +264,8 @@ class NfoMetadataPlugin extends BasePlugin {
     next.description = archiveSummary;
     next.tags = this.metadataTagsFromCsv(tags);
     next.assets = this.metadataSetAssetValue(next.assets, "cover", archiveCover);
+    next.assets = this.metadataSetAssetValue(next.assets, "backdrop", archiveBackdrop);
+    next.assets = this.metadataSetAssetValue(next.assets, "clearlogo", archiveClearlogo);
     next.archive = [];
     (next as Record<string, unknown>).pages = pages;
 
@@ -264,6 +282,9 @@ class NfoMetadataPlugin extends BasePlugin {
     const collectionMeta = await this.readTvshowMetadataForTankoubon(archiveIds);
 
     const patches: Array<Record<string, unknown>> = [];
+    let firstArchiveCover = "";
+    let firstArchiveBackdrop = "";
+    let firstArchiveClearlogo = "";
     for (const archiveId of archiveIds) {
       const seasonMeta = await this.readSeasonMetadata(archiveId);
       if (!seasonMeta) continue;
@@ -278,12 +299,25 @@ class NfoMetadataPlugin extends BasePlugin {
         }
       }
 
+      if (!firstArchiveCover && seasonMeta.cover) {
+        firstArchiveCover = seasonMeta.cover;
+      }
+      if (!firstArchiveBackdrop && seasonMeta.backdrop) {
+        firstArchiveBackdrop = seasonMeta.backdrop;
+      }
+      if (!firstArchiveClearlogo && seasonMeta.clearlogo) {
+        firstArchiveClearlogo = seasonMeta.clearlogo;
+      }
+
+      let patchAssets = this.metadataSetAssetValue([], "cover", seasonMeta.cover);
+      patchAssets = this.metadataSetAssetValue(patchAssets, "backdrop", seasonMeta.backdrop);
+      patchAssets = this.metadataSetAssetValue(patchAssets, "clearlogo", seasonMeta.clearlogo);
       patches.push(this.cloneMetadataObject({
         title: seasonMeta.title,
         type: 0,
         description: seasonMeta.summary,
         tags: this.metadataTagsFromCsv(patchTags),
-        assets: this.metadataSetAssetValue([], "cover", seasonMeta.cover),
+        assets: patchAssets,
         archive: [],
         archive_id: archiveId,
       }));
@@ -293,16 +327,9 @@ class NfoMetadataPlugin extends BasePlugin {
     const outputTags = tagWithSource
       ? this.mergeTags(collectionTags, collectionMeta?.sourceTag || "")
       : collectionTags;
-    let collectionCover = collectionMeta?.cover || "";
-    if (!collectionCover) {
-      for (const patch of patches) {
-        const candidate = String(patch.cover || "").trim();
-        if (candidate) {
-          collectionCover = candidate;
-          break;
-        }
-      }
-    }
+    const collectionCover = collectionMeta?.cover || firstArchiveCover;
+    const collectionBackdrop = collectionMeta?.backdrop || firstArchiveBackdrop;
+    const collectionClearlogo = collectionMeta?.clearlogo || firstArchiveClearlogo;
 
     const next = this.cloneMetadataObject(metadata);
     const collectionTitle = String(collectionMeta?.title || "").trim();
@@ -315,6 +342,8 @@ class NfoMetadataPlugin extends BasePlugin {
     }
     next.tags = this.metadataTagsFromCsv(outputTags);
     next.assets = this.metadataSetAssetValue(next.assets, "cover", collectionCover);
+    next.assets = this.metadataSetAssetValue(next.assets, "backdrop", collectionBackdrop);
+    next.assets = this.metadataSetAssetValue(next.assets, "clearlogo", collectionClearlogo);
     next.archive = patches.map((item) => this.cloneMetadataObject(item as any));
 
     this.reportProgress(100, "Collection NFO metadata done");
@@ -358,6 +387,8 @@ class NfoMetadataPlugin extends BasePlugin {
         this.readXmlInt(xml, ["seasonnumber", "season"]) ||
         this.extractSeasonNumberFromText(String(listing?.baseDir || ""));
       const cover = await this.findArchiveCoverForArchive(archiveId, files, seasonNumber, "");
+      const backdrop = await this.findArchiveArtworkForArchive(archiveId, files, seasonNumber, "backdrop");
+      const clearlogo = await this.findArchiveArtworkForArchive(archiveId, files, seasonNumber, "clearlogo");
 
       return {
         title: this.readXmlTag(xml, ["title"]).trim(),
@@ -366,6 +397,8 @@ class NfoMetadataPlugin extends BasePlugin {
         genreTags: this.parseGenreTags(xml),
         seasonNumber,
         cover,
+        backdrop,
+        clearlogo,
       };
     } catch {
       return null;
@@ -374,7 +407,7 @@ class NfoMetadataPlugin extends BasePlugin {
 
   private async readTvshowMetadataForTankoubon(
     archiveIds: string[],
-  ): Promise<{ title: string; summary: string; sourceTag: string; genreTags: string[]; cover: string } | null> {
+  ): Promise<TvshowMeta | null> {
     const visitedBaseDirs = new Set<string>();
 
     for (const archiveId of archiveIds) {
@@ -403,8 +436,18 @@ class NfoMetadataPlugin extends BasePlugin {
         const sourceTag = this.parseSourceTag(xml);
         const genreTags = this.parseGenreTags(xml);
         const cover = await this.extractBestThumbFromCandidates(archiveId, this.findGeneralCoverCandidates(files), 1);
-        if (title || summary || sourceTag || genreTags.length > 0 || cover) {
-          return { title, summary, sourceTag, genreTags, cover };
+        const backdrop = await this.extractBestThumbFromCandidates(
+          archiveId,
+          this.findArtworkCandidates(files, 0, "backdrop"),
+          1,
+        );
+        const clearlogo = await this.extractBestThumbFromCandidates(
+          archiveId,
+          this.findArtworkCandidates(files, 0, "clearlogo"),
+          1,
+        );
+        if (title || summary || sourceTag || genreTags.length > 0 || cover || backdrop || clearlogo) {
+          return { title, summary, sourceTag, genreTags, cover, backdrop, clearlogo };
         }
       } catch {
         // keep trying other archives in the collection
@@ -742,6 +785,106 @@ class NfoMetadataPlugin extends BasePlugin {
     return fallbackEpisodeCover || "";
   }
 
+  private async findArchiveArtworkForArchive(
+    archiveId: string,
+    sameDirFiles: string[],
+    seasonNumber: number,
+    assetKey: ArtworkKey,
+  ): Promise<string> {
+    const localSeasonSpecificCandidates = this.findSeasonSpecificArtworkCandidates(sameDirFiles, seasonNumber, assetKey);
+    const localSeasonSpecificAsset = await this.extractBestThumbFromCandidates(archiveId, localSeasonSpecificCandidates);
+    if (localSeasonSpecificAsset) {
+      return localSeasonSpecificAsset;
+    }
+
+    let parentFiles: string[] = [];
+    try {
+      const parentListing = await this.callHost<AdjacentFilesResponse>("archive.listAdjacentFiles", {
+        archiveId,
+        levelsUp: 1,
+      });
+      parentFiles = Array.isArray(parentListing?.files) ? parentListing.files : [];
+      const parentSeasonSpecificCandidates = this.findSeasonSpecificArtworkCandidates(parentFiles, seasonNumber, assetKey);
+      const parentSeasonSpecificAsset = await this.extractBestThumbFromCandidates(
+        archiveId,
+        parentSeasonSpecificCandidates,
+        1,
+      );
+      if (parentSeasonSpecificAsset) {
+        return parentSeasonSpecificAsset;
+      }
+    } catch {
+      // ignore parent artwork lookup errors and keep fallback behavior
+    }
+
+    const localCandidates = this.findArtworkCandidates(sameDirFiles, seasonNumber, assetKey);
+    const localAsset = await this.extractBestThumbFromCandidates(archiveId, localCandidates);
+    if (localAsset) {
+      return localAsset;
+    }
+
+    try {
+      const parentCandidates = this.findArtworkCandidates(parentFiles, seasonNumber, assetKey);
+      const parentAsset = await this.extractBestThumbFromCandidates(archiveId, parentCandidates, 1);
+      if (parentAsset) {
+        return parentAsset;
+      }
+    } catch {
+      // ignore parent artwork lookup errors and keep fallback behavior
+    }
+
+    return "";
+  }
+
+  private findSeasonSpecificArtworkCandidates(files: string[], seasonNumber: number, assetKey: ArtworkKey): string[] {
+    const seasonTokens = this.buildSeasonTokens(seasonNumber);
+    if (seasonTokens.length === 0) {
+      return [];
+    }
+
+    const out: Array<{ path: string; score: number }> = [];
+    for (const file of files) {
+      if (!this.isImageFile(file)) continue;
+      const stem = this.stripExtension(file).toLowerCase();
+      if (this.looksLikeEpisodeStem(stem)) continue;
+
+      let score = 0;
+      for (const token of seasonTokens) {
+        if (!token) continue;
+        score = Math.max(score, this.scoreSeasonSpecificArtworkCandidate(stem, token, assetKey));
+      }
+
+      if (score > 0) {
+        out.push({ path: file, score });
+      }
+    }
+
+    out.sort((a, b) => b.score - a.score || a.path.localeCompare(b.path));
+    return this.unique(out.map((item) => item.path));
+  }
+
+  private findArtworkCandidates(files: string[], seasonNumber: number, assetKey: ArtworkKey): string[] {
+    const seasonTokens = this.buildSeasonTokens(seasonNumber);
+    const out: Array<{ path: string; score: number }> = [];
+    for (const file of files) {
+      if (!this.isImageFile(file)) continue;
+      const stem = this.stripExtension(file).toLowerCase();
+      if (this.looksLikeEpisodeStem(stem)) continue;
+
+      let score = this.scoreGeneralArtworkCandidate(stem, assetKey);
+      for (const token of seasonTokens) {
+        if (!token) continue;
+        score = Math.max(score, this.scoreSeasonArtworkCandidate(stem, token, assetKey));
+      }
+
+      if (score > 0) {
+        out.push({ path: file, score });
+      }
+    }
+    out.sort((a, b) => b.score - a.score || a.path.localeCompare(b.path));
+    return this.unique(out.map((item) => item.path));
+  }
+
   private findSeasonSpecificCoverCandidates(files: string[], seasonNumber: number): string[] {
     const seasonTokens = this.buildSeasonTokens(seasonNumber);
     if (seasonTokens.length === 0) {
@@ -839,6 +982,56 @@ class NfoMetadataPlugin extends BasePlugin {
     if (stemLower.includes("thumb")) return 620;
     if (stemLower.includes("backdrop") || stemLower.includes("fanart")) return 600;
     return 0;
+  }
+
+  private scoreGeneralArtworkCandidate(stemLower: string, assetKey: ArtworkKey): number {
+    if (assetKey === "backdrop") {
+      if (stemLower === "backdrop") return 1100;
+      if (stemLower === "fanart") return 1080;
+      if (stemLower === "landscape") return 1040;
+      if (stemLower === "background") return 980;
+      if (this.matchesStemToken(stemLower, "backdrop")) return 820;
+      if (this.matchesStemToken(stemLower, "fanart")) return 780;
+      if (this.matchesStemToken(stemLower, "landscape")) return 740;
+      if (this.matchesStemToken(stemLower, "background")) return 700;
+      return 0;
+    }
+
+    if (stemLower === "clearlogo") return 1100;
+    if (stemLower === "logo") return 1000;
+    if (this.matchesStemToken(stemLower, "clearlogo")) return 920;
+    if (this.matchesStemToken(stemLower, "logo")) return 780;
+    return 0;
+  }
+
+  private scoreSeasonArtworkCandidate(stemLower: string, token: string, assetKey: ArtworkKey): number {
+    if (!token) return 0;
+    if (assetKey === "backdrop") {
+      if (stemLower === `${token}-backdrop` || stemLower === `${token}_backdrop`) return 1500;
+      if (stemLower === `${token}-fanart` || stemLower === `${token}_fanart`) return 1480;
+      if (stemLower.includes(token) && this.matchesStemToken(stemLower, "backdrop")) return 1380;
+      if (stemLower.includes(token) && this.matchesStemToken(stemLower, "fanart")) return 1340;
+      if (stemLower.includes(token) && this.matchesStemToken(stemLower, "landscape")) return 1280;
+      return 0;
+    }
+
+    if (stemLower === `${token}-clearlogo` || stemLower === `${token}_clearlogo`) return 1500;
+    if (stemLower === `${token}-logo` || stemLower === `${token}_logo`) return 1450;
+    if (stemLower.includes(token) && this.matchesStemToken(stemLower, "clearlogo")) return 1380;
+    if (stemLower.includes(token) && this.matchesStemToken(stemLower, "logo")) return 1260;
+    return 0;
+  }
+
+  private scoreSeasonSpecificArtworkCandidate(stemLower: string, token: string, assetKey: ArtworkKey): number {
+    const score = this.scoreSeasonArtworkCandidate(stemLower, token, assetKey);
+    if (score <= 0) return 0;
+    return score + 120;
+  }
+
+  private matchesStemToken(stemLower: string, token: string): boolean {
+    const escaped = token.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const tokenRegex = new RegExp(`(?:^|[._\\-\\s])${escaped}(?:$|[._\\-\\s])`, "i");
+    return tokenRegex.test(stemLower);
   }
 
   private buildSeasonTokens(seasonNumber: number): string[] {
