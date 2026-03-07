@@ -186,6 +186,19 @@ class NfoMetadataPlugin extends BasePlugin {
         seasonNumberHint = episodeMeta.season;
       }
       const mediaPath = this.findBestMediaFile(files, baseName);
+
+      // Handle movie-type NFO: apply title to archive level
+      if (this.isMovieNfo(xml)) {
+        const movieTitle = this.readXmlTag(xml, ["title"]).trim();
+        if (movieTitle) {
+          archiveTitle = movieTitle;
+        }
+        const movieSummary = this.readXmlTag(xml, ["plot"]).trim() || this.readXmlTag(xml, ["outline"]).trim();
+        if (movieSummary) {
+          archiveSummary = movieSummary;
+        }
+      }
+
       if (!mediaPath) {
         continue;
       }
@@ -520,6 +533,10 @@ class NfoMetadataPlugin extends BasePlugin {
       }
     }
     return "";
+  }
+
+  private isMovieNfo(xml: string): boolean {
+    return /<movie\b[^>]*>/i.test(xml);
   }
 
   private parseEpisodeNfo(xml: string, fileName: string): EpisodeMeta {
