@@ -26,8 +26,53 @@ function nsKey(ns: string, value: string): string {
   return `${ns}\u0000${value}`;
 }
 
-function isOtherLike(ns: string): boolean {
-  return ns === "other" || ns === "";
+function normalizeNamespace(ns: unknown): string {
+  return String(ns ?? "")
+    .trim()
+    .toLowerCase();
+}
+
+function parseMergeSourcePrefixes(value: unknown): Set<string> {
+  const add = (target: Set<string>, item: unknown) => {
+    if (item === null || item === undefined) return;
+    target.add(normalizeNamespace(item));
+  };
+
+  if (value instanceof Set) {
+    return new Set([...value].map((item) => normalizeNamespace(item)));
+  }
+
+  if (Array.isArray(value)) {
+    const result = new Set<string>();
+    for (const item of value) add(result, item);
+    return result;
+  }
+
+  const text = String(value ?? "").trim();
+  if (!text) return new Set(["other", ""]);
+
+  try {
+    const parsed = JSON.parse(text);
+    if (Array.isArray(parsed)) {
+      const result = new Set<string>();
+      for (const item of parsed) add(result, item);
+      return result;
+    }
+  } catch {
+    // Fall back to comma/newline separated strings for compatibility.
+  }
+
+  const result = new Set<string>();
+  for (const item of text.split(/[\n,]/)) {
+    const trimmed = item.trim();
+    if (!trimmed) continue;
+    result.add(normalizeNamespace(trimmed));
+  }
+  return result;
+}
+
+function isMergeSourceNamespace(ns: string, mergeSourcePrefixes: Set<string>): boolean {
+  return mergeSourcePrefixes.has(normalizeNamespace(ns));
 }
 
 /**
@@ -35,7 +80,7 @@ function isOtherLike(ns: string): boolean {
  *
  * Rules:
  * 1) Same namespace: if tagA.name equals tagB.translation_text, merge A -> B
- * 2) namespace === "other" or empty: if other/empty:VALUE equals another tag's VALUE or translation_text, merge -> that tag
+ * 2) namespace is in the configured merge_source_prefixes list: if PREFIX:VALUE equals another tag's VALUE or translation_text, merge -> that tag
  *
  * Host RPC methods required:
  * - tags.list (paginated)
@@ -48,7 +93,7 @@ class TagMergeScriptPlugin extends BasePlugin {
       type: "script",
       namespace: "tag_merge",
       author: "lanlu",
-      version: "1.0",
+      version: "2.1",
       description: "Merge duplicate tags based on translation/name rules.",
       parameters: [
         { type: "string", name: "lang", desc: "Translation language to use", default_value: "zh" },
@@ -56,6 +101,12 @@ class TagMergeScriptPlugin extends BasePlugin {
         { type: "bool", name: "dry_run", desc: "Only compute merges; do not change DB", default_value: "true" },
         { type: "bool", name: "delete_source", desc: "Delete source tag after merge", default_value: "true" },
         { type: "int", name: "max_merges", desc: "Max merges to apply (0 = unlimited)", default_value: "0" },
+        {
+          type: "array" as any,
+          name: "merge_source_prefixes",
+          desc: "Namespace prefixes treated as merge sources for cross-namespace matches; use \"\" for no namespace",
+          default_value: '["other", ""]',
+        },
       ],
       cron_enabled: false,
       cron_expression: "0 3 * * *",
@@ -71,8 +122,16 @@ class TagMergeScriptPlugin extends BasePlugin {
     const dryRun = Boolean(params.dry_run ?? true);
     const deleteSource = Boolean(params.delete_source ?? true);
     const maxMerges = Math.max(0, Number(params.max_merges ?? 0));
+    const mergeSourcePrefixes = parseMergeSourcePrefixes(params.merge_source_prefixes);
 
-    await this.logInfo("tag_merge started", { lang, pageSize, dryRun, deleteSource, maxMerges });
+    await this.logInfo("tag_merge started", {
+      lang,
+      pageSize,
+      dryRun,
+      deleteSource,
+      maxMerges,
+      mergeSourcePrefixes: [...mergeSourcePrefixes],
+    });
 
     const tags: TagListItem[] = [];
 
@@ -106,7 +165,7 @@ class TagMergeScriptPlugin extends BasePlugin {
         tags.push({ id, namespace: ns, name, translation_text: t });
         idToNs.set(id, ns);
 
-        if (!isOtherLike(ns)) {
+        if (!isMergeSourceNamespace(ns, mergeSourcePrefixes)) {
           const nameKey = norm(name);
           if (nameKey) {
             let set = canonicalCandidates.get(nameKey);
@@ -153,7 +212,7 @@ class TagMergeScriptPlugin extends BasePlugin {
       const nameKey = norm(it.name);
       if (!nameKey) continue;
 
-      if (isOtherLike(ns)) {
+      if (isMergeSourceNamespace(ns, mergeSourcePrefixes)) {
         const set = canonicalCandidates.get(nameKey);
         if (!set || set.size !== 1) continue;
         const [targetId] = [...set.values()];
@@ -185,8 +244,13 @@ class TagMergeScriptPlugin extends BasePlugin {
     for (const [sourceId, targetId] of sourceToTarget.entries()) {
       const finalTarget = resolve(targetId);
       if (finalTarget === sourceId) continue;
-      // For rule (2), ensure target isn't "other".
-      if (isOtherLike(idToNs.get(sourceId) ?? "") && isOtherLike(idToNs.get(finalTarget) ?? "")) continue;
+      // For rule (2), ensure source prefixes never merge into another configured source prefix.
+      if (
+        isMergeSourceNamespace(idToNs.get(sourceId) ?? "", mergeSourcePrefixes) &&
+        isMergeSourceNamespace(idToNs.get(finalTarget) ?? "", mergeSourcePrefixes)
+      ) {
+        continue;
+      }
       merges.push({ sourceId, targetId: finalTarget });
     }
 
