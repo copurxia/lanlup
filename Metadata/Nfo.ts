@@ -1,6 +1,6 @@
 #!/usr/bin/env deno run --allow-read
 
-import { BasePlugin, PluginInfo, PluginInput } from "../base_plugin.ts";
+import { BasePlugin, PageMetadataPatch, PluginInfo, PluginInput } from "../base_plugin.ts";
 
 type AdjacentFilesResponse = {
   archiveId: string;
@@ -43,6 +43,14 @@ type SeasonMeta = {
   cover: string;
   backdrop: string;
   clearlogo: string;
+  pages: PageMetadataPatch[];
+};
+
+type ArchiveModeOptions = {
+  hideThumbImages: boolean;
+  applyEpisodeSort: boolean;
+  includeEpisodePlot: boolean;
+  tagWithSource: boolean;
 };
 
 type TvshowMeta = {
@@ -109,17 +117,18 @@ class NfoMetadataPlugin extends BasePlugin {
 
       const targetType = String((params.__target_type as string) || "archive").trim().toLowerCase();
       const tagWithSource = this.readBoolParam(params, "tag_with_source", true);
-      if (targetType === "tankoubon" || targetType === "tank") {
-        await this.runTankoubonMode(targetId, tagWithSource, metadata);
-        return;
-      }
-
-      await this.runArchiveMode(targetId, {
+      const options: ArchiveModeOptions = {
         hideThumbImages: this.readBoolParam(params, "hide_thumb_images", true),
         applyEpisodeSort: this.readBoolParam(params, "apply_episode_sort", true),
         includeEpisodePlot: this.readBoolParam(params, "include_episode_plot", true),
         tagWithSource,
-      }, metadata);
+      };
+      if (targetType === "tankoubon" || targetType === "tank") {
+        await this.runTankoubonMode(targetId, options, metadata);
+        return;
+      }
+
+      await this.runArchiveMode(targetId, options, metadata);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       this.outputResult({ success: false, error: `NFO plugin execution failed: ${message}` });
@@ -128,12 +137,7 @@ class NfoMetadataPlugin extends BasePlugin {
 
   private async runArchiveMode(
     archiveId: string,
-    options: {
-      hideThumbImages: boolean;
-      applyEpisodeSort: boolean;
-      includeEpisodePlot: boolean;
-      tagWithSource: boolean;
-    },
+    options: ArchiveModeOptions,
     metadata: any,
   ): Promise<void> {
     this.reportProgress(10, "Listing adjacent files...");
@@ -302,7 +306,7 @@ class NfoMetadataPlugin extends BasePlugin {
     this.outputResult({ success: true, data: next });
   }
 
-  private async runTankoubonMode(tankoubonId: string, tagWithSource: boolean, metadata: any): Promise<void> {
+  private async runTankoubonMode(tankoubonId: string, options: ArchiveModeOptions, metadata: any): Promise<void> {
     this.reportProgress(10, "Listing collection archives...");
     const listing = await this.callHost<TankoubonArchivesResponse>("tankoubon.listArchives", {
       tankoubonId,
@@ -315,12 +319,12 @@ class NfoMetadataPlugin extends BasePlugin {
     let firstArchiveBackdrop = "";
     let firstArchiveClearlogo = "";
     for (const archiveId of archiveIds) {
-      const seasonMeta = await this.readSeasonMetadata(archiveId);
+      const seasonMeta = await this.readSeasonMetadata(archiveId, options);
       if (!seasonMeta) continue;
 
       let patchTags = "";
       patchTags = this.mergeTagList(patchTags, seasonMeta.genreTags);
-      if (tagWithSource) {
+      if (options.tagWithSource) {
         if (seasonMeta.sourceTag) {
           patchTags = this.mergeTags(patchTags, seasonMeta.sourceTag);
         } else if (collectionMeta?.sourceTag) {
@@ -348,12 +352,13 @@ class NfoMetadataPlugin extends BasePlugin {
         tags: this.metadataTagsFromCsv(patchTags),
         assets: patchAssets,
         archive: [],
+        pages: seasonMeta.pages,
         archive_id: archiveId,
       }));
     }
 
     const collectionTags = this.mergeTagList("", collectionMeta?.genreTags || []);
-    const outputTags = tagWithSource
+    const outputTags = options.tagWithSource
       ? this.mergeTags(collectionTags, collectionMeta?.sourceTag || "")
       : collectionTags;
     const collectionCover = collectionMeta?.cover || firstArchiveCover;
@@ -403,10 +408,16 @@ class NfoMetadataPlugin extends BasePlugin {
 
   private async readSeasonMetadata(
     archiveId: string,
+    options: ArchiveModeOptions,
   ): Promise<SeasonMeta | null> {
     try {
       const listing = await this.callHost<AdjacentFilesResponse>("archive.listAdjacentFiles", { archiveId });
       const files = Array.isArray(listing?.files) ? listing.files : [];
+      const lowerFiles = files.map((f) => ({ raw: f, lower: f.toLowerCase() }));
+      const nfoFiles = lowerFiles
+        .map((f) => f.raw)
+        .filter((file) => file.toLowerCase().endsWith(".nfo"))
+        .sort((a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" }));
       const seasonNfo = files.find((f) => f.toLowerCase() === "season.nfo");
       if (!seasonNfo) return null;
 
@@ -419,6 +430,55 @@ class NfoMetadataPlugin extends BasePlugin {
       const cover = (await this.findArchiveCoverForArchive(archiveId, files, seasonNumber)) || firstPageCover;
       const backdrop = await this.findArchiveArtworkForArchive(archiveId, files, seasonNumber, "backdrop");
       const clearlogo = await this.findArchiveArtworkForArchive(archiveId, files, seasonNumber, "clearlogo");
+      const pagePatches = new Map<string, PageMetadataPatch>();
+
+      for (const nfoFile of nfoFiles) {
+        const lower = nfoFile.toLowerCase();
+        if (lower === "season.nfo" || lower === "tvshow.nfo") {
+          continue;
+        }
+
+        const pageXml = await this.readAdjacentFile(archiveId, nfoFile);
+        if (!pageXml) continue;
+        const baseName = this.stripExtension(nfoFile);
+        const episodeMeta = this.parseEpisodeNfo(pageXml, nfoFile);
+        const mediaPath = this.findBestMediaFile(files, baseName);
+        if (!mediaPath) {
+          continue;
+        }
+
+        const patch: PageMetadataPatch = {
+          path: mediaPath,
+          title: episodeMeta.title,
+        };
+        if (options.includeEpisodePlot && episodeMeta.summary) {
+          patch.description = episodeMeta.summary;
+        }
+        if (options.applyEpisodeSort) {
+          const sort = this.buildSortIndex(baseName, episodeMeta);
+          if (sort > 0) {
+            patch.sort = sort;
+          }
+        }
+
+        const coverCandidates = this.findCoverCandidates(files, baseName, mediaPath);
+        const thumbRelPath = await this.extractBestThumbFromCandidates(archiveId, coverCandidates);
+        if (thumbRelPath) {
+          patch.thumb = thumbRelPath;
+        } else if (this.isMovieNfo(pageXml)) {
+          await this.logInfo(`Movie NFO: no image thumb candidate, skipping page thumb`, { mediaPath, nfoFile });
+        }
+
+        pagePatches.set(mediaPath, patch);
+        if (options.hideThumbImages) {
+          for (const coverPath of coverCandidates) {
+            pagePatches.set(coverPath, {
+              path: coverPath,
+              hidden_in_files: true,
+            });
+          }
+        }
+      }
 
       return {
         title: this.readXmlTag(xml, ["title"]).trim(),
@@ -429,6 +489,7 @@ class NfoMetadataPlugin extends BasePlugin {
         cover,
         backdrop,
         clearlogo,
+        pages: [...pagePatches.values()],
       };
     } catch {
       return null;
