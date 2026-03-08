@@ -206,6 +206,7 @@ class NfoMetadataPlugin extends BasePlugin {
       const patch: Record<string, unknown> = {
         path: mediaPath,
         title: episodeMeta.title,
+        metadata: {},
       };
 
       if (options.includeEpisodePlot && episodeMeta.summary) {
@@ -219,12 +220,14 @@ class NfoMetadataPlugin extends BasePlugin {
         }
       }
 
-      pagePatches.set(mediaPath, patch);
-
       const coverCandidates = this.findCoverCandidates(files, baseName, mediaPath);
       const thumbRelPath = await this.extractBestThumbFromCandidates(archiveId, coverCandidates);
-      if (thumbRelPath) {
-        patch.thumb = thumbRelPath;
+      // 电影类型时,thumb 优先设置为媒体文件本身(页面预览图),否则使用提取的封面图
+      if (this.isMovieNfo(xml)) {
+        (patch.metadata as any).thumb = mediaPath;
+        await this.logInfo(`Movie NFO: setting thumb to mediaPath`, { mediaPath, nfoFile });
+      } else if (thumbRelPath) {
+        (patch.metadata as any).thumb = thumbRelPath;
         const sortValue = this.buildSortIndex(baseName, episodeMeta);
         if (
           !episodeCoverFallback ||
@@ -234,6 +237,9 @@ class NfoMetadataPlugin extends BasePlugin {
           episodeCoverFallbackSort = sortValue;
         }
       }
+
+      await this.logInfo(`Setting patch for mediaPath`, { mediaPath, patch: JSON.stringify(patch) });
+      pagePatches.set(mediaPath, patch);
 
       if (options.hideThumbImages) {
         for (const coverPath of coverCandidates) {
@@ -255,6 +261,7 @@ class NfoMetadataPlugin extends BasePlugin {
     const archiveClearlogo = await this.findArchiveArtworkForArchive(archiveId, files, seasonNumberHint, "clearlogo");
 
     const pages = [...pagePatches.values()];
+    await this.logInfo(`Final pages array`, { pagesCount: pages.length, pages: JSON.stringify(pages) });
 
     let tags = this.metadataTagsToCsv(metadata.tags);
     tags = this.mergeTagList(tags, [...discoveredTags]);
@@ -1083,13 +1090,15 @@ class NfoMetadataPlugin extends BasePlugin {
   }
 
   private scoreCoverCandidate(stemLower: string, baseLower: string): number {
-    if (stemLower === `${baseLower}-thumb` || stemLower === `${baseLower}_thumb`) return 100;
-    if (stemLower === `${baseLower}.thumb`) return 95;
-    if (stemLower === `${baseLower}-poster` || stemLower === `${baseLower}_poster`) return 90;
-    if (stemLower === `${baseLower}-cover` || stemLower === `${baseLower}_cover`) return 80;
-    if (stemLower.includes("thumb")) return 70;
-    if (stemLower.includes("poster")) return 60;
-    if (stemLower.includes("cover")) return 50;
+    // 优先使用 poster 作为预览图
+    if (stemLower === `${baseLower}-poster` || stemLower === `${baseLower}_poster`) return 100;
+    if (stemLower === `${baseLower}-cover` || stemLower === `${baseLower}_cover`) return 95;
+    if (stemLower.includes("poster")) return 80;
+    if (stemLower.includes("cover")) return 70;
+    // thumb 作为次要选择
+    if (stemLower === `${baseLower}-thumb` || stemLower === `${baseLower}_thumb`) return 60;
+    if (stemLower === `${baseLower}.thumb`) return 55;
+    if (stemLower.includes("thumb")) return 50;
     if (stemLower === baseLower) return 10;
     return 1;
   }
