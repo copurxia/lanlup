@@ -143,7 +143,8 @@ class NfoMetadataPlugin extends BasePlugin {
     const lowerFiles = files.map((f) => ({ raw: f, lower: f.toLowerCase() }));
     const nfoFiles = lowerFiles
       .map((f) => f.raw)
-      .filter((file) => file.toLowerCase().endsWith(".nfo"));
+      .filter((file) => file.toLowerCase().endsWith(".nfo"))
+      .sort((a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" }));
 
     let archiveTitle = String(metadata.title || "");
     let archiveSummary = String(metadata.description || "");
@@ -152,8 +153,8 @@ class NfoMetadataPlugin extends BasePlugin {
     const discoveredTags = new Set<string>();
     const pagePatches = new Map<string, Record<string, unknown>>();
     let archiveCover = "";
-    let episodeCoverFallback = "";
-    let episodeCoverFallbackSort = 0;
+    let firstPageCoverFallback = "";
+    let firstPageCoverFallbackSort = 0;
 
     for (const nfoFile of nfoFiles) {
       const lower = nfoFile.toLowerCase();
@@ -222,20 +223,26 @@ class NfoMetadataPlugin extends BasePlugin {
 
       const coverCandidates = this.findCoverCandidates(files, baseName, mediaPath);
       const thumbRelPath = await this.extractBestThumbFromCandidates(archiveId, coverCandidates);
-      // 电影类型时,thumb 优先设置为媒体文件本身(页面预览图),否则使用提取的封面图
-      if (this.isMovieNfo(xml)) {
-        (patch.metadata as any).thumb = mediaPath;
-        await this.logInfo(`Movie NFO: setting thumb to mediaPath`, { mediaPath, nfoFile });
-      } else if (thumbRelPath) {
-        (patch.metadata as any).thumb = thumbRelPath;
-        const sortValue = this.buildSortIndex(baseName, episodeMeta);
-        if (
-          !episodeCoverFallback ||
-          (sortValue > 0 && (episodeCoverFallbackSort <= 0 || sortValue < episodeCoverFallbackSort))
-        ) {
-          episodeCoverFallback = thumbRelPath;
-          episodeCoverFallbackSort = sortValue;
-        }
+      const sortValue = this.buildSortIndex(baseName, episodeMeta);
+      let patchThumb = "";
+
+      // 页面缩略图需要输出到顶层 thumb，后端保存链路当前读取 pages[].thumb。
+      // movie 类型如果没有 sidecar 图片，不把视频路径当成可保存缩略图。
+      if (thumbRelPath) {
+        patchThumb = thumbRelPath;
+        patch.thumb = patchThumb;
+        (patch.metadata as any).thumb = patchThumb;
+      } else if (this.isMovieNfo(xml)) {
+        await this.logInfo(`Movie NFO: no image thumb candidate, skipping page thumb`, { mediaPath, nfoFile });
+      }
+
+      if (
+        patchThumb &&
+        (!firstPageCoverFallback ||
+          (sortValue > 0 && (firstPageCoverFallbackSort <= 0 || sortValue < firstPageCoverFallbackSort)))
+      ) {
+        firstPageCoverFallback = patchThumb;
+        firstPageCoverFallbackSort = sortValue;
       }
 
       await this.logInfo(`Setting patch for mediaPath`, { mediaPath, patch: JSON.stringify(patch) });
@@ -255,8 +262,10 @@ class NfoMetadataPlugin extends BasePlugin {
       archiveId,
       files,
       seasonNumberHint,
-      episodeCoverFallback,
     );
+    if (!archiveCover && firstPageCoverFallback) {
+      archiveCover = firstPageCoverFallback;
+    }
     const archiveBackdrop = await this.findArchiveArtworkForArchive(archiveId, files, seasonNumberHint, "backdrop");
     const archiveClearlogo = await this.findArchiveArtworkForArchive(archiveId, files, seasonNumberHint, "clearlogo");
 
@@ -406,7 +415,8 @@ class NfoMetadataPlugin extends BasePlugin {
       const seasonNumber =
         this.readXmlInt(xml, ["seasonnumber", "season"]) ||
         this.extractSeasonNumberFromText(String(listing?.baseDir || ""));
-      const cover = await this.findArchiveCoverForArchive(archiveId, files, seasonNumber, "");
+      const firstPageCover = await this.findFirstPageCoverForArchive(archiveId, files);
+      const cover = (await this.findArchiveCoverForArchive(archiveId, files, seasonNumber)) || firstPageCover;
       const backdrop = await this.findArchiveArtworkForArchive(archiveId, files, seasonNumber, "backdrop");
       const clearlogo = await this.findArchiveArtworkForArchive(archiveId, files, seasonNumber, "clearlogo");
 
@@ -540,6 +550,59 @@ class NfoMetadataPlugin extends BasePlugin {
       }
     }
     return "";
+  }
+
+
+  private async findFirstPageCoverForArchive(archiveId: string, files: string[]): Promise<string> {
+    const nfoFiles = files
+      .filter((file) => file.toLowerCase().endsWith(".nfo"))
+      .sort((a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" }));
+
+    let firstPageCover = "";
+    let firstPageCoverSort = 0;
+
+    for (const nfoFile of nfoFiles) {
+      const lower = nfoFile.toLowerCase();
+      if (lower === "season.nfo" || lower === "tvshow.nfo") {
+        continue;
+      }
+
+      let xml = "";
+      try {
+        xml = await this.readAdjacentFile(archiveId, nfoFile);
+      } catch {
+        continue;
+      }
+      if (!xml) {
+        continue;
+      }
+
+      const baseName = this.stripExtension(nfoFile);
+      const mediaPath = this.findBestMediaFile(files, baseName);
+      if (!mediaPath) {
+        continue;
+      }
+
+      const pageThumb = await this.extractBestThumbFromCandidates(
+        archiveId,
+        this.findCoverCandidates(files, baseName, mediaPath),
+      );
+      if (!pageThumb) {
+        continue;
+      }
+
+      const episodeMeta = this.parseEpisodeNfo(xml, nfoFile);
+      const sortValue = this.buildSortIndex(baseName, episodeMeta);
+      if (
+        !firstPageCover ||
+        (sortValue > 0 && (firstPageCoverSort <= 0 || sortValue < firstPageCoverSort))
+      ) {
+        firstPageCover = pageThumb;
+        firstPageCoverSort = sortValue;
+      }
+    }
+
+    return firstPageCover;
   }
 
   private isMovieNfo(xml: string): boolean {
@@ -738,8 +801,15 @@ class NfoMetadataPlugin extends BasePlugin {
       if (!this.isImageFile(file)) continue;
 
       const stem = this.stripExtension(file).toLowerCase();
-      const matchesStem = stem === baseLower || stem === `${baseLower}-thumb` || stem === `${baseLower}_thumb`;
-      const matchesLoose = stem.startsWith(baseLower) && (stem.includes("thumb") || stem.includes("poster"));
+      const matchesStem =
+        stem === baseLower ||
+        this.matchesStemSuffix(stem, baseLower, "poster") ||
+        this.matchesStemSuffix(stem, baseLower, "cover") ||
+        this.matchesStemSuffix(stem, baseLower, "thumb");
+      const matchesLoose =
+        this.matchesStemWithTrailingCoverToken(stem, baseLower, "poster") ||
+        this.matchesStemWithTrailingCoverToken(stem, baseLower, "cover") ||
+        this.matchesStemWithTrailingCoverToken(stem, baseLower, "thumb");
       if (matchesStem || matchesLoose) {
         out.push({ path: file, score: this.scoreCoverCandidate(stem, baseLower) });
       }
@@ -753,9 +823,9 @@ class NfoMetadataPlugin extends BasePlugin {
     archiveId: string,
     sameDirFiles: string[],
     seasonNumber: number,
-    fallbackEpisodeCover: string,
   ): Promise<string> {
-    const localSeasonSpecificCandidates = this.findSeasonSpecificCoverCandidates(sameDirFiles, seasonNumber);
+    const localArchiveCoverFiles = sameDirFiles.filter((file) => !this.isLikelyPageSidecarImage(file, sameDirFiles));
+    const localSeasonSpecificCandidates = this.findSeasonSpecificCoverCandidates(localArchiveCoverFiles, seasonNumber);
     const localSeasonSpecificCover = await this.extractBestThumbFromCandidates(archiveId, localSeasonSpecificCandidates);
     if (localSeasonSpecificCover) {
       return localSeasonSpecificCover;
@@ -781,7 +851,7 @@ class NfoMetadataPlugin extends BasePlugin {
       // ignore parent cover lookup errors and keep fallback behavior
     }
 
-    const localSeasonCandidates = this.findSeasonCoverCandidates(sameDirFiles, seasonNumber);
+    const localSeasonCandidates = this.findSeasonCoverCandidates(localArchiveCoverFiles, seasonNumber);
     const localCover = await this.extractBestThumbFromCandidates(archiveId, localSeasonCandidates);
     if (localCover) {
       return localCover;
@@ -806,7 +876,7 @@ class NfoMetadataPlugin extends BasePlugin {
       // ignore parent cover lookup errors and keep fallback behavior
     }
 
-    return fallbackEpisodeCover || "";
+    return "";
   }
 
   private async findArchiveArtworkForArchive(
@@ -1092,7 +1162,9 @@ class NfoMetadataPlugin extends BasePlugin {
   private scoreCoverCandidate(stemLower: string, baseLower: string): number {
     // 优先使用 poster 作为预览图
     if (stemLower === `${baseLower}-poster` || stemLower === `${baseLower}_poster`) return 100;
+    if (stemLower === `${baseLower}.poster`) return 98;
     if (stemLower === `${baseLower}-cover` || stemLower === `${baseLower}_cover`) return 95;
+    if (stemLower === `${baseLower}.cover`) return 93;
     if (stemLower.includes("poster")) return 80;
     if (stemLower.includes("cover")) return 70;
     // thumb 作为次要选择
@@ -1114,6 +1186,49 @@ class NfoMetadataPlugin extends BasePlugin {
     const episode = Number.parseInt(m[2], 10);
     if (!Number.isFinite(season) || !Number.isFinite(episode)) return 0;
     return season * 10000 + episode;
+  }
+
+  private matchesStemSuffix(stemLower: string, baseLower: string, suffix: string): boolean {
+    return stemLower === `${baseLower}.${suffix}` ||
+      stemLower === `${baseLower}-${suffix}` ||
+      stemLower === `${baseLower}_${suffix}`;
+  }
+
+  private matchesStemWithTrailingCoverToken(stemLower: string, baseLower: string, suffix: string): boolean {
+    if (!stemLower.startsWith(`${baseLower}.`) && !stemLower.startsWith(`${baseLower}-`) &&
+      !stemLower.startsWith(`${baseLower}_`)) {
+      return false;
+    }
+
+    const trailing = stemLower.slice(baseLower.length + 1);
+    if (!trailing) return false;
+    return trailing.split(/[._-]+/).includes(suffix);
+  }
+
+  private isLikelyPageSidecarImage(fileName: string, files: string[]): boolean {
+    if (!this.isImageFile(fileName)) {
+      return false;
+    }
+
+    const stemLower = this.stripExtension(fileName).toLowerCase();
+    const baseLower = this.stripSidecarCoverSuffix(stemLower);
+    if (!baseLower || baseLower === stemLower) {
+      return false;
+    }
+
+    return files.some((candidate) => {
+      const candidateLower = candidate.toLowerCase();
+      if (candidateLower === fileName.toLowerCase()) {
+        return false;
+      }
+
+      return this.stripExtension(candidate).toLowerCase() === baseLower &&
+        (candidateLower.endsWith(".nfo") || this.isVideoFile(candidate) || this.isImageFile(candidate));
+    });
+  }
+
+  private stripSidecarCoverSuffix(stemLower: string): string {
+    return stemLower.replace(/[._-](poster|cover|thumb)$/i, "");
   }
 
   private isVideoFile(name: string): boolean {
