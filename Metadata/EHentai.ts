@@ -138,7 +138,7 @@ class EHentaiMetadataPlugin extends BasePlugin {
       }
 
       await this.logInfo("run:start", {
-        archive_id: input.targetId || "",
+        archiveId: input.targetId || "",
         target_type: targetType || "archive",
         has_oneshot: !!input.oneshotParam,
         title_len: (metadata.title || "").length,
@@ -160,7 +160,7 @@ class EHentaiMetadataPlugin extends BasePlugin {
         thumbnail_hash: String(metadata.thumbnail_hash || ""),
         login_cookies: input.loginCookies || [],
         oneshot_param: input.oneshotParam || "",
-        archive_id: input.targetId || "",
+        archiveId: input.targetId || "",
         debug,
       };
 
@@ -189,7 +189,9 @@ class EHentaiMetadataPlugin extends BasePlugin {
         next.title = nextTitle;
       }
       next.tags = this.metadataTagsFromCsv(String(payload.tags || ""));
-      next.archive = [];
+      next.children = [];
+      delete (next as Record<string, unknown>).archive;
+      delete (next as Record<string, unknown>).archive_id;
 
       this.reportProgress(100, "元数据获取完成");
       this.outputResult({ success: true, data: next });
@@ -268,7 +270,7 @@ class EHentaiMetadataPlugin extends BasePlugin {
         thumbnail_hash: String(archiveMeta.thumbnail_hash || ""),
         login_cookies: loginCookies,
         oneshot_param: "",
-        archive_id: archiveId,
+        archiveId: archiveId,
         debug,
       };
 
@@ -291,19 +293,25 @@ class EHentaiMetadataPlugin extends BasePlugin {
       }
 
       patches.push({
-        ...this.cloneMetadataObject({
-          ...archiveMeta,
-          archive_id: archiveId,
+        title: String(result.data.title || archiveMeta.title || ""),
+        type: 0,
+        description: String(archiveMeta.description || ""),
+        tags: this.metadataTagsFromCsv(String(result.data.tags || "")),
+        assets: Array.isArray(archiveMeta.assets) ? archiveMeta.assets : [],
+        volume_no: i + 1,
+        entity_id: archiveId,
+        locator: {
+          entity_type: "archive",
+          entity_id: archiveId,
           volume_no: i + 1,
-          title: String(result.data.title || archiveMeta.title || ""),
-          tags: this.metadataTagsFromCsv(String(result.data.tags || "")),
-          archive: [],
-        }),
+        },
       });
     }
 
     const next = this.cloneMetadataObject((rootMetadata || {}) as any);
-    next.archive = patches.map((item) => this.cloneMetadataObject(item as any));
+    next.children = patches as any;
+    delete (next as Record<string, unknown>).archive;
+    delete (next as Record<string, unknown>).archive_id;
 
     return {
       success: true,
@@ -332,7 +340,7 @@ class EHentaiMetadataPlugin extends BasePlugin {
     const debug = !!lrrInfo.debug;
 
     await this.dlog(debug, "getTags:context", {
-      archive_id: lrrInfo.archive_id || "",
+      archiveId: lrrInfo.archiveId || "",
       domain,
       title: (lrrInfo.archive_title || "").slice(0, 200),
       thumbhash: lrrInfo.thumbnail_hash
@@ -382,7 +390,7 @@ class EHentaiMetadataPlugin extends BasePlugin {
     if (!gID) {
       // 搜索matching gallery
       const searchResult = await this.lookupGallery(
-        lrrInfo.archive_id,
+        lrrInfo.archiveId,
         lrrInfo.archive_title,
         lrrInfo.existing_tags,
         lrrInfo.thumbnail_hash,
@@ -404,7 +412,7 @@ class EHentaiMetadataPlugin extends BasePlugin {
         });
       } else {
         await this.logWarn("getTags:lookup_failed", {
-          archive_id: lrrInfo.archive_id || "",
+          archiveId: lrrInfo.archiveId || "",
           error: searchResult.error,
         });
         return searchResult;
@@ -424,7 +432,7 @@ class EHentaiMetadataPlugin extends BasePlugin {
     );
     if (!tagsResult.success) {
       await this.logWarn("getTags:gdata_failed", {
-        archive_id: lrrInfo.archive_id || "",
+        archiveId: lrrInfo.archiveId || "",
         gID,
         error: tagsResult.error,
       });

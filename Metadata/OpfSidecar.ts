@@ -99,7 +99,9 @@ class OpfSidecarMetadataPlugin extends BasePlugin {
         next.description = summary;
       }
       next.tags = this.metadataTagsFromCsv(merged);
-      next.archive = [];
+      next.children = [];
+      delete (next as Record<string, unknown>).archive;
+      delete (next as Record<string, unknown>).archive_id;
 
       this.reportProgress(100, "OPF 元数据导入完成");
       this.outputResult({

@@ -208,7 +208,9 @@ class PixivMetadataPlugin extends BasePlugin {
         next.title = title;
         next.description = summary;
         next.tags = this.metadataTagsFromCsv(merged);
-        next.archive = [];
+        next.children = [];
+        delete (next as Record<string, unknown>).archive;
+        delete (next as Record<string, unknown>).archive_id;
 
         this.reportProgress(100, "从 meta.json 获取元数据完成");
         this.outputResult({
@@ -251,7 +253,9 @@ class PixivMetadataPlugin extends BasePlugin {
       next.title = title;
       next.description = summary;
       next.tags = this.metadataTagsFromCsv(merged);
-      next.archive = [];
+      next.children = [];
+      delete (next as Record<string, unknown>).archive;
+      delete (next as Record<string, unknown>).archive_id;
 
       this.reportProgress(100, "元数据获取完成");
       this.outputResult({

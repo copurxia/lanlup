@@ -234,7 +234,6 @@ class NfoMetadataPlugin extends BasePlugin {
       if (thumbRelPath) {
         patchThumb = thumbRelPath;
         patch.thumb = patchThumb;
-        (patch.metadata as any).thumb = patchThumb;
       } else if (this.isMovieNfo(xml)) {
         await this.logInfo(`Movie NFO: no image thumb candidate, skipping page thumb`, { mediaPath, nfoFile });
       }
@@ -298,7 +297,9 @@ class NfoMetadataPlugin extends BasePlugin {
     next.assets = this.metadataSetAssetValue(next.assets, "cover", archiveCover);
     next.assets = this.metadataSetAssetValue(next.assets, "backdrop", archiveBackdrop);
     next.assets = this.metadataSetAssetValue(next.assets, "clearlogo", archiveClearlogo);
-    next.archive = [];
+    next.children = [];
+    delete (next as Record<string, unknown>).archive;
+    delete (next as Record<string, unknown>).archive_id;
     (next as Record<string, unknown>).pages = pages;
 
     this.reportProgress(100, "NFO metadata done");
@@ -317,7 +318,9 @@ class NfoMetadataPlugin extends BasePlugin {
     let firstArchiveCover = "";
     let firstArchiveBackdrop = "";
     let firstArchiveClearlogo = "";
-    for (const archiveId of archiveIds) {
+    for (let i = 0; i < archiveIds.length; i += 1) {
+      const archiveId = String(archiveIds[i] || "").trim();
+      if (!archiveId) continue;
       const seasonMeta = await this.readSeasonMetadata(archiveId, options);
       if (!seasonMeta) continue;
 
@@ -344,16 +347,21 @@ class NfoMetadataPlugin extends BasePlugin {
       let patchAssets = this.metadataSetAssetValue([], "cover", seasonMeta.cover);
       patchAssets = this.metadataSetAssetValue(patchAssets, "backdrop", seasonMeta.backdrop);
       patchAssets = this.metadataSetAssetValue(patchAssets, "clearlogo", seasonMeta.clearlogo);
-      patches.push(this.cloneMetadataObject({
+      patches.push({
         title: seasonMeta.title,
         type: 0,
         description: seasonMeta.summary,
         tags: this.metadataTagsFromCsv(patchTags),
         assets: patchAssets,
-        archive: [],
         pages: seasonMeta.pages,
-        archive_id: archiveId,
-      }));
+        volume_no: i + 1,
+        entity_id: archiveId,
+        locator: {
+          entity_type: "archive",
+          entity_id: archiveId,
+          volume_no: i + 1,
+        },
+      });
     }
 
     const collectionTags = this.mergeTagList("", collectionMeta?.genreTags || []);
@@ -377,7 +385,9 @@ class NfoMetadataPlugin extends BasePlugin {
     next.assets = this.metadataSetAssetValue(next.assets, "cover", collectionCover);
     next.assets = this.metadataSetAssetValue(next.assets, "backdrop", collectionBackdrop);
     next.assets = this.metadataSetAssetValue(next.assets, "clearlogo", collectionClearlogo);
-    next.archive = patches.map((item) => this.cloneMetadataObject(item as any));
+    next.children = patches as any;
+    delete (next as Record<string, unknown>).archive;
+    delete (next as Record<string, unknown>).archive_id;
 
     this.reportProgress(100, "Collection NFO metadata done");
     this.outputResult({ success: true, data: next });

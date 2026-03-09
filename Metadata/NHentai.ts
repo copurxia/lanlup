@@ -83,7 +83,9 @@ class NHentaiMetadataPlugin extends BasePlugin {
         next.title = nextTitle;
       }
       next.tags = this.metadataTagsFromCsv(String(data.tags || ""));
-      next.archive = [];
+      next.children = [];
+      delete (next as Record<string, unknown>).archive;
+      delete (next as Record<string, unknown>).archive_id;
 
       this.reportProgress(100, "元数据获取完成");
       this.outputResult({ success: true, data: next });

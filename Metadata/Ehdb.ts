@@ -128,7 +128,7 @@ class EhdbMetadataPlugin extends BasePlugin {
       }
 
       await this.logInfo("run:start", {
-        archive_id: input.targetId || "",
+        archiveId: input.targetId || "",
         target_type: targetType || "archive",
         has_oneshot: !!input.oneshotParam,
         title_len: (metadata.title || "").length,
@@ -157,7 +157,7 @@ class EhdbMetadataPlugin extends BasePlugin {
         existing_tags: this.metadataTagsToCsv(metadata.tags),
         thumbnail_hash: String(metadata.thumbnail_hash || ""),
         oneshot_param: input.oneshotParam || "",
-        archive_id: input.targetId || "",
+        archiveId: input.targetId || "",
       };
 
       const result = await this.searchGallery(lrrInfo);
@@ -179,7 +179,9 @@ class EhdbMetadataPlugin extends BasePlugin {
         next.title = nextTitle;
       }
       next.tags = this.metadataTagsFromCsv(String(payload.tags || ""));
-      next.archive = [];
+      next.children = [];
+      delete (next as Record<string, unknown>).archive;
+      delete (next as Record<string, unknown>).archive_id;
       this.outputResult({ success: true, data: next });
     } catch (error) {
       const errorMessage = error instanceof Error
@@ -251,7 +253,7 @@ class EhdbMetadataPlugin extends BasePlugin {
         existing_tags: this.metadataTagsToCsv(archiveMeta.tags),
         thumbnail_hash: String(archiveMeta.thumbnail_hash || ""),
         oneshot_param: "",
-        archive_id: archiveId,
+        archiveId: archiveId,
       };
 
       const result = await this.searchGallery(lrrInfo);
@@ -263,19 +265,25 @@ class EhdbMetadataPlugin extends BasePlugin {
       }
 
       patches.push({
-        ...this.cloneMetadataObject({
-          ...archiveMeta,
-          archive_id: archiveId,
+        title: String(result.data.title || archiveMeta.title || ""),
+        type: 0,
+        description: String(archiveMeta.description || ""),
+        tags: this.metadataTagsFromCsv(String(result.data.tags || "")),
+        assets: Array.isArray(archiveMeta.assets) ? archiveMeta.assets : [],
+        volume_no: i + 1,
+        entity_id: archiveId,
+        locator: {
+          entity_type: "archive",
+          entity_id: archiveId,
           volume_no: i + 1,
-          title: String(result.data.title || archiveMeta.title || ""),
-          tags: this.metadataTagsFromCsv(String(result.data.tags || "")),
-          archive: [],
-        }),
+        },
       });
     }
 
     const next = this.cloneMetadataObject((rootMetadata || {}) as any);
-    next.archive = patches.map((item) => this.cloneMetadataObject(item as any));
+    next.children = patches as any;
+    delete (next as Record<string, unknown>).archive;
+    delete (next as Record<string, unknown>).archive_id;
 
     return {
       success: true,

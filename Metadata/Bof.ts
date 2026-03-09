@@ -171,29 +171,32 @@ class BofMetadataPlugin extends BasePlugin {
       if (seriesCover.trim()) {
         next.assets = this.metadataSetAssetValue(next.assets, "cover", seriesCover)
       }
-      next.archive = volumeMetas.map((item) => {
-        const member = this.cloneMetadataObject({
-          title: item.title,
-          type: 0,
-          description: item.summary,
-          tags: this.metadataTagsFromCsv(item.tags),
-          assets: this.metadataSetAssetValue([], "cover", item.cover || ""),
-          archive: [],
+      const children = volumeMetas.map((item) => ({
+        title: item.title,
+        type: 0,
+        description: item.summary,
+        tags: this.metadataTagsFromCsv(item.tags),
+        assets: this.metadataSetAssetValue([], "cover", item.cover || ""),
+        volume_no: item.volume_no,
+        locator: {
+          entity_type: "archive",
           volume_no: item.volume_no,
-          release_date: item.release_date || "",
-          isbn: item.isbn || "",
-          source_url: item.source_url,
-        })
-        return member
-      })
+        },
+        release_date: item.release_date || "",
+        isbn: item.isbn || "",
+        source_url: item.source_url,
+      }))
+      next.children = children as any
+      delete (next as Record<string, unknown>).archive
+      delete (next as Record<string, unknown>).archive_id
       if (!String(next.title || "").trim()) {
-        const fallbackTitle = String((next.archive?.[0] as any)?.title || "").trim()
+        const fallbackTitle = String((next.children?.[0] as any)?.title || "").trim()
         if (fallbackTitle) {
           next.title = fallbackTitle
         }
       }
       if (!String(next.description || "").trim()) {
-        const fallbackSummary = String((next.archive?.[0] as any)?.description || "").trim()
+        const fallbackSummary = String((next.children?.[0] as any)?.description || "").trim()
         if (fallbackSummary) {
           next.description = fallbackSummary
         }
@@ -202,7 +205,7 @@ class BofMetadataPlugin extends BasePlugin {
         next.tags = this.metadataTagsFromCsv(`source:${seriesUrl}`)
       }
       if (!Array.isArray(next.assets) || next.assets.length === 0) {
-        const firstArchiveAssets = (next.archive?.[0] as any)?.assets as
+        const firstArchiveAssets = (next.children?.[0] as any)?.assets as
           | Array<{ key?: string; value?: string }>
           | undefined
         const fallbackCover = this.metadataGetAssetValue(firstArchiveAssets as any, "cover")

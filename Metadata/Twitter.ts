@@ -106,7 +106,9 @@ class TwitterMetadataPlugin extends BasePlugin {
       next.title = title;
       next.description = description;
       next.tags = this.metadataTagsFromCsv(merged);
-      next.archive = [];
+      next.children = [];
+      delete (next as Record<string, unknown>).archive;
+      delete (next as Record<string, unknown>).archive_id;
 
       this.reportProgress(100, "Metadata fetched");
       this.outputResult({
