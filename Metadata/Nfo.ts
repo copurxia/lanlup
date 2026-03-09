@@ -211,7 +211,6 @@ class NfoMetadataPlugin extends BasePlugin {
       const patch: Record<string, unknown> = {
         path: mediaPath,
         title: episodeMeta.title,
-        metadata: {},
       };
 
       if (options.includeEpisodePlot && episodeMeta.summary) {
