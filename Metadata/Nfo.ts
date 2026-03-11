@@ -209,7 +209,7 @@ class NfoMetadataPlugin extends BasePlugin {
       }
 
       const patch: Record<string, unknown> = {
-        path: mediaPath,
+        entry_path: mediaPath,
         title: episodeMeta.title,
       };
 
@@ -220,7 +220,7 @@ class NfoMetadataPlugin extends BasePlugin {
       if (options.applyEpisodeSort) {
         const sort = this.buildSortIndex(baseName, episodeMeta);
         if (sort > 0) {
-          patch.sort = sort;
+          patch.order_index = sort;
         }
       }
 
@@ -253,7 +253,7 @@ class NfoMetadataPlugin extends BasePlugin {
       if (options.hideThumbImages) {
         for (const coverPath of coverCandidates) {
           pagePatches.set(coverPath, {
-            path: coverPath,
+            entry_path: coverPath,
             hidden_in_files: true,
           });
         }
@@ -457,7 +457,7 @@ class NfoMetadataPlugin extends BasePlugin {
         }
 
         const patch: PageMetadataPatch = {
-          path: mediaPath,
+          entry_path: mediaPath,
           title: episodeMeta.title,
         };
         if (options.includeEpisodePlot && episodeMeta.summary) {
@@ -466,7 +466,7 @@ class NfoMetadataPlugin extends BasePlugin {
         if (options.applyEpisodeSort) {
           const sort = this.buildSortIndex(baseName, episodeMeta);
           if (sort > 0) {
-            patch.sort = sort;
+            patch.order_index = sort;
           }
         }
 
@@ -482,7 +482,7 @@ class NfoMetadataPlugin extends BasePlugin {
         if (options.hideThumbImages) {
           for (const coverPath of coverCandidates) {
             pagePatches.set(coverPath, {
-              path: coverPath,
+              entry_path: coverPath,
               hidden_in_files: true,
             });
           }
