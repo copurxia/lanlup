@@ -26,10 +26,9 @@ class NHentaiMetadataPlugin extends BasePlugin {
         "Searches nHentai for tags matching your archive. Supports reading the ID from titles formatted as \"{Id} Title\" and otherwise searches by title. Uses the source: tag if present.",
       parameters: [
         {
-          // Keep naming consistent with EHentai.ts, which uses `updated_at:` to map to archives.updated_at.
           name: "additionaltags",
           type: "bool",
-          desc: "Fetch upload_date and set updated_at:<epoch> tag",
+          desc: "Fetch upload_date and set metadata.updated_at (epoch seconds)",
           default_value: "0",
         },
       ],
@@ -83,6 +82,10 @@ class NHentaiMetadataPlugin extends BasePlugin {
         next.title = nextTitle;
       }
       next.tags = this.metadataTagsFromCsv(String(data.tags || ""));
+      const updatedAt = String(data.updated_at || "").trim();
+      if (updatedAt) {
+        next.updated_at = updatedAt;
+      }
       next.children = [];
       delete (next as Record<string, unknown>).archive;
       delete (next as Record<string, unknown>).archive_id;
@@ -189,9 +192,14 @@ class NHentaiMetadataPlugin extends BasePlugin {
     return JSON.parse(jsonString);
   }
 
-  private buildTagsFromGalleryJson(gallery: any, galleryId: string, addUploaded: boolean): string {
+  private buildTagsFromGalleryJson(
+    gallery: any,
+    galleryId: string,
+    addUploaded: boolean,
+  ): { tags: string; updated_at?: string } {
     const tags: string[] = [];
     const jsonTags: any[] = Array.isArray(gallery?.tags) ? gallery.tags : [];
+    let updatedAt = "";
 
     for (const t of jsonTags) {
       const ns = String(t?.type || "").trim();
@@ -204,10 +212,9 @@ class NHentaiMetadataPlugin extends BasePlugin {
     if (addUploaded) {
       const uploadDate = gallery?.upload_date;
       if (typeof uploadDate === "number" && Number.isFinite(uploadDate)) {
-        // Use updated_at namespace so the backend can map it to archives.updated_at (see EHentai.ts).
-        tags.push(`updated_at:${Math.trunc(uploadDate)}`);
+        updatedAt = String(Math.trunc(uploadDate));
       } else if (typeof uploadDate === "string" && uploadDate.trim()) {
-        tags.push(`updated_at:${uploadDate.trim()}`);
+        updatedAt = uploadDate.trim();
       }
     }
 
@@ -215,7 +222,10 @@ class NHentaiMetadataPlugin extends BasePlugin {
       tags.push(`source:nhentai.net/g/${galleryId}`);
     }
 
-    return tags.join(", ");
+    return {
+      tags: tags.join(", "),
+      updated_at: updatedAt || undefined,
+    };
   }
 
   private coerceBoolLike(value: unknown): boolean {
@@ -264,14 +274,15 @@ class NHentaiMetadataPlugin extends BasePlugin {
     const gallery = this.extractGalleryJsonFromHtml(html);
     if (!gallery) return { success: false, error: "Failed to parse gallery metadata (missing embedded JSON)" };
 
-    const tags = this.buildTagsFromGalleryJson(gallery, galleryId, addUploaded);
+    const tagPayload = this.buildTagsFromGalleryJson(gallery, galleryId, addUploaded);
     const title = this.pickTitleFromGalleryJson(gallery, galleryId);
 
     return {
       success: true,
       data: {
-        tags,
+        tags: tagPayload.tags,
         title,
+        updated_at: tagPayload.updated_at,
       },
     };
   }

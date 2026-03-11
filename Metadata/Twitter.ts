@@ -100,12 +100,15 @@ class TwitterMetadataPlugin extends BasePlugin {
       const title = prefixId ? `${tweetId} ${displayName || screenName}`.trim() : baseTitle;
 
       const createdAt = this.normalizeToEpochSeconds(tweetLegacy?.createdAt);
-      const tags = this.buildTags(tweetId, tweetUrl, screenName, displayName, createdAt);
+      const tags = this.buildTags(tweetId, tweetUrl, screenName, displayName);
       const merged = mergeExisting ? this.mergeTags(existingTags, tags) : tags;
       const next = this.cloneMetadataObject(metadata);
       next.title = title;
       next.description = description;
       next.tags = this.metadataTagsFromCsv(merged);
+      if (createdAt) {
+        next.updated_at = createdAt;
+      }
       next.children = [];
       delete (next as Record<string, unknown>).archive;
       delete (next as Record<string, unknown>).archive_id;
@@ -217,7 +220,6 @@ class TwitterMetadataPlugin extends BasePlugin {
     tweetUrl: string,
     screenName: string,
     displayName: string,
-    createdAt: string | null,
   ): string {
     const out: string[] = [];
     out.push(`source:${tweetUrl}`);
@@ -226,7 +228,6 @@ class TwitterMetadataPlugin extends BasePlugin {
     // User requirement: store author username as artist:{id}
     if (screenName) out.push(`artist:${screenName}`);
     if (displayName) out.push(`x_name:${displayName}`);
-    if (createdAt) out.push(`updated_at:${createdAt}`);
 
     const seen = new Set<string>();
     const deduped: string[] = [];

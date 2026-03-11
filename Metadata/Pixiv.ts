@@ -197,17 +197,17 @@ class PixivMetadataPlugin extends BasePlugin {
         const updatedAt = this.normalizeToEpochSeconds(
           body.updateDate || body.uploadDate || body.createDate,
         );
-        const tagsWithUpdatedAt = updatedAt
-          ? this.mergeTags(tags, `updated_at:${updatedAt}`)
-          : tags;
         const merged = mergeExisting
-          ? this.mergeTags(this.metadataTagsToCsv(metadata.tags), tagsWithUpdatedAt)
-          : tagsWithUpdatedAt;
+          ? this.mergeTags(this.metadataTagsToCsv(metadata.tags), tags)
+          : tags;
 
         const next = this.cloneMetadataObject(metadata);
         next.title = title;
         next.description = summary;
         next.tags = this.metadataTagsFromCsv(merged);
+        if (updatedAt) {
+          next.updated_at = updatedAt;
+        }
         next.children = [];
         delete (next as Record<string, unknown>).archive;
         delete (next as Record<string, unknown>).archive_id;
@@ -242,17 +242,17 @@ class PixivMetadataPlugin extends BasePlugin {
       const updatedAt = this.normalizeToEpochSeconds(
         body.updateDate || body.uploadDate || body.createDate,
       );
-      const tagsWithUpdatedAt = updatedAt
-        ? this.mergeTags(tags, `updated_at:${updatedAt}`)
-        : tags;
       const merged = mergeExisting
-        ? this.mergeTags(this.metadataTagsToCsv(metadata.tags), tagsWithUpdatedAt)
-        : tagsWithUpdatedAt;
+        ? this.mergeTags(this.metadataTagsToCsv(metadata.tags), tags)
+        : tags;
 
       const next = this.cloneMetadataObject(metadata);
       next.title = title;
       next.description = summary;
       next.tags = this.metadataTagsFromCsv(merged);
+      if (updatedAt) {
+        next.updated_at = updatedAt;
+      }
       next.children = [];
       delete (next as Record<string, unknown>).archive;
       delete (next as Record<string, unknown>).archive_id;

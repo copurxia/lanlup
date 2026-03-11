@@ -75,7 +75,7 @@ class EHentaiMetadataPlugin extends BasePlugin {
           name: "additionaltags",
           type: "bool",
           desc:
-            "Fetch additional updated_at (time posted) and uploader metadata",
+            "Fetch additional uploader metadata and set metadata.updated_at (time posted)",
         },
         {
           name: "expunged",
@@ -189,6 +189,10 @@ class EHentaiMetadataPlugin extends BasePlugin {
         next.title = nextTitle;
       }
       next.tags = this.metadataTagsFromCsv(String(payload.tags || ""));
+      const updatedAt = String(payload.updated_at || "").trim();
+      if (updatedAt) {
+        next.updated_at = updatedAt;
+      }
       next.children = [];
       delete (next as Record<string, unknown>).archive;
       delete (next as Record<string, unknown>).archive_id;
@@ -297,6 +301,7 @@ class EHentaiMetadataPlugin extends BasePlugin {
         type: 0,
         description: String(archiveMeta.description || ""),
         tags: this.metadataTagsFromCsv(String(result.data.tags || "")),
+        updated_at: String(result.data.updated_at || "").trim() || undefined,
         assets: Array.isArray(archiveMeta.assets) ? archiveMeta.assets : [],
         volume_no: i + 1,
         entity_id: archiveId,
@@ -440,6 +445,10 @@ class EHentaiMetadataPlugin extends BasePlugin {
     }
 
     const hashData: any = { tags: tagsResult.data.tags };
+    const updatedAt = String(tagsResult.data.updated_at || "").trim();
+    if (updatedAt) {
+      hashData.updated_at = updatedAt;
+    }
 
     // 添加source URL和title（同时添加两个域名）
     if (hashData.tags) {
@@ -966,14 +975,14 @@ class EHentaiMetadataPlugin extends BasePlugin {
       }
 
       const tags = [...data.tags, `category:${data.category.toLowerCase()}`];
+      let updatedAt = "";
 
       if (additionaltags) {
         if (data.uploader) {
           tags.push(`uploader:${data.uploader}`);
         }
         if (data.posted) {
-          // Use updated_at namespace so the backend can map it to archives.updated_at.
-          tags.push(`updated_at:${data.posted}`);
+          updatedAt = String(data.posted).trim();
         }
       }
 
@@ -984,6 +993,7 @@ class EHentaiMetadataPlugin extends BasePlugin {
         data: {
           tags: tags.join(", "),
           title: this.htmlUnescape(title),
+          updated_at: updatedAt || undefined,
         },
       };
     } catch (error) {

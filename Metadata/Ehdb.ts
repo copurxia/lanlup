@@ -179,6 +179,10 @@ class EhdbMetadataPlugin extends BasePlugin {
         next.title = nextTitle;
       }
       next.tags = this.metadataTagsFromCsv(String(payload.tags || ""));
+      const updatedAt = String(payload.updated_at || "").trim();
+      if (updatedAt) {
+        next.updated_at = updatedAt;
+      }
       next.children = [];
       delete (next as Record<string, unknown>).archive;
       delete (next as Record<string, unknown>).archive_id;
@@ -269,6 +273,7 @@ class EhdbMetadataPlugin extends BasePlugin {
         type: 0,
         description: String(archiveMeta.description || ""),
         tags: this.metadataTagsFromCsv(String(result.data.tags || "")),
+        updated_at: String(result.data.updated_at || "").trim() || undefined,
         assets: Array.isArray(archiveMeta.assets) ? archiveMeta.assets : [],
         volume_no: i + 1,
         entity_id: archiveId,
@@ -419,6 +424,10 @@ class EhdbMetadataPlugin extends BasePlugin {
       }
 
       const hashData: any = { tags: tagsResult.data.tags };
+      const updatedAt = String(tagsResult.data.updated_at || "").trim();
+      if (updatedAt) {
+        hashData.updated_at = updatedAt;
+      }
 
       // 添加 source URL（同时添加两个域名）
       if (hashData.tags) {
@@ -920,11 +929,7 @@ class EhdbMetadataPlugin extends BasePlugin {
         tags.push(`uploader:${gallery.uploader}`);
       }
 
-      // EHDB stores posted time in gallery.posted; expose it as updated_at for the host to map to archives.updated_at.
       const posted = this.normalizeToEpochSeconds(gallery.posted);
-      if (posted) {
-        tags.push(`updated_at:${posted}`);
-      }
 
       const title = gallery.title_jpn || gallery.title;
 
@@ -939,6 +944,7 @@ class EhdbMetadataPlugin extends BasePlugin {
         data: {
           tags: tags.join(", "),
           title: title,
+          updated_at: posted || undefined,
         },
       };
     } catch (error) {

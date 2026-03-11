@@ -38,7 +38,7 @@ type VolumeMeta = {
   summary: string;
   tags: string;
   cover?: string;
-  release_date?: string;
+  release_at?: string;
   isbn?: string;
   source_url: string;
   cover_urls: string[];
@@ -182,7 +182,7 @@ class BofMetadataPlugin extends BasePlugin {
           entity_type: "archive",
           volume_no: item.volume_no,
         },
-        release_date: item.release_date || "",
+        release_at: item.release_at || "",
         isbn: item.isbn || "",
         source_url: item.source_url,
       }))

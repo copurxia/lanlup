@@ -18,7 +18,7 @@ class OpfSidecarMetadataPlugin extends BasePlugin {
         { name: "sidecar_name", type: "string", desc: "Preferred OPF sidecar filename", default_value: "metadata.opf" },
         { name: "merge_existing", type: "bool", desc: "Merge extracted tags with existing archive tags", default_value: "1" },
         { name: "include_artist", type: "bool", desc: "Add artist:<dc:creator> tag", default_value: "1" },
-        { name: "include_timestamp", type: "bool", desc: "Map calibre:timestamp to updated_at:<unix>", default_value: "1" },
+        { name: "include_timestamp", type: "bool", desc: "Map calibre:timestamp to metadata.updated_at (unix epoch seconds)", default_value: "1" },
       ],
       oneshot_arg: "Optional OPF filename in archive directory (e.g. metadata.opf)",
       cooldown: 0,
@@ -83,9 +83,12 @@ class OpfSidecarMetadataPlugin extends BasePlugin {
         if (creator) tags.push("artist:" + creator);
       }
 
+      let updatedAt: string | undefined;
       if (includeTimestamp) {
         const ts = this.readCalibreTimestamp(xml);
-        if (ts) tags.push("updated_at:" + ts);
+        if (ts) {
+          updatedAt = ts;
+        }
       }
 
       const deduped = this.dedupeTags(tags).join(", ");
@@ -99,6 +102,9 @@ class OpfSidecarMetadataPlugin extends BasePlugin {
         next.description = summary;
       }
       next.tags = this.metadataTagsFromCsv(merged);
+      if (updatedAt !== undefined) {
+        next.updated_at = updatedAt;
+      }
       next.children = [];
       delete (next as Record<string, unknown>).archive;
       delete (next as Record<string, unknown>).archive_id;

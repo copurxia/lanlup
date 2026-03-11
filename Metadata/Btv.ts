@@ -53,7 +53,7 @@ type VolumeMeta = {
   summary: string;
   tags: string;
   cover?: string;
-  release_date?: string;
+  release_at?: string;
   isbn?: string;
   source_url: string;
   cover_urls: string[];
@@ -200,7 +200,7 @@ class BtvMetadataPlugin extends BasePlugin {
           entity_type: "archive",
           volume_no: item.volume_no,
         },
-        release_date: item.release_date || "",
+        release_at: item.release_at || "",
         isbn: item.isbn || "",
         source_url: item.source_url,
       }));
@@ -309,7 +309,7 @@ class BtvMetadataPlugin extends BasePlugin {
         summary: detailSummary,
         tags: vTags,
         cover,
-        release_date: releaseDate || undefined,
+        release_at: releaseDate || undefined,
         isbn: isbn || undefined,
         source_url: `${BtvMetadataPlugin.WEB_BASE}/subject/${rel.id}`,
         cover_urls: coverUrls,
