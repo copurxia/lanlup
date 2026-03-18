@@ -24,7 +24,7 @@ use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(target_arch = "wasm32")]
-#[link(wasm_import_module = "lanlu_host")]
+#[link(wasm_import_module = "wasmedge_host")]
 extern "C" {
     fn host_log(level: i32, ptr: i32, len: i32) -> i32;
     fn host_progress(percent: i32, ptr: i32, len: i32) -> i32;
@@ -36,7 +36,7 @@ extern "C" {
 }
 
 #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
-#[link(wasm_import_module = "lanlu_host")]
+#[link(wasm_import_module = "wasmedge_host")]
 extern "C" {
     fn host_tcp_connect(host_ptr: i32, host_len: i32, port: i32, timeout_ms: i32) -> i32;
     fn host_tcp_read(handle: i32, dst_ptr: i32, dst_len: i32, timeout_ms: i32) -> i32;

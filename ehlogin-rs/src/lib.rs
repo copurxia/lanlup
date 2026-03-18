@@ -23,7 +23,7 @@ const MAX_REDIRECTS: usize = 5;
 const DEFAULT_TIMEOUT_MS: i32 = 30_000;
 
 #[cfg(target_arch = "wasm32")]
-#[link(wasm_import_module = "lanlu_host")]
+#[link(wasm_import_module = "wasmedge_host")]
 extern "C" {
     fn host_log(level: i32, ptr: i32, len: i32) -> i32;
     fn host_progress(percent: i32, ptr: i32, len: i32) -> i32;
