@@ -1,0 +1,23 @@
+name: CI nhmeta-rs (wasip1)
+
+on:
+  push:
+    paths:
+      - 'nhmeta-rs/**'
+      - '.github/workflows/nhmeta-rs-wasip1.yml'
+      - '.github/workflows/_build-wasip1.yml'
+  pull_request:
+    paths:
+      - 'nhmeta-rs/**'
+      - '.github/workflows/nhmeta-rs-wasip1.yml'
+      - '.github/workflows/_build-wasip1.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    uses: ./.github/workflows/_build-wasip1.yml
+    with:
+      plugin: nhmeta-rs

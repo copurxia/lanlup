@@ -1,0 +1,23 @@
+name: CI helloworld-rs (wasip1)
+
+on:
+  push:
+    paths:
+      - 'helloworld-rs/**'
+      - '.github/workflows/helloworld-rs-wasip1.yml'
+      - '.github/workflows/_build-wasip1.yml'
+  pull_request:
+    paths:
+      - 'helloworld-rs/**'
+      - '.github/workflows/helloworld-rs-wasip1.yml'
+      - '.github/workflows/_build-wasip1.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    uses: ./.github/workflows/_build-wasip1.yml
+    with:
+      plugin: helloworld-rs
