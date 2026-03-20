@@ -298,7 +298,7 @@ fn execute_plugin(input: PluginInput) -> Result<Value, String> {
             std::slice::from_ref(&cover_url),
             &format!("vol_{}", idx + 1),
             &input.plugin_dir,
-            "bofmeta-rs",
+            "bofmeta",
         );
         if !cached.is_empty() {
             v.cover = cached;
@@ -311,7 +311,7 @@ fn execute_plugin(input: PluginInput) -> Result<Value, String> {
 
     let cover_urls = volumes.iter().map(|v| v.cover.clone()).collect::<Vec<_>>();
     let mut series_cover =
-        cache_cover_for_result(&cover_urls, &format!("series_{series_id}"), &input.plugin_dir, "bofmeta-rs");
+        cache_cover_for_result(&cover_urls, &format!("series_{series_id}"), &input.plugin_dir, "bofmeta");
     if series_cover.is_empty() && !cover_urls.is_empty() {
         series_cover = cover_urls[0].clone();
     }

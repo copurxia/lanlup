@@ -316,7 +316,7 @@ fn execute_plugin(input: PluginInput) -> Result<Value, String> {
         &series_cover_urls,
         &format!("series_{subject_id}"),
         &input.plugin_dir,
-        "btvmeta-rs",
+        "btvmeta",
     );
     if series_cover.is_empty() && !series_cover_urls.is_empty() {
         series_cover = series_cover_urls[0].clone();
@@ -508,7 +508,7 @@ fn fetch_volume_metadata(
             }
             dedupe_strings(urls)
         };
-        let mut cover = cache_cover_for_result(&cover_urls, &format!("vol_{}", rel.id), plugin_dir, "btvmeta-rs");
+        let mut cover = cache_cover_for_result(&cover_urls, &format!("vol_{}", rel.id), plugin_dir, "btvmeta");
         if cover.is_empty() && !cover_urls.is_empty() {
             cover = cover_urls[0].clone();
         }

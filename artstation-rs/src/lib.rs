@@ -250,7 +250,7 @@ fn run_download(input: PluginInput) -> Value {
         return output_err(&format!("No artworks found for user: {}", username));
     }
 
-    let out_base = resolve_plugin_dir(&input.plugin_dir, "artstation-rs");
+    let out_base = resolve_plugin_dir(&input.plugin_dir, "artstation");
     let out_dir = format!("{out_base}/{username}");
     if let Err(e) = fs::create_dir_all(&out_dir) {
         return output_err(&format!("Failed to prepare output dir: {e}"));
@@ -326,7 +326,8 @@ fn run_download(input: PluginInput) -> Value {
     json!({
         "success": true,
         "data": [{
-            "relative_path": format!("plugins/artstation-rs/{}", username),
+            "plugin_relative_path": username,
+            "relative_path": username,
             "filename": username,
             "source": format!("https://www.artstation.com/{}", username),
             "downloaded_count": downloaded,

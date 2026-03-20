@@ -235,7 +235,7 @@ fn run_download(input: PluginInput) -> Value {
     }
 
     let safe_author = sanitize_filename(&screen_name);
-    let base_dir = resolve_plugin_dir(&input.plugin_dir, "xdl-rs");
+    let base_dir = resolve_plugin_dir(&input.plugin_dir, "xdl");
     let abs_dir = format!("{base_dir}/{safe_author}/{tweet_id}");
     if let Err(e) = fs::create_dir_all(&abs_dir) {
         return output_err(&format!("Failed to prepare output dir: {e}"));
@@ -269,7 +269,8 @@ fn run_download(input: PluginInput) -> Value {
     json!({
         "success": true,
         "data": [{
-            "relative_path": format!("plugins/xdl-rs/{safe_author}/{tweet_id}"),
+            "plugin_relative_path": format!("{safe_author}/{tweet_id}"),
+            "relative_path": format!("{safe_author}/{tweet_id}"),
             "filename": format!("{}_{}", safe_author, tweet_id),
             "source": input.url,
             "downloaded_count": ok_count,

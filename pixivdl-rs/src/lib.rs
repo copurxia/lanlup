@@ -219,7 +219,7 @@ fn run_download(input: PluginInput) -> Value {
         safe_title
     };
 
-    let out_base = resolve_plugin_dir(&input.plugin_dir, "pixivdl-rs");
+    let out_base = resolve_plugin_dir(&input.plugin_dir, "pixivdl");
     let out_dir = format!("{out_base}/{folder_name}");
     if let Err(e) = fs::create_dir_all(&out_dir) {
         return output_err(&format!("Failed to prepare output dir: {e}"));
@@ -337,7 +337,8 @@ fn run_download(input: PluginInput) -> Value {
     json!({
         "success": true,
         "data": [{
-            "relative_path": format!("plugins/pixivdl-rs/{folder_name}"),
+            "plugin_relative_path": folder_name,
+            "relative_path": folder_name,
             "filename": folder_name,
             "source": referer,
             "downloaded_count": downloaded,

@@ -281,7 +281,7 @@ fn run_download(input: &PluginInput) -> Value {
         &gallery.pretty_name
     });
     let folder_name = format!("{} {}", gallery.id, safe);
-    let plugin_base = resolve_plugin_dir(&input.plugin_dir, "nhentai-rs");
+    let plugin_base = resolve_plugin_dir(&input.plugin_dir, "nhentai");
     let plugin_dir = format!("{plugin_base}/{folder_name}");
     if let Err(e) = fs::create_dir_all(&plugin_dir) {
         return output_err(&format!("Failed to prepare plugin dir: {e}"));
@@ -322,7 +322,8 @@ fn run_download(input: &PluginInput) -> Value {
     json!({
         "success": true,
         "data": [{
-            "relative_path": format!("plugins/nhentai-rs/{folder_name}"),
+            "plugin_relative_path": folder_name,
+            "relative_path": folder_name,
             "filename": folder_name,
             "source": format!("https://nhentai.net/g/{gallery_id}/"),
             "downloaded_count": downloaded_count,

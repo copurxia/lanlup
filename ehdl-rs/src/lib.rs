@@ -275,7 +275,7 @@ fn run_download(input: &PluginInput) -> Value {
         token,
         if forceresampled { "res" } else { "org" }
     );
-    let plugin_dir = resolve_plugin_dir(&input.plugin_dir, "ehdl-rs");
+    let plugin_dir = resolve_plugin_dir(&input.plugin_dir, "ehdl");
     let (final_relative_path, final_filename) = match download_archive_direct(
         &final_url,
         domain,
@@ -290,6 +290,7 @@ fn run_download(input: &PluginInput) -> Value {
     json!({
         "success": true,
         "data": [{
+            "plugin_relative_path": final_relative_path,
             "relative_path": final_relative_path,
             "filename": final_filename,
             "source": format!("https://e-hentai.org/g/{gid}/{token}"),
@@ -1042,7 +1043,7 @@ fn download_archive_direct(
         .and_then(|v| v.to_str())
         .unwrap_or(file_name_hint)
         .to_string();
-    Ok((format!("plugins/ehdl-rs/{filename}"), filename))
+    Ok((filename.clone(), filename))
 }
 
 fn parse_content_range_total(v: &str) -> Option<u64> {
