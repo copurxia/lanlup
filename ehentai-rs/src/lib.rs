@@ -9,6 +9,8 @@ use std::cell::RefCell;
 use std::io::{self, Read, Write};
 use std::slice;
 use std::sync::Arc;
+use time::macros::format_description;
+use time::OffsetDateTime;
 use url::Url;
 use webpki_roots::TLS_SERVER_ROOTS;
 
@@ -1052,7 +1054,9 @@ fn get_tags_from_eh(
             }
         }
         if let Some(posted) = data.get("posted").and_then(value_to_string) {
-            updated_at = posted.trim().to_string();
+            if let Some(formatted) = epoch_seconds_to_utc_timestamp(posted.trim()) {
+                updated_at = formatted;
+            }
         }
     }
 
@@ -1073,6 +1077,13 @@ fn get_tags_from_eh(
         title: html_unescape(title.trim()),
         updated_at,
     })
+}
+
+fn epoch_seconds_to_utc_timestamp(raw: &str) -> Option<String> {
+    let secs = raw.parse::<i64>().ok()?;
+    let dt = OffsetDateTime::from_unix_timestamp(secs).ok()?;
+    let fmt = format_description!("[year]-[month]-[day] [hour]:[minute]:[second]");
+    dt.format(fmt).ok()
 }
 
 #[cfg(all(target_arch = "wasm32", target_os = "wasi"))]
