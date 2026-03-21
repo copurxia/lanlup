@@ -8,6 +8,8 @@ use std::cell::RefCell;
 use std::io::{self, Read, Write};
 use std::slice;
 use std::sync::Arc;
+use time::macros::format_description;
+use time::OffsetDateTime;
 use webpki_roots::TLS_SERVER_ROOTS;
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -518,9 +520,9 @@ fn normalize_to_epoch_seconds(value: Option<&Value>) -> Option<String> {
 
     if let Some(n) = v.as_i64() {
         if n > 1_000_000_000_000 {
-            return Some((n / 1000).to_string());
+            return epoch_seconds_to_utc_timestamp(n / 1000);
         }
-        return Some(n.to_string());
+        return epoch_seconds_to_utc_timestamp(n);
     }
 
     let Some(s) = v.as_str() else {
@@ -534,16 +536,23 @@ fn normalize_to_epoch_seconds(value: Option<&Value>) -> Option<String> {
     if t.chars().all(|c| c.is_ascii_digit()) {
         if let Ok(n) = t.parse::<i64>() {
             if n > 1_000_000_000_000 {
-                return Some((n / 1000).to_string());
+                return epoch_seconds_to_utc_timestamp(n / 1000);
             }
-            return Some(n.to_string());
+            return epoch_seconds_to_utc_timestamp(n);
         }
     }
 
     if let Ok(ts) = parse_iso8601_to_epoch_seconds(t) {
-        return Some(ts.to_string());
+        return epoch_seconds_to_utc_timestamp(ts);
     }
     None
+}
+
+fn epoch_seconds_to_utc_timestamp(secs: i64) -> Option<String> {
+    let fmt = format_description!("[year]-[month]-[day] [hour]:[minute]:[second]");
+    OffsetDateTime::from_unix_timestamp(secs)
+        .ok()
+        .and_then(|dt| dt.format(fmt).ok())
 }
 
 fn parse_iso8601_to_epoch_seconds(s: &str) -> Result<i64, String> {

@@ -6,6 +6,8 @@ use std::alloc::{alloc, dealloc, Layout};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::slice;
+use time::macros::format_description;
+use time::OffsetDateTime;
 
 #[cfg(target_arch = "wasm32")]
 #[link(wasm_import_module = "wasmedge_host")]
@@ -205,7 +207,7 @@ fn plugin_info_json() -> Value {
             {"name": "sidecar_name", "type": "string", "desc": "Preferred OPF sidecar filename", "default_value": "metadata.opf"},
             {"name": "merge_existing", "type": "bool", "desc": "Merge extracted tags with existing archive tags", "default_value": "1"},
             {"name": "include_artist", "type": "bool", "desc": "Add artist:<dc:creator> tag", "default_value": "1"},
-            {"name": "include_timestamp", "type": "bool", "desc": "Map calibre:timestamp to metadata.updated_at (unix epoch seconds)", "default_value": "1"}
+            {"name": "include_timestamp", "type": "bool", "desc": "Map calibre:timestamp to metadata.updated_at (UTC timestamp string)", "default_value": "1"}
         ],
         "oneshot_arg": "Optional OPF filename in archive directory (e.g. metadata.opf)",
         "cooldown": 0,
@@ -293,10 +295,9 @@ fn execute_plugin(input: PluginInput) -> Result<Value, String> {
     metadata.insert("tags".to_string(), json!(final_tags));
     if options.include_timestamp {
         if let Some(updated_at) = read_calibre_timestamp(&parsed) {
-            metadata.insert(
-                "updated_at".to_string(),
-                Value::String(updated_at.to_string()),
-            );
+            if let Some(updated_text) = epoch_seconds_to_utc_timestamp(updated_at) {
+                metadata.insert("updated_at".to_string(), Value::String(updated_text));
+            }
         }
     }
     metadata.insert("children".to_string(), Value::Array(vec![]));
@@ -519,6 +520,13 @@ fn read_calibre_timestamp(parsed: &ParsedXml) -> Option<i64> {
             .map(|(_, value)| value.trim().to_string())
     })?;
     parse_timestamp_to_epoch(&raw)
+}
+
+fn epoch_seconds_to_utc_timestamp(secs: i64) -> Option<String> {
+    let fmt = format_description!("[year]-[month]-[day] [hour]:[minute]:[second]");
+    OffsetDateTime::from_unix_timestamp(secs)
+        .ok()
+        .and_then(|dt| dt.format(fmt).ok())
 }
 
 fn parse_timestamp_to_epoch(raw: &str) -> Option<i64> {

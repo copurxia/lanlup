@@ -13,6 +13,7 @@ serde_json = "1.0"
 rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
 webpki-roots = "0.26"
 urlencoding = "2.1"
+time = { version = "0.3", features = ["formatting", "macros"] }
 
 [target.'cfg(all(target_arch = "wasm32", target_os = "wasi"))'.dependencies]
 wasmedge_wasi_socket = "0.5.5"

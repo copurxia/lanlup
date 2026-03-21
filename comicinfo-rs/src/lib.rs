@@ -6,6 +6,8 @@ use std::alloc::{alloc, dealloc, Layout};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::slice;
+use time::macros::format_description;
+use time::OffsetDateTime;
 
 #[cfg(target_arch = "wasm32")]
 #[link(wasm_import_module = "wasmedge_host")]
@@ -206,7 +208,7 @@ fn plugin_info_json() -> Value {
             {"name": "merge_existing", "type": "bool", "desc": "Merge extracted tags with existing archive tags", "default_value": "1"},
             {"name": "include_writer_artist", "type": "bool", "desc": "Add artist:<Writer> tag", "default_value": "1"},
             {"name": "include_web_source", "type": "bool", "desc": "Map <Web> to metadata.source_url", "default_value": "1"},
-            {"name": "include_release_date", "type": "bool", "desc": "Map Year/Month/Day to metadata.release_at (unix epoch seconds)", "default_value": "1"}
+            {"name": "include_release_date", "type": "bool", "desc": "Map Year/Month/Day to metadata.release_at (UTC timestamp string)", "default_value": "1"}
         ],
         "oneshot_arg": "Optional ComicInfo filename inside archive (e.g. ComicInfo.xml)",
         "cooldown": 0,
@@ -299,10 +301,9 @@ fn execute_plugin(input: PluginInput) -> Result<Value, String> {
     }
     if options.include_release_date {
         if let Some(release_at) = parse_release_at(&parsed) {
-            metadata.insert(
-                "release_at".to_string(),
-                Value::String(release_at.to_string()),
-            );
+            if let Some(release_text) = epoch_seconds_to_utc_timestamp(release_at) {
+                metadata.insert("release_at".to_string(), Value::String(release_text));
+            }
         }
     }
     metadata.insert("children".to_string(), Value::Array(vec![]));
@@ -514,6 +515,13 @@ fn parse_release_at(parsed: &ParsedXml) -> Option<i64> {
         return None;
     }
     Some(days_from_civil(year, month, day) * 86_400)
+}
+
+fn epoch_seconds_to_utc_timestamp(secs: i64) -> Option<String> {
+    let fmt = format_description!("[year]-[month]-[day] [hour]:[minute]:[second]");
+    OffsetDateTime::from_unix_timestamp(secs)
+        .ok()
+        .and_then(|dt| dt.format(fmt).ok())
 }
 
 fn days_in_month(year: i32, month: u32) -> u32 {

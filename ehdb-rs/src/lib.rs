@@ -15,6 +15,8 @@ use std::collections::{BTreeSet, HashMap};
 use std::io::{self, Read, Write};
 use std::slice;
 use std::str;
+use time::macros::format_description;
+use time::OffsetDateTime;
 use url::Url;
 
 #[cfg(any(not(target_arch = "wasm32"), target_os = "wasi"))]
@@ -1707,12 +1709,26 @@ fn normalize_to_epoch_seconds(value: &str) -> String {
         return String::new();
     }
     if trimmed.chars().all(|ch| ch.is_ascii_digit()) {
-        if trimmed.len() > 12 {
-            return trimmed[..trimmed.len() - 3].to_string();
+        let maybe_secs = if trimmed.len() > 12 {
+            trimmed[..trimmed.len() - 3].parse::<i64>().ok()
+        } else {
+            trimmed.parse::<i64>().ok()
+        };
+        if let Some(secs) = maybe_secs {
+            if let Some(ts) = epoch_seconds_to_utc_timestamp(secs) {
+                return ts;
+            }
         }
-        return trimmed.to_string();
+        return String::new();
     }
     trimmed.to_string()
+}
+
+fn epoch_seconds_to_utc_timestamp(secs: i64) -> Option<String> {
+    let fmt = format_description!("[year]-[month]-[day] [hour]:[minute]:[second]");
+    OffsetDateTime::from_unix_timestamp(secs)
+        .ok()
+        .and_then(|dt| dt.format(fmt).ok())
 }
 
 fn parse_json_string_array(raw: &str) -> Vec<String> {

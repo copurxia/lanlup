@@ -8,6 +8,8 @@ use std::cell::RefCell;
 use std::io::{self, Read, Write};
 use std::slice;
 use std::sync::Arc;
+use time::macros::format_description;
+use time::OffsetDateTime;
 use webpki_roots::TLS_SERVER_ROOTS;
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -176,7 +178,7 @@ fn plugin_info_json() -> Value {
             {
                 "name": "additionaltags",
                 "type": "bool",
-                "desc": "Fetch upload_date and set metadata.updated_at (epoch seconds)",
+                "desc": "Fetch upload_date and set metadata.updated_at (UTC timestamp string)",
                 "default_value": "0"
             }
         ],
@@ -456,20 +458,34 @@ fn build_tags_from_gallery_json(
     }
 
     let updated_at = if add_uploaded {
-        if let Some(v) = gallery.get("upload_date") {
-            if let Some(n) = v.as_i64() {
-                Some(n.to_string())
-            } else {
-                v.as_str().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
-            }
-        } else {
-            None
-        }
+        gallery.get("upload_date").and_then(format_uploaded_at_value)
     } else {
         None
     };
 
     (tags.join(", "), updated_at)
+}
+
+fn format_uploaded_at_value(value: &Value) -> Option<String> {
+    if let Some(n) = value.as_i64() {
+        return epoch_seconds_to_utc_timestamp(n);
+    }
+    let raw = value.as_str()?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    if raw.chars().all(|ch| ch.is_ascii_digit()) {
+        let secs = raw.parse::<i64>().ok()?;
+        return epoch_seconds_to_utc_timestamp(secs);
+    }
+    Some(raw.to_string())
+}
+
+fn epoch_seconds_to_utc_timestamp(secs: i64) -> Option<String> {
+    let fmt = format_description!("[year]-[month]-[day] [hour]:[minute]:[second]");
+    OffsetDateTime::from_unix_timestamp(secs)
+        .ok()
+        .and_then(|dt| dt.format(fmt).ok())
 }
 
 fn pick_title_from_gallery_json(gallery: &Value, gallery_id: &str) -> String {
