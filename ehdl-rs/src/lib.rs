@@ -276,11 +276,14 @@ fn run_download(input: &PluginInput) -> Value {
         if forceresampled { "res" } else { "org" }
     );
     let plugin_dir = resolve_plugin_dir(&input.plugin_dir, "ehdl");
+    let title_hint = extract_gallery_title_hint(&check.1)
+        .or_else(|| extract_gallery_title_hint(&req.1));
     let (final_relative_path, final_filename) = match download_archive_direct(
         &final_url,
         domain,
         &input.login_cookies,
         &plugin_dir,
+        title_hint.as_deref(),
         &file_name_hint,
     ) {
         Ok(v) => v,
@@ -882,6 +885,57 @@ fn extract_line_crlf(pending: &mut Vec<u8>) -> Option<String> {
     }
 }
 
+fn extract_gallery_title_hint(html: &str) -> Option<String> {
+    let patterns = [
+        r#"(?is)<h1[^>]*\bid\s*=\s*["']?gj["']?[^>]*>(.*?)</h1>"#,
+        r#"(?is)<h1[^>]*\bid\s*=\s*["']?gn["']?[^>]*>(.*?)</h1>"#,
+        r#"(?is)<title[^>]*>(.*?)</title>"#,
+    ];
+    for pattern in patterns {
+        let re = match Regex::new(pattern) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let Some(caps) = re.captures(html) else {
+            continue;
+        };
+        let raw = caps.get(1).map(|m| m.as_str()).unwrap_or_default();
+        let stripped = strip_html_tags(raw);
+        let decoded = decode_basic_html_entities(&stripped);
+        let mut title = decoded.trim().to_string();
+        if title.is_empty() {
+            continue;
+        }
+        if title.to_ascii_lowercase().contains("e-hentai") {
+            for suffix in [" - E-Hentai Galleries", " - ExHentai.org"] {
+                if title.ends_with(suffix) {
+                    title = title.trim_end_matches(suffix).trim().to_string();
+                }
+            }
+        }
+        if !title.is_empty() {
+            return Some(title);
+        }
+    }
+    None
+}
+
+fn strip_html_tags(input: &str) -> String {
+    let re = Regex::new(r"(?is)<[^>]+>").expect("valid regex");
+    re.replace_all(input, " ").to_string()
+}
+
+fn decode_basic_html_entities(input: &str) -> String {
+    input
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&apos;", "'")
+        .replace("&nbsp;", " ")
+}
+
 fn is_redirect_status(status: u16) -> bool {
     matches!(status, 301 | 302 | 303 | 307 | 308)
 }
@@ -940,15 +994,122 @@ fn ensure_unique_path(base_dir: &str, file_name: &str) -> PathBuf {
     p
 }
 
+fn resolve_archive_filename(
+    headers: &[(String, String)],
+    title_hint: Option<&str>,
+    fallback_hint: &str,
+) -> String {
+    if let Some(v) = header_value(headers, "Content-Disposition")
+        .and_then(parse_content_disposition_filename)
+    {
+        let safe = sanitize_filename_for_fs(&v);
+        if !safe.is_empty() {
+            return ensure_zip_extension(safe);
+        }
+    }
+    if let Some(v) = title_hint {
+        let safe = sanitize_filename_for_fs(v);
+        if !safe.is_empty() {
+            return ensure_zip_extension(safe);
+        }
+    }
+    fallback_hint.to_string()
+}
+
+fn parse_content_disposition_filename(raw: &str) -> Option<String> {
+    for token in raw.split(';') {
+        let part = token.trim();
+        let lower = part.to_ascii_lowercase();
+        if let Some(rest) = lower.strip_prefix("filename*=") {
+            let original = &part[part.len() - rest.len()..];
+            let value = strip_surrounding_quotes(original);
+            let encoded = value.split("''").nth(1).unwrap_or(value);
+            let decoded = percent_decode_lossy(encoded);
+            let candidate = decoded.trim();
+            if !candidate.is_empty() {
+                return Some(candidate.to_string());
+            }
+        }
+    }
+    for token in raw.split(';') {
+        let part = token.trim();
+        let lower = part.to_ascii_lowercase();
+        if let Some(rest) = lower.strip_prefix("filename=") {
+            let original = &part[part.len() - rest.len()..];
+            let candidate = strip_surrounding_quotes(original).trim();
+            if !candidate.is_empty() {
+                return Some(candidate.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn strip_surrounding_quotes(input: &str) -> &str {
+    let s = input.trim();
+    if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') {
+        &s[1..s.len() - 1]
+    } else {
+        s
+    }
+}
+
+fn percent_decode_lossy(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let h1 = bytes[i + 1] as char;
+            let h2 = bytes[i + 2] as char;
+            if let (Some(a), Some(b)) = (h1.to_digit(16), h2.to_digit(16)) {
+                out.push(((a << 4) | b) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).to_string()
+}
+
+fn sanitize_filename_for_fs(input: &str) -> String {
+    let leaf = input
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(input)
+        .trim();
+    let mut out = String::with_capacity(leaf.len());
+    for ch in leaf.chars() {
+        let bad = matches!(ch, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') || ch.is_control();
+        if bad {
+            out.push('_');
+        } else {
+            out.push(ch);
+        }
+    }
+    out.trim_matches([' ', '.']).trim().to_string()
+}
+
+fn ensure_zip_extension(name: String) -> String {
+    if name.to_ascii_lowercase().ends_with(".zip") {
+        name
+    } else {
+        format!("{name}.zip")
+    }
+}
+
 fn download_archive_direct(
     url: &str,
     referer: &str,
     cookies: &[LoginCookie],
     plugin_dir: &str,
+    title_hint: Option<&str>,
     file_name_hint: &str,
 ) -> Result<(String, String), String> {
     fs::create_dir_all(plugin_dir).map_err(|e| e.to_string())?;
-    let target = ensure_unique_path(plugin_dir, file_name_hint);
+    let mut target: Option<PathBuf> = None;
     let mut downloaded = 0u64;
     let mut expected_total: Option<u64> = None;
     for attempt in 0..6 {
@@ -997,12 +1158,20 @@ fn download_archive_direct(
                 }
             }
         }
+        if target.is_none() {
+            let preferred_name =
+                resolve_archive_filename(&resp.headers, title_hint, file_name_hint);
+            target = Some(ensure_unique_path(plugin_dir, &preferred_name));
+        }
+        let target_path = target
+            .as_ref()
+            .ok_or_else(|| "missing download target path".to_string())?;
         let mut file = if downloaded == 0 {
-            File::create(&target).map_err(|e| e.to_string())?
+            File::create(target_path).map_err(|e| e.to_string())?
         } else {
             OpenOptions::new()
                 .append(true)
-                .open(&target)
+                .open(target_path)
                 .map_err(|e| e.to_string())?
         };
         file.write_all(&resp.body).map_err(|e| e.to_string())?;
@@ -1038,7 +1207,10 @@ fn download_archive_direct(
         }
     }
 
-    let filename = target
+    let target_path = target
+        .as_ref()
+        .ok_or_else(|| "missing download target path".to_string())?;
+    let filename = target_path
         .file_name()
         .and_then(|v| v.to_str())
         .unwrap_or(file_name_hint)
