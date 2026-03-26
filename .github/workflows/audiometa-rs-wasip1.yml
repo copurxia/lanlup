@@ -1,0 +1,23 @@
+name: CI audiometa-rs (wasip1)
+
+on:
+  push:
+    paths:
+      - 'audiometa-rs/**'
+      - '.github/workflows/audiometa-rs-wasip1.yml'
+      - '.github/workflows/_build-wasip1.yml'
+  pull_request:
+    paths:
+      - 'audiometa-rs/**'
+      - '.github/workflows/audiometa-rs-wasip1.yml'
+      - '.github/workflows/_build-wasip1.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    uses: ./.github/workflows/_build-wasip1.yml
+    with:
+      plugin: audiometa-rs
