@@ -72,6 +72,8 @@ struct PluginState {
 struct PluginInput {
     #[serde(rename = "pluginType", default)]
     plugin_type: String,
+    #[serde(rename = "targetType", default)]
+    target_type: String,
     #[serde(rename = "targetId", default)]
     target_id: String,
     #[serde(rename = "oneshotParam", default)]
@@ -104,6 +106,12 @@ struct ExportEntriesResponse {
     files: Vec<ExportedFileItem>,
 }
 
+#[derive(Debug, Deserialize)]
+struct TankoubonArchivesResponse {
+    #[serde(default)]
+    archive_ids: Vec<String>,
+}
+
 #[derive(Debug, Clone, Default)]
 struct ParsedAudioTags {
     title: String,
@@ -134,6 +142,16 @@ struct AudioMetaOptions {
     include_genre_tag: bool,
     include_year_tag: bool,
     levels_up: i64,
+}
+
+#[derive(Debug, Clone)]
+struct ArchiveAudioExtraction {
+    archive_id: String,
+    target_entry: String,
+    target_source_name: String,
+    parsed: ParsedAudioTags,
+    cover: Option<ExtractedCover>,
+    pages: Vec<Value>,
 }
 
 #[no_mangle]
@@ -221,6 +239,7 @@ fn plugin_info_json() -> Value {
             "metadata.read_input",
             "archive.list_files",
             "archive.export_entries",
+            "tankoubon.list_archives",
             "log.write",
             "progress.report"
         ],
@@ -258,10 +277,12 @@ fn execute_plugin(input: PluginInput) -> Result<Value, String> {
         return Err("audiometa-rs only supports Metadata plugins".to_string());
     }
 
-    let archive_id = input.target_id.trim();
-    if archive_id.is_empty() {
+    let target_id = input.target_id.trim();
+    if target_id.is_empty() {
         return Err("Missing targetId".to_string());
     }
+
+    let target_type = normalized_target_type(&input.target_type, &input.params);
 
     let options = AudioMetaOptions {
         merge_existing: read_bool_param(&input.params, "merge_existing", true),
@@ -272,25 +293,182 @@ fn execute_plugin(input: PluginInput) -> Result<Value, String> {
         levels_up: read_i64_param(&input.params, "levels_up", 0).clamp(0, 8),
     };
     let execution_tag = resolve_execution_tag(&input.params);
-
-    HostBridge::progress(5, "扫描归档音频文件...");
-    let listing = HostBridge::list_files(archive_id)?;
-    let _ = &listing.archive_id;
-
     let preferred = first_non_empty(&[
         input.oneshot_param.trim().to_string(),
         read_string_param(&input.params, "entry_name", ""),
     ]);
 
+    if target_type == "tankoubon" || target_type == "tank" {
+        return execute_tankoubon_mode(target_id, &preferred, options, execution_tag.as_str(), input.metadata);
+    }
+
+    execute_archive_mode(target_id, &preferred, options, execution_tag.as_str(), input.metadata)
+}
+
+fn execute_archive_mode(
+    archive_id: &str,
+    preferred: &str,
+    options: AudioMetaOptions,
+    execution_tag: &str,
+    metadata_input: Value,
+) -> Result<Value, String> {
+    HostBridge::progress(5, "扫描归档音频文件...");
+    let extracted = extract_archive_audio(archive_id, preferred, options, execution_tag)?;
+    HostBridge::progress(85, "合并元数据输出...");
+    let mut metadata = ensure_metadata_object(metadata_input);
+
+    let next_title = first_non_empty(&[
+        extracted.parsed.title.clone(),
+        metadata_string(&metadata, "title"),
+    ]);
+    if !next_title.is_empty() {
+        metadata.insert("title".to_string(), Value::String(next_title));
+    }
+
+    let summary = build_track_description(&extracted.parsed);
+    if !summary.is_empty() {
+        metadata.insert("description".to_string(), Value::String(summary));
+    }
+
+    let mut tags = if options.merge_existing {
+        metadata_tags(&metadata)
+    } else {
+        Vec::new()
+    };
+    if options.include_artist_tag && !extracted.parsed.artist.is_empty() {
+        tags.push(format!("artist:{}", extracted.parsed.artist));
+    }
+    if options.include_album_tag && !extracted.parsed.album.is_empty() {
+        tags.push(format!("album:{}", extracted.parsed.album));
+    }
+    if options.include_genre_tag && !extracted.parsed.genre.is_empty() {
+        tags.push(format!("genre:{}", extracted.parsed.genre));
+    }
+    if options.include_year_tag {
+        if let Some(year) = extracted.parsed.year {
+            tags.push(format!("year:{year}"));
+        }
+    }
+    tags.push(format!("audio_entry:{}", extracted.target_entry));
+    if !extracted.target_source_name.is_empty() {
+        tags.push(format!("audio_source:{}", extracted.target_source_name));
+    }
+    metadata.insert("tags".to_string(), json!(unique_strings(tags)));
+
+    metadata.insert("children".to_string(), Value::Array(vec![]));
+    if let Some(cover) = extracted.cover {
+        metadata.insert(
+            "assets".to_string(),
+            Value::Array(vec![json!({
+                "key": "cover",
+                "value": cover.relative_path.clone(),
+            })]),
+        );
+    }
+    if !extracted.pages.is_empty() {
+        metadata.insert("pages".to_string(), Value::Array(extracted.pages));
+    }
+    metadata.remove("archive");
+    metadata.remove("archive_id");
+
+    HostBridge::progress(100, "音频标签提取完成");
+    Ok(Value::Object(metadata))
+}
+
+fn execute_tankoubon_mode(
+    tankoubon_id: &str,
+    preferred: &str,
+    options: AudioMetaOptions,
+    execution_tag: &str,
+    metadata_input: Value,
+) -> Result<Value, String> {
+    HostBridge::progress(5, "列出合集成员归档...");
+    let archive_ids = HostBridge::list_tankoubon_archives(tankoubon_id)?
+        .into_iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    if archive_ids.is_empty() {
+        return Err(format!("No member archives found in collection {tankoubon_id}"));
+    }
+
+    let mut root_metadata = ensure_metadata_object(metadata_input);
+    let mut children = Vec::<Value>::with_capacity(archive_ids.len());
+    let mut aggregate_tags = if options.merge_existing {
+        metadata_tags(&root_metadata)
+    } else {
+        Vec::new()
+    };
+    let mut common_album = String::new();
+    let mut first_cover = String::new();
+    let mut first_summary = String::new();
+
+    for (index, archive_id) in archive_ids.iter().enumerate() {
+        let percent = 10 + (((index + 1) * 80) / archive_ids.len()) as i32;
+        HostBridge::progress(percent.min(90), &format!("处理合集成员 {}/{}", index + 1, archive_ids.len()));
+        let member_exec_tag = format!("{execution_tag}_v{}", index + 1);
+        let extracted = extract_archive_audio(archive_id, preferred, options, &member_exec_tag)?;
+        merge_archive_tags(&mut aggregate_tags, &extracted.parsed, options, Some(&extracted.target_entry), Some(&extracted.target_source_name));
+
+        if common_album.is_empty() && !extracted.parsed.album.trim().is_empty() {
+            common_album = extracted.parsed.album.trim().to_string();
+        }
+        if first_cover.is_empty() {
+            if let Some(cover) = &extracted.cover {
+                first_cover = cover.relative_path.clone();
+            }
+        }
+        if first_summary.is_empty() {
+            let summary = build_track_description(&extracted.parsed);
+            if !summary.is_empty() {
+                first_summary = summary;
+            }
+        }
+
+        children.push(build_child_patch_value(index, &extracted));
+    }
+
+    if metadata_string(&root_metadata, "title").is_empty() && !common_album.is_empty() {
+        root_metadata.insert("title".to_string(), Value::String(common_album));
+    }
+    if metadata_string(&root_metadata, "description").is_empty() && !first_summary.is_empty() {
+        root_metadata.insert("description".to_string(), Value::String(first_summary));
+    }
+    root_metadata.insert("tags".to_string(), json!(unique_strings(aggregate_tags)));
+    if !first_cover.is_empty() {
+        root_metadata.insert(
+            "assets".to_string(),
+            Value::Array(vec![json!({
+                "key": "cover",
+                "value": first_cover,
+            })]),
+        );
+    }
+    root_metadata.insert("children".to_string(), Value::Array(children));
+    root_metadata.remove("archive");
+    root_metadata.remove("archive_id");
+
+    HostBridge::progress(100, "合集音频标签提取完成");
+    Ok(Value::Object(root_metadata))
+}
+
+fn extract_archive_audio(
+    archive_id: &str,
+    preferred: &str,
+    options: AudioMetaOptions,
+    execution_tag: &str,
+) -> Result<ArchiveAudioExtraction, String> {
+    let listing = HostBridge::list_files(archive_id)?;
+    let _ = &listing.archive_id;
     let audio_entries = collect_audio_entries(&listing.files);
-    let target_entry = select_audio_entry(&audio_entries, &preferred)
+    let target_entry = select_audio_entry(&audio_entries, preferred)
         .ok_or_else(|| "No audio file found in archive listing".to_string())?;
 
-    HostBridge::progress(25, "导出目标音频文件到运行目录...");
     let exported = HostBridge::export_entries(archive_id, audio_entries.clone(), options.levels_up)?;
     if exported.files.is_empty() {
         return Err("archive.export_entries returned empty files".to_string());
     }
+
     let mut exported_by_source = HashMap::<String, ExportedFileItem>::new();
     for item in &exported.files {
         let key = normalize_entry_key(&item.source);
@@ -300,7 +478,6 @@ fn execute_plugin(input: PluginInput) -> Result<Value, String> {
         exported_by_source.entry(key).or_insert_with(|| item.clone());
     }
 
-    HostBridge::progress(55, "读取音频内嵌标签...");
     let mut page_patches = Vec::<Value>::new();
     let mut target_parsed: Option<ParsedAudioTags> = None;
     let mut target_cover: Option<ExtractedCover> = None;
@@ -309,7 +486,7 @@ fn execute_plugin(input: PluginInput) -> Result<Value, String> {
     for (idx, entry) in audio_entries.iter().enumerate() {
         let source_key = normalize_entry_key(entry);
         let Some(exported_file) = exported_by_source.get(&source_key) else {
-            HostBridge::log(2, &format!("skip page patch: missing exported file for entry={entry}"));
+            HostBridge::log(2, &format!("skip page patch: missing exported file for archive={archive_id}, entry={entry}"));
             continue;
         };
         let runtime_path = format!("/plugin/{}", exported_file.relative_path.trim_start_matches('/'));
@@ -319,7 +496,7 @@ fn execute_plugin(input: PluginInput) -> Result<Value, String> {
                 if normalize_entry_key(entry) == normalize_entry_key(&target_entry) {
                     return Err(e);
                 }
-                HostBridge::log(2, &format!("skip entry due to parse error entry={entry}: {e}"));
+                HostBridge::log(2, &format!("skip entry due to parse error archive={archive_id}, entry={entry}: {e}"));
                 continue;
             }
         };
@@ -328,11 +505,11 @@ fn execute_plugin(input: PluginInput) -> Result<Value, String> {
             &runtime_path,
             exported_file.relative_path.trim(),
             &cover_prefix,
-            &execution_tag,
+            execution_tag,
         ) {
             Ok(v) => v,
             Err(e) => {
-                HostBridge::log(2, &format!("cover extract failed entry={entry}: {e}"));
+                HostBridge::log(2, &format!("cover extract failed archive={archive_id}, entry={entry}: {e}"));
                 None
             }
         };
@@ -342,18 +519,18 @@ fn execute_plugin(input: PluginInput) -> Result<Value, String> {
             exported_file.relative_path.trim(),
             &lyrics_prefix,
             parsed.lyrics.trim(),
-            &execution_tag,
+            execution_tag,
         ) {
             Ok(v) => v,
             Err(e) => {
-                HostBridge::log(2, &format!("lyrics extract failed entry={entry}: {e}"));
+                HostBridge::log(2, &format!("lyrics extract failed archive={archive_id}, entry={entry}: {e}"));
                 None
             }
         };
 
         let page_description = build_track_description(&parsed);
         let mut page_obj = Map::<String, Value>::new();
-        page_obj.insert("entry_path".to_string(), Value::String(entry.clone()));
+        page_obj.insert("path".to_string(), Value::String(entry.clone()));
         if !parsed.title.trim().is_empty() {
             page_obj.insert("title".to_string(), Value::String(parsed.title.clone()));
         }
@@ -374,53 +551,88 @@ fn execute_plugin(input: PluginInput) -> Result<Value, String> {
             target_source_name = exported_file.source.trim().to_string();
         }
     }
+
     let parsed = target_parsed
         .ok_or_else(|| "Target audio was exported but tags could not be parsed".to_string())?;
+    Ok(ArchiveAudioExtraction {
+        archive_id: archive_id.to_string(),
+        target_entry,
+        target_source_name,
+        parsed,
+        cover: target_cover,
+        pages: page_patches,
+    })
+}
 
-    HostBridge::progress(85, "合并元数据输出...");
-    let mut metadata = ensure_metadata_object(input.metadata);
-
-    let next_title = first_non_empty(&[
-        parsed.title.clone(),
-        metadata_string(&metadata, "title"),
-    ]);
-    if !next_title.is_empty() {
-        metadata.insert("title".to_string(), Value::String(next_title));
-    }
-
-    let summary = build_track_description(&parsed);
-    if !summary.is_empty() {
-        metadata.insert("description".to_string(), Value::String(summary));
-    }
-
-    let mut tags = if options.merge_existing {
-        metadata_tags(&metadata)
-    } else {
-        Vec::new()
-    };
+fn merge_archive_tags(
+    aggregate_tags: &mut Vec<String>,
+    parsed: &ParsedAudioTags,
+    options: AudioMetaOptions,
+    target_entry: Option<&str>,
+    target_source_name: Option<&str>,
+) {
     if options.include_artist_tag && !parsed.artist.is_empty() {
-        tags.push(format!("artist:{}", parsed.artist));
+        aggregate_tags.push(format!("artist:{}", parsed.artist));
     }
     if options.include_album_tag && !parsed.album.is_empty() {
-        tags.push(format!("album:{}", parsed.album));
+        aggregate_tags.push(format!("album:{}", parsed.album));
     }
     if options.include_genre_tag && !parsed.genre.is_empty() {
-        tags.push(format!("genre:{}", parsed.genre));
+        aggregate_tags.push(format!("genre:{}", parsed.genre));
     }
     if options.include_year_tag {
         if let Some(year) = parsed.year {
-            tags.push(format!("year:{year}"));
+            aggregate_tags.push(format!("year:{year}"));
         }
     }
-    tags.push(format!("audio_entry:{}", target_entry));
-    if !target_source_name.is_empty() {
-        tags.push(format!("audio_source:{}", target_source_name));
+    if let Some(entry) = target_entry {
+        let trimmed = entry.trim();
+        if !trimmed.is_empty() {
+            aggregate_tags.push(format!("audio_entry:{trimmed}"));
+        }
     }
-    metadata.insert("tags".to_string(), json!(unique_strings(tags)));
+    if let Some(source_name) = target_source_name {
+        let trimmed = source_name.trim();
+        if !trimmed.is_empty() {
+            aggregate_tags.push(format!("audio_source:{trimmed}"));
+        }
+    }
+}
 
-    metadata.insert("children".to_string(), Value::Array(vec![]));
-    if let Some(cover) = target_cover {
-        metadata.insert(
+fn build_child_patch_value(index: usize, extracted: &ArchiveAudioExtraction) -> Value {
+    let mut child = Map::<String, Value>::new();
+    child.insert("entity_type".to_string(), Value::String("archive".to_string()));
+    child.insert("entity_id".to_string(), Value::String(extracted.archive_id.clone()));
+    child.insert("volume_no".to_string(), Value::from((index + 1) as i64));
+
+    if !extracted.parsed.title.trim().is_empty() {
+        child.insert("title".to_string(), Value::String(extracted.parsed.title.clone()));
+    }
+
+    let summary = build_track_description(&extracted.parsed);
+    if !summary.is_empty() {
+        child.insert("description".to_string(), Value::String(summary));
+    }
+
+    let mut child_tags = Vec::<String>::new();
+    merge_archive_tags(
+        &mut child_tags,
+        &extracted.parsed,
+        AudioMetaOptions {
+            merge_existing: true,
+            include_artist_tag: true,
+            include_album_tag: true,
+            include_genre_tag: true,
+            include_year_tag: true,
+            levels_up: 0,
+        },
+        Some(&extracted.target_entry),
+        Some(&extracted.target_source_name),
+    );
+    child.insert("tags".to_string(), json!(unique_strings(child_tags)));
+
+    if let Some(cover) = &extracted.cover {
+        child.insert(
             "assets".to_string(),
             Value::Array(vec![json!({
                 "key": "cover",
@@ -428,14 +640,33 @@ fn execute_plugin(input: PluginInput) -> Result<Value, String> {
             })]),
         );
     }
-    if !page_patches.is_empty() {
-        metadata.insert("pages".to_string(), Value::Array(page_patches));
+    if !extracted.pages.is_empty() {
+        child.insert("pages".to_string(), Value::Array(extracted.pages.clone()));
     }
-    metadata.remove("archive");
-    metadata.remove("archive_id");
 
-    HostBridge::progress(100, "音频标签提取完成");
-    Ok(Value::Object(metadata))
+    child.insert(
+        "locator".to_string(),
+        json!({
+            "entity_type": "archive",
+            "entity_id": extracted.archive_id,
+            "volume_no": (index + 1) as i64,
+        }),
+    );
+    Value::Object(child)
+}
+
+fn normalized_target_type(target_type: &str, params: &Value) -> String {
+    let direct = target_type.trim().to_ascii_lowercase();
+    if !direct.is_empty() {
+        return direct;
+    }
+    let fallback = read_string_param(params, "__target_type", "");
+    let normalized = fallback.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        "archive".to_string()
+    } else {
+        normalized
+    }
 }
 
 fn select_audio_entry(files: &[String], preferred: &str) -> Option<String> {
@@ -914,6 +1145,14 @@ impl HostBridge {
                 "levels_up": levels_up,
             }),
         )
+    }
+
+    fn list_tankoubon_archives(tankoubon_id: &str) -> Result<Vec<String>, String> {
+        let response = Self::call_typed::<TankoubonArchivesResponse>(
+            "tankoubon.list_archives",
+            json!({ "tankoubon_id": tankoubon_id }),
+        )?;
+        Ok(response.archive_ids)
     }
 
     fn call_typed<T: DeserializeOwned>(method: &str, params: Value) -> Result<T, String> {
