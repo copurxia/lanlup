@@ -8,6 +8,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::slice;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(target_arch = "wasm32")]
 #[link(wasm_import_module = "wasmedge_host")]
@@ -270,6 +271,7 @@ fn execute_plugin(input: PluginInput) -> Result<Value, String> {
         include_year_tag: read_bool_param(&input.params, "include_year_tag", true),
         levels_up: read_i64_param(&input.params, "levels_up", 0).clamp(0, 8),
     };
+    let execution_tag = resolve_execution_tag(&input.params);
 
     HostBridge::progress(5, "扫描归档音频文件...");
     let listing = HostBridge::list_files(archive_id)?;
@@ -326,6 +328,7 @@ fn execute_plugin(input: PluginInput) -> Result<Value, String> {
             &runtime_path,
             exported_file.relative_path.trim(),
             &cover_prefix,
+            &execution_tag,
         ) {
             Ok(v) => v,
             Err(e) => {
@@ -339,6 +342,7 @@ fn execute_plugin(input: PluginInput) -> Result<Value, String> {
             exported_file.relative_path.trim(),
             &lyrics_prefix,
             parsed.lyrics.trim(),
+            &execution_tag,
         ) {
             Ok(v) => v,
             Err(e) => {
@@ -555,6 +559,7 @@ fn extract_embedded_cover(
     runtime_audio_path: &str,
     exported_relative_path: &str,
     output_prefix: &str,
+    execution_tag: &str,
 ) -> Result<Option<ExtractedCover>, String> {
     let tagged_file = Probe::open(runtime_audio_path)
         .map_err(|e| format!("failed to open audio file for picture extraction: {e}"))?
@@ -579,7 +584,7 @@ fn extract_embedded_cover(
     }
 
     let ext = detect_image_extension(&bytes);
-    let output_name = format!("{output_prefix}.{ext}");
+    let output_name = build_runtime_output_name(output_prefix, execution_tag, ext);
 
     let runtime_audio = Path::new(runtime_audio_path);
     let runtime_parent = runtime_audio
@@ -611,6 +616,7 @@ fn extract_embedded_lyrics(
     exported_relative_path: &str,
     output_prefix: &str,
     lyrics_text: &str,
+    execution_tag: &str,
 ) -> Result<Option<ExtractedLyrics>, String> {
     let text = lyrics_text.trim();
     if text.is_empty() {
@@ -621,7 +627,7 @@ fn extract_embedded_lyrics(
         .lines()
         .any(|line| line.trim_start().starts_with('[') && line.contains(':') && line.contains(']'));
     let ext = if has_time_tag { "lrc" } else { "txt" };
-    let output_name = format!("{output_prefix}.{ext}");
+    let output_name = build_runtime_output_name(output_prefix, execution_tag, ext);
 
     let runtime_audio = Path::new(runtime_audio_path);
     let runtime_parent = runtime_audio
@@ -657,6 +663,37 @@ fn format_runtime_path_for_host(path: &str) -> String {
         return trimmed.to_string();
     }
     format!("plugins/audiometa/{trimmed}")
+}
+
+fn build_runtime_output_name(output_prefix: &str, execution_tag: &str, ext: &str) -> String {
+    if execution_tag.is_empty() {
+        format!("{output_prefix}.{ext}")
+    } else {
+        format!("{execution_tag}_{output_prefix}.{ext}")
+    }
+}
+
+fn sanitize_runtime_token(raw: &str) -> String {
+    raw.trim()
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '_' || *ch == '-')
+        .collect()
+}
+
+fn resolve_execution_tag(params: &Value) -> String {
+    let host_tag = sanitize_runtime_token(&read_string_param(params, "__task_id", ""));
+    if !host_tag.is_empty() {
+        return host_tag;
+    }
+
+    let now_nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    if now_nanos == 0 {
+        return "exec_fallback".to_string();
+    }
+    format!("exec_{now_nanos:x}")
 }
 
 fn path_to_forward_slash(path: &Path) -> String {
