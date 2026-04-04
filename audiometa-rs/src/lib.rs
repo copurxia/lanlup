@@ -6,6 +6,7 @@ use std::alloc::{alloc, dealloc, Layout};
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::slice;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -238,7 +239,7 @@ fn plugin_info_json() -> Value {
         "permissions": [
             "metadata.read_input",
             "archive.list_files",
-            "archive.export_entries",
+            "archive.read_entry_bytes",
             "tankoubon.list_archives",
             "log.write",
             "progress.report"
@@ -464,33 +465,23 @@ fn extract_archive_audio(
     let target_entry = select_audio_entry(&audio_entries, preferred)
         .ok_or_else(|| "No audio file found in archive listing".to_string())?;
 
-    let exported = HostBridge::export_entries(archive_id, audio_entries.clone(), options.levels_up)?;
-    if exported.files.is_empty() {
-        return Err("archive.export_entries returned empty files".to_string());
-    }
-
-    let mut exported_by_source = HashMap::<String, ExportedFileItem>::new();
-    for item in &exported.files {
-        let key = normalize_entry_key(&item.source);
-        if key.is_empty() {
-            continue;
-        }
-        exported_by_source.entry(key).or_insert_with(|| item.clone());
-    }
-
     let mut page_patches = Vec::<Value>::new();
     let mut target_parsed: Option<ParsedAudioTags> = None;
     let mut target_cover: Option<ExtractedCover> = None;
-    let mut target_source_name = String::new();
 
     for (idx, entry) in audio_entries.iter().enumerate() {
-        let source_key = normalize_entry_key(entry);
-        let Some(exported_file) = exported_by_source.get(&source_key) else {
-            HostBridge::log(2, &format!("skip page patch: missing exported file for archive={archive_id}, entry={entry}"));
-            continue;
+        let audio_bytes = match HostBridge::read_entry_bytes(archive_id, entry) {
+            Ok(b) => b,
+            Err(e) => {
+                if normalize_entry_key(entry) == normalize_entry_key(&target_entry) {
+                    return Err(format!("failed to read target audio entry bytes: {e}"));
+                }
+                HostBridge::log(2, &format!("skip entry: failed to read bytes for archive={archive_id}, entry={entry}: {e}"));
+                continue;
+            }
         };
-        let runtime_path = format!("/plugin/{}", exported_file.relative_path.trim_start_matches('/'));
-        let parsed = match read_audio_tags(&runtime_path) {
+
+        let parsed = match read_audio_tags_from_bytes(&audio_bytes) {
             Ok(v) => v,
             Err(e) => {
                 if normalize_entry_key(entry) == normalize_entry_key(&target_entry) {
@@ -500,10 +491,10 @@ fn extract_archive_audio(
                 continue;
             }
         };
+
         let cover_prefix = format!("__embedded_cover_{}", idx + 1);
-        let extracted_cover = match extract_embedded_cover(
-            &runtime_path,
-            exported_file.relative_path.trim(),
+        let extracted_cover = match extract_embedded_cover_from_bytes(
+            &audio_bytes,
             &cover_prefix,
             execution_tag,
         ) {
@@ -513,10 +504,9 @@ fn extract_archive_audio(
                 None
             }
         };
+
         let lyrics_prefix = format!("__embedded_lyrics_{}", idx + 1);
-        let extracted_lyrics = match extract_embedded_lyrics(
-            &runtime_path,
-            exported_file.relative_path.trim(),
+        let extracted_lyrics = match extract_embedded_lyrics_from_bytes(
             &lyrics_prefix,
             parsed.lyrics.trim(),
             execution_tag,
@@ -548,16 +538,15 @@ fn extract_archive_audio(
         if normalize_entry_key(entry) == normalize_entry_key(&target_entry) {
             target_parsed = Some(parsed);
             target_cover = extracted_cover;
-            target_source_name = exported_file.source.trim().to_string();
         }
     }
 
     let parsed = target_parsed
-        .ok_or_else(|| "Target audio was exported but tags could not be parsed".to_string())?;
+        .ok_or_else(|| "Target audio was read but tags could not be parsed".to_string())?;
     Ok(ArchiveAudioExtraction {
         archive_id: archive_id.to_string(),
         target_entry,
-        target_source_name,
+        target_source_name: String::new(),
         parsed,
         cover: target_cover,
         pages: page_patches,
@@ -725,7 +714,20 @@ fn read_audio_tags(path: &str) -> Result<ParsedAudioTags, String> {
         .map_err(|e| format!("failed to open audio file: {e}"))?
         .read()
         .map_err(|e| format!("failed to parse tags: {e}"))?;
+    parse_tags_from_tagged_file(&tagged_file)
+}
 
+fn read_audio_tags_from_bytes(bytes: &[u8]) -> Result<ParsedAudioTags, String> {
+    let cursor = Cursor::new(bytes);
+    let tagged_file = Probe::new(cursor)
+        .guess_file_type()
+        .map_err(|e| format!("failed to detect audio format: {e}"))?
+        .read()
+        .map_err(|e| format!("failed to parse tags from bytes: {e}"))?;
+    parse_tags_from_tagged_file(&tagged_file)
+}
+
+fn parse_tags_from_tagged_file(tagged_file: &lofty::file::TaggedFile) -> Result<ParsedAudioTags, String> {
     let mut out = ParsedAudioTags::default();
     if let Some(primary) = tagged_file.primary_tag().or_else(|| tagged_file.first_tag()) {
         out.title = primary.title().unwrap_or_default().trim().to_string();
@@ -882,6 +884,82 @@ fn extract_embedded_lyrics(
 
     Ok(Some(ExtractedLyrics {
         relative_path: format_runtime_path_for_host(&rel_lyrics_path),
+    }))
+}
+
+/// 从内存 bytes 提取封面图，输出到 plugin 运行时根目录（/plugin/plugins/audiometa/）
+fn extract_embedded_cover_from_bytes(
+    audio_bytes: &[u8],
+    output_prefix: &str,
+    execution_tag: &str,
+) -> Result<Option<ExtractedCover>, String> {
+    let cursor = Cursor::new(audio_bytes);
+    let tagged_file = Probe::new(cursor)
+        .guess_file_type()
+        .map_err(|e| format!("failed to detect audio format for cover extraction: {e}"))?
+        .read()
+        .map_err(|e| format!("failed to parse tags for cover extraction: {e}"))?;
+
+    let picture_data = tagged_file
+        .primary_tag()
+        .and_then(|tag| tag.pictures().first())
+        .or_else(|| {
+            tagged_file
+                .first_tag()
+                .and_then(|tag| tag.pictures().first())
+        })
+        .map(|pic| pic.data().to_vec());
+
+    let Some(pic_bytes) = picture_data else {
+        return Ok(None);
+    };
+    if pic_bytes.is_empty() {
+        return Ok(None);
+    }
+
+    let ext = detect_image_extension(&pic_bytes);
+    let output_name = build_runtime_output_name(output_prefix, execution_tag, ext);
+    let runtime_dir = Path::new("/plugin/plugins/audiometa");
+    if let Err(e) = fs::create_dir_all(runtime_dir) {
+        return Err(format!("failed to create runtime output dir: {e}"));
+    }
+    let runtime_cover_path = runtime_dir.join(&output_name);
+    if let Err(e) = fs::write(&runtime_cover_path, &pic_bytes) {
+        return Err(format!("failed to write extracted cover: {e}"));
+    }
+
+    Ok(Some(ExtractedCover {
+        relative_path: format!("plugins/audiometa/{output_name}"),
+    }))
+}
+
+/// 从歌词文本生成 lrc/txt 文件，输出到 plugin 运行时根目录（/plugin/plugins/audiometa/）
+fn extract_embedded_lyrics_from_bytes(
+    output_prefix: &str,
+    lyrics_text: &str,
+    execution_tag: &str,
+) -> Result<Option<ExtractedLyrics>, String> {
+    let text = lyrics_text.trim();
+    if text.is_empty() {
+        return Ok(None);
+    }
+
+    let has_time_tag = text
+        .lines()
+        .any(|line| line.trim_start().starts_with('[') && line.contains(':') && line.contains(']'));
+    let ext = if has_time_tag { "lrc" } else { "txt" };
+    let output_name = build_runtime_output_name(output_prefix, execution_tag, ext);
+    let runtime_dir = Path::new("/plugin/plugins/audiometa");
+    if let Err(e) = fs::create_dir_all(runtime_dir) {
+        return Err(format!("failed to create runtime output dir: {e}"));
+    }
+    let runtime_lyrics_path = runtime_dir.join(&output_name);
+    if let Err(e) = fs::write(&runtime_lyrics_path, text.as_bytes()) {
+        return Err(format!("failed to write extracted lyrics: {e}"));
+    }
+
+    Ok(Some(ExtractedLyrics {
+        relative_path: format!("plugins/audiometa/{output_name}"),
     }))
 }
 
@@ -1145,6 +1223,44 @@ impl HostBridge {
                 "levels_up": levels_up,
             }),
         )
+    }
+
+    fn read_entry_bytes(archive_id: &str, entry_name: &str) -> Result<Vec<u8>, String> {
+        #[derive(serde::Deserialize)]
+        struct EntryBytesResponse {
+            #[serde(default)]
+            data: String,
+        }
+        let resp = Self::call_typed::<EntryBytesResponse>(
+            "archive.read_entry_bytes",
+            json!({ "archive_id": archive_id, "entry_name": entry_name }),
+        )?;
+        if resp.data.is_empty() {
+            return Err(format!("archive.read_entry_bytes returned empty data for entry={entry_name}"));
+        }
+        // hex-decode
+        fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
+            if s.len() % 2 != 0 {
+                return Err("hex string has odd length".to_string());
+            }
+            let mut out = Vec::with_capacity(s.len() / 2);
+            let bytes = s.as_bytes();
+            for chunk in bytes.chunks(2) {
+                let hi = hex_nibble(chunk[0])?;
+                let lo = hex_nibble(chunk[1])?;
+                out.push((hi << 4) | lo);
+            }
+            Ok(out)
+        }
+        fn hex_nibble(b: u8) -> Result<u8, String> {
+            match b {
+                b'0'..=b'9' => Ok(b - b'0'),
+                b'a'..=b'f' => Ok(b - b'a' + 10),
+                b'A'..=b'F' => Ok(b - b'A' + 10),
+                _ => Err(format!("invalid hex char: {}", b as char)),
+            }
+        }
+        hex_decode(&resp.data)
     }
 
     fn list_tankoubon_archives(tankoubon_id: &str) -> Result<Vec<String>, String> {
