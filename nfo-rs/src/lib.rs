@@ -75,6 +75,7 @@ struct EpisodeMeta {
     summary: String,
     season: i64,
     episode: i64,
+    aired: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -88,7 +89,7 @@ struct TvshowMeta {
     title: String,
     summary: String,
     source_tag: String,
-    genre_tags: Vec<String>,
+    tags: Vec<String>,
     cover: String,
     backdrop: String,
     clearlogo: String,
@@ -99,7 +100,7 @@ struct SeasonMeta {
     title: String,
     summary: String,
     source_tag: String,
-    genre_tags: Vec<String>,
+    tags: Vec<String>,
     cover: String,
     backdrop: String,
     clearlogo: String,
@@ -728,13 +729,12 @@ fn run_archive_mode(
             continue;
         };
         let doc = parse_nfo(xml);
-        selected_source = pick_better_source(selected_source, parse_source_tag_candidate(&doc));
-        for tag in parse_genre_tags(&doc) {
-            discovered_tags.insert(tag);
-        }
-
         let lower = nfo_file.to_ascii_lowercase();
+        selected_source = pick_better_source(selected_source, parse_source_tag_candidate(&doc));
         if lower == "season.nfo" {
+            for tag in parse_tv_tags(&doc, false) {
+                discovered_tags.insert(tag);
+            }
             let season_title = read_xml_tag(&doc, &["title"]);
             let season_summary = first_non_empty(&[
                 read_xml_tag(&doc, &["plot"]),
@@ -743,6 +743,11 @@ fn run_archive_mode(
             let season_number = read_xml_int(&doc, &["seasonnumber", "season"]);
             if season_number > 0 {
                 season_number_hint = season_number;
+            }
+            discovered_tags.insert("media:tv".to_string());
+            discovered_tags.insert("media:season".to_string());
+            if season_number > 0 {
+                discovered_tags.insert(format!("season:{season_number}"));
             }
             if !season_title.is_empty() {
                 archive_title = season_title;
@@ -760,6 +765,9 @@ fn run_archive_mode(
         }
 
         if is_movie_nfo(&doc) {
+            for tag in parse_tv_tags(&doc, false) {
+                discovered_tags.insert(tag);
+            }
             let movie_title = read_xml_tag(&doc, &["title"]);
             if !movie_title.is_empty() {
                 archive_title = movie_title;
@@ -782,12 +790,18 @@ fn run_archive_mode(
         patch.insert("entry_path".to_string(), Value::String(media_path.clone()));
         patch.insert(
             "title".to_string(),
-            Value::String(episode_meta.title.clone()),
+            Value::String(build_episode_display_title(&episode_meta)),
         );
         if options.include_episode_plot && !episode_meta.summary.is_empty() {
             patch.insert(
                 "description".to_string(),
                 Value::String(episode_meta.summary.clone()),
+            );
+        }
+        if !episode_meta.aired.is_empty() {
+            patch.insert(
+                "release_at".to_string(),
+                Value::String(episode_meta.aired.clone()),
             );
         }
 
@@ -846,7 +860,12 @@ fn run_archive_mode(
     let mut tags = metadata_tags(&metadata);
     tags.extend(discovered_tags.into_iter());
     let parent_tvshow = read_tvshow_info_for_archive(archive_id).unwrap_or_default();
-    tags.extend(parent_tvshow.genre_tags);
+    tags.extend(parent_tvshow.tags.clone());
+    if season_number_hint > 0 {
+        tags.push("media:tv".to_string());
+        tags.push("media:season".to_string());
+        tags.push(format!("season:{season_number_hint}"));
+    }
     if options.tag_with_source {
         tags.retain(|tag| tag.to_ascii_lowercase() != "source:nfo");
         if let Some(source) = selected_source {
@@ -858,6 +877,12 @@ fn run_archive_mode(
         } else if !parent_tvshow.source_tag.is_empty() {
             tags.push(parent_tvshow.source_tag);
         }
+    }
+    if archive_title.trim().is_empty() && season_number_hint > 0 && !parent_tvshow.title.is_empty() {
+        archive_title = format_season_title(&parent_tvshow.title, season_number_hint);
+    }
+    if archive_summary.trim().is_empty() && !parent_tvshow.summary.is_empty() {
+        archive_summary = parent_tvshow.summary;
     }
 
     if !archive_title.trim().is_empty() {
@@ -908,7 +933,7 @@ fn run_tankoubon_mode(
             continue;
         };
 
-        let mut patch_tags = season_meta.genre_tags.clone();
+        let mut patch_tags = season_meta.tags.clone();
         if options.tag_with_source {
             if !season_meta.source_tag.is_empty() {
                 patch_tags.push(season_meta.source_tag.clone());
@@ -959,7 +984,10 @@ fn run_tankoubon_mode(
 
     HostBridge::progress(84, "finalizing collection patches");
     HostBridge::progress(92, "composing collection metadata");
-    let mut collection_tags = collection_meta.genre_tags;
+    let mut collection_tags = collection_meta.tags;
+    if !archive_ids.is_empty() {
+        collection_tags.push("media:tv".to_string());
+    }
     if options.tag_with_source && !collection_meta.source_tag.is_empty() {
         collection_tags.push(collection_meta.source_tag);
     }
@@ -1010,12 +1038,20 @@ fn run_tankoubon_mode(
 fn read_season_metadata(archive_id: &str, options: ArchiveModeOptions) -> Option<SeasonMeta> {
     let listing = HostBridge::list_adjacent_files(archive_id, 0).ok()?;
     let index = ListingIndex::new(listing.files);
-    let season_nfo = index.find_file_ignore_ascii_case("season.nfo")?;
     let nfo_files = index.nfo_files_sorted();
+    if nfo_files.is_empty() {
+        return None;
+    }
     let text_map = HostBridge::read_adjacent_texts(archive_id, &nfo_files, 0).ok()?;
-    let season_doc = parse_nfo(text_map.get(&season_nfo)?);
-    let season_number = read_xml_int(&season_doc, &["seasonnumber", "season"])
-        .max(extract_season_number_from_text(&listing.base_dir));
+    let season_doc = index
+        .find_file_ignore_ascii_case("season.nfo")
+        .and_then(|season_nfo| text_map.get(&season_nfo).map(|xml| parse_nfo(xml)));
+    let parent_tvshow = read_tvshow_info_for_archive(archive_id).unwrap_or_default();
+    let mut season_number = match (&season_doc) {
+        Some(doc) => read_xml_int(doc, &["seasonnumber", "season"]),
+        None => 0,
+    }
+    .max(extract_season_number_from_text(&listing.base_dir));
     let parent_index = HostBridge::list_adjacent_files(archive_id, 1)
         .map(|parent_listing| ListingIndex::new(parent_listing.files))
         .unwrap_or_default();
@@ -1034,6 +1070,9 @@ fn read_season_metadata(archive_id: &str, options: ArchiveModeOptions) -> Option
         let page_doc = parse_nfo(page_xml);
         let base_name = strip_extension(&nfo_file);
         let episode_meta = parse_episode_nfo(&page_doc, &nfo_file);
+        if season_number <= 0 && episode_meta.season > 0 {
+            season_number = episode_meta.season;
+        }
         let sort = build_sort_index(&base_name, &episode_meta);
         let media_path = index.best_media_file(&base_name);
         if media_path.is_empty() {
@@ -1044,13 +1083,16 @@ fn read_season_metadata(archive_id: &str, options: ArchiveModeOptions) -> Option
         patch.insert("entry_path".to_string(), Value::String(media_path.clone()));
         patch.insert(
             "title".to_string(),
-            Value::String(episode_meta.title.clone()),
+            Value::String(build_episode_display_title(&episode_meta)),
         );
         if options.include_episode_plot && !episode_meta.summary.is_empty() {
             patch.insert(
                 "description".to_string(),
                 Value::String(episode_meta.summary.clone()),
             );
+        }
+        if !episode_meta.aired.is_empty() {
+            patch.insert("release_at".to_string(), Value::String(episode_meta.aired.clone()));
         }
         if options.apply_episode_sort {
             if sort > 0 {
@@ -1084,15 +1126,57 @@ fn read_season_metadata(archive_id: &str, options: ArchiveModeOptions) -> Option
     }
     let backdrop = index.archive_artwork(&parent_index, season_number, ArtworkKey::Backdrop);
     let clearlogo = index.archive_artwork(&parent_index, season_number, ArtworkKey::Clearlogo);
+    let season_title = match (&season_doc) {
+        Some(doc) => read_xml_tag(doc, &["title"]),
+        None => String::new(),
+    };
+    let season_summary = match (&season_doc) {
+        Some(doc) => first_non_empty(&[
+            read_xml_tag(doc, &["plot"]),
+            read_xml_tag(doc, &["outline"]),
+        ]),
+        None => String::new(),
+    };
+    let source_tag = match (&season_doc) {
+        Some(doc) => {
+            let from_season = parse_source_tag(doc);
+            if !from_season.is_empty() {
+                from_season
+            } else {
+                parent_tvshow.source_tag.clone()
+            }
+        }
+        None => parent_tvshow.source_tag.clone(),
+    };
+    let tags = if let Some(doc) = &season_doc {
+        let mut tags = build_season_tags(doc, season_number);
+        tags.extend(parent_tvshow.tags.clone());
+        unique_strings(tags)
+    } else {
+        let mut tags = parent_tvshow.tags.clone();
+        tags.push("media:tv".to_string());
+        tags.push("media:season".to_string());
+        if season_number > 0 {
+            tags.push(format!("season:{season_number}"));
+        }
+        unique_strings(tags)
+    };
 
     Some(SeasonMeta {
-        title: read_xml_tag(&season_doc, &["title"]),
-        summary: first_non_empty(&[
-            read_xml_tag(&season_doc, &["plot"]),
-            read_xml_tag(&season_doc, &["outline"]),
-        ]),
-        source_tag: parse_source_tag(&season_doc),
-        genre_tags: parse_genre_tags(&season_doc),
+        title: if !season_title.is_empty() {
+            season_title
+        } else if !parent_tvshow.title.is_empty() && season_number > 0 {
+            format_season_title(&parent_tvshow.title, season_number)
+        } else {
+            parent_tvshow.title.clone()
+        },
+        summary: if !season_summary.is_empty() {
+            season_summary
+        } else {
+            parent_tvshow.summary.clone()
+        },
+        source_tag,
+        tags,
         cover,
         backdrop,
         clearlogo,
@@ -1117,7 +1201,7 @@ fn read_tvshow_metadata_for_tankoubon(archive_ids: &[String]) -> Option<TvshowMe
             read_xml_tag(&doc, &["outline"]),
         ]);
         let source_tag = parse_source_tag(&doc);
-        let genre_tags = parse_genre_tags(&doc);
+        let tags = build_tvshow_tags(&doc);
         let cover = index
             .general_cover_candidates()
             .first()
@@ -1136,7 +1220,7 @@ fn read_tvshow_metadata_for_tankoubon(archive_ids: &[String]) -> Option<TvshowMe
         if !title.is_empty()
             || !summary.is_empty()
             || !source_tag.is_empty()
-            || !genre_tags.is_empty()
+            || !tags.is_empty()
             || !cover.is_empty()
             || !backdrop.is_empty()
             || !clearlogo.is_empty()
@@ -1145,7 +1229,7 @@ fn read_tvshow_metadata_for_tankoubon(archive_ids: &[String]) -> Option<TvshowMe
                 title,
                 summary,
                 source_tag,
-                genre_tags,
+                tags,
                 cover,
                 backdrop,
                 clearlogo,
@@ -1164,32 +1248,115 @@ fn read_tvshow_info_for_archive(archive_id: &str) -> Result<TvshowMeta, String> 
     let xml = HostBridge::read_adjacent_text(archive_id, &tvshow_nfo, 1)?;
     let doc = parse_nfo(&xml);
     Ok(TvshowMeta {
+        title: read_xml_tag(&doc, &["title"]),
+        summary: first_non_empty(&[
+            read_xml_tag(&doc, &["plot"]),
+            read_xml_tag(&doc, &["outline"]),
+        ]),
         source_tag: parse_source_tag(&doc),
-        genre_tags: parse_genre_tags(&doc),
+        tags: build_tvshow_tags(&doc),
         ..TvshowMeta::default()
     })
 }
 
 fn parse_episode_nfo(doc: &ParsedNfo, file_name: &str) -> EpisodeMeta {
+    let season = read_xml_int(doc, &["season", "seasonnumber"]);
+    let episode = read_xml_int(doc, &["episode"]);
     EpisodeMeta {
-        title: first_non_empty(&[read_xml_tag(doc, &["title"]), strip_extension(file_name)]),
+        title: first_non_empty(&[
+            read_xml_tag(doc, &["title"]),
+            read_xml_tag(doc, &["originaltitle"]),
+            strip_extension(file_name),
+        ]),
         summary: first_non_empty(&[
             read_xml_tag(doc, &["plot"]),
             read_xml_tag(doc, &["outline"]),
         ]),
-        season: read_xml_int(doc, &["season", "seasonnumber"]),
-        episode: read_xml_int(doc, &["episode"]),
+        season,
+        episode,
+        aired: first_non_empty(&[
+            read_xml_tag(doc, &["aired"]),
+            read_xml_tag(doc, &["premiered"]),
+        ]),
     }
 }
 
-fn parse_genre_tags(doc: &ParsedNfo) -> Vec<String> {
-    read_xml_tags(doc, &["genre", "tag"])
-        .into_iter()
-        .filter(|value| !value.trim().is_empty())
-        .map(|value| format!("genre:{value}"))
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect()
+fn build_episode_display_title(meta: &EpisodeMeta) -> String {
+    let plain_title = meta.title.trim();
+    if meta.season > 0 && meta.episode > 0 {
+        if plain_title.is_empty() {
+            return format!("S{:02}E{:02}", meta.season, meta.episode);
+        }
+        return format!("S{:02}E{:02} {}", meta.season, meta.episode, plain_title);
+    }
+    plain_title.to_string()
+}
+
+fn format_season_title(base_title: &str, season_number: i64) -> String {
+    let title = base_title.trim();
+    if title.is_empty() || season_number <= 0 {
+        return title.to_string();
+    }
+    format!("{title} Season {season_number}")
+}
+
+fn build_tvshow_tags(doc: &ParsedNfo) -> Vec<String> {
+    let mut tags = parse_tv_tags(doc, true);
+    tags.push("media:tv".to_string());
+    unique_strings(tags)
+}
+
+fn build_season_tags(doc: &ParsedNfo, season_number: i64) -> Vec<String> {
+    let mut tags = parse_tv_tags(doc, true);
+    tags.push("media:tv".to_string());
+    tags.push("media:season".to_string());
+    if season_number > 0 {
+        tags.push(format!("season:{season_number}"));
+    }
+    unique_strings(tags)
+}
+
+fn parse_tv_tags(doc: &ParsedNfo, include_people: bool) -> Vec<String> {
+    let mut tags = Vec::new();
+    tags.extend(read_xml_tags(doc, &["genre"]).into_iter().map(|value| format!("genre:{value}")));
+    tags.extend(read_xml_tags(doc, &["tag"]).into_iter().map(|value| format!("tag:{value}")));
+    tags.extend(read_xml_tags(doc, &["studio"]).into_iter().map(|value| format!("studio:{value}")));
+    tags.extend(read_xml_tags(doc, &["country"]).into_iter().map(|value| format!("country:{value}")));
+    tags.extend(read_xml_tags(doc, &["status"]).into_iter().map(|value| format!("status:{}", value.to_ascii_lowercase())));
+    tags.extend(read_xml_tags(doc, &["mpaa", "certification"]).into_iter().map(|value| format!("certification:{value}")));
+
+    let year = read_xml_tag(doc, &["year"]);
+    if !year.is_empty() {
+        tags.push(format!("year:{year}"));
+    }
+    let premiered = read_xml_tag(doc, &["premiered"]);
+    if !premiered.is_empty() {
+        tags.push(format!("aired:{premiered}"));
+    }
+    let end_date = read_xml_tag(doc, &["enddate"]);
+    if !end_date.is_empty() {
+        tags.push(format!("ended:{end_date}"));
+    }
+    let runtime = read_xml_tag(doc, &["runtime"]);
+    if !runtime.is_empty() {
+        tags.push(format!("runtime:{runtime}"));
+    }
+    let season = read_xml_int(doc, &["season", "seasonnumber"]);
+    if season > 0 {
+        tags.push(format!("season:{season}"));
+    }
+    let episode = read_xml_int(doc, &["episode"]);
+    if episode > 0 {
+        tags.push(format!("episode:{episode}"));
+    }
+
+    if include_people {
+        tags.extend(read_xml_tags(doc, &["name"]).into_iter().map(|value| format!("cast:{value}")));
+        tags.extend(read_xml_tags(doc, &["director"]).into_iter().map(|value| format!("director:{value}")));
+        tags.extend(read_xml_tags(doc, &["credits"]).into_iter().map(|value| format!("writer:{value}")));
+    }
+
+    unique_strings(tags)
 }
 
 fn parse_source_tag(doc: &ParsedNfo) -> String {
@@ -1218,7 +1385,7 @@ fn parse_source_tag_candidate(doc: &ParsedNfo) -> Option<SourceTagCandidate> {
             continue;
         }
         return Some(SourceTagCandidate {
-            tag: format!("{tag_type}:{normalized}"),
+            tag: format!("source:{tag_type}:{normalized}"),
             score,
         });
     }
@@ -1245,7 +1412,7 @@ fn extract_best_unique_id(doc: &ParsedNfo) -> Option<SourceTagCandidate> {
         let default_attr = unique_id.default_attr.to_ascii_lowercase();
         let is_default = matches!(default_attr.as_str(), "true" | "1" | "yes");
         let candidate = SourceTagCandidate {
-            tag: format!("{source_type}:{normalized}"),
+            tag: format!("source:{source_type}:{normalized}"),
             score: source_type_priority(&source_type) + if is_default { 100 } else { 0 },
         };
         best = pick_better_source(best, Some(candidate));
