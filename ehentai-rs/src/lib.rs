@@ -27,6 +27,7 @@ const USER_AGENT: &str =
 const EH_API_URL: &str = "https://api.e-hentai.org/api.php";
 const DEFAULT_TIMEOUT_MS: i32 = 30_000;
 const MAX_REDIRECTS: usize = 5;
+const AUTH_DATA_KEY: &str = "__lanlu.phase.ehlogin.data";
 
 #[cfg(target_arch = "wasm32")]
 #[link(wasm_import_module = "wasmedge_host")]
@@ -96,8 +97,6 @@ struct PluginInput {
     target_id: String,
     #[serde(rename = "oneshotParam", default)]
     oneshot_param: String,
-    #[serde(rename = "loginCookies", default)]
-    login_cookies: Vec<LoginCookie>,
     #[serde(default)]
     params: Value,
     #[serde(default)]
@@ -114,6 +113,18 @@ struct LoginCookie {
     domain: String,
     #[serde(default)]
     path: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct EhAuthData {
+    #[serde(default)]
+    ipb_member_id: String,
+    #[serde(default)]
+    ipb_pass_hash: String,
+    #[serde(default)]
+    star: String,
+    #[serde(default)]
+    igneous: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -262,6 +273,18 @@ impl HostBridge {
             return "host call failed".to_string();
         }
         String::from_utf8_lossy(&buf[..read as usize]).to_string()
+    }
+
+    fn task_kv_get(key: &str) -> Result<Option<Value>, String> {
+        let response = Self::call("task_kv.get", json!({ "key": key }))?;
+        let found = response
+            .get("found")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if !found {
+            return Ok(None);
+        }
+        Ok(response.get("value").cloned())
     }
 
     fn http_fetch(
@@ -418,7 +441,7 @@ fn plugin_info_json() -> Value {
         "name": "E-Hentai",
         "type": "metadata",
         "namespace": "ehentai",
-        "login_from": "ehlogin",
+        "pre": ["ehlogin"],
         "author": "Difegue and others",
         "version": "2.6",
         "description": "Searches g.e-hentai for tags matching your archive. This plugin will use the source: tag of the archive if it exists.",
@@ -445,7 +468,8 @@ fn plugin_info_json() -> Value {
             "archive.export_cover_for_search",
             "tcp.connect",
             "log.write",
-            "progress.report"
+            "progress.report",
+            "task_kv.read"
         ],
         "icon": "https://e-hentai.org/favicon.ico",
         "update_url": "https://git.copur.xyz/copur/lanlup/raw/branch/master/Metadata/EHentai.ts"
@@ -463,9 +487,14 @@ fn build_result_payload(input: PluginInput) -> Value {
     };
 
     HostBridge::progress(5, "初始化元数据搜索...");
+    let auth = match load_eh_auth() {
+        Ok(v) => v,
+        Err(error) => return json!({ "success": false, "error": error }),
+    };
+    let login_cookies = build_eh_login_cookies(&auth);
 
     if is_collection_target_type(&target_type) {
-        match process_collection(&input.metadata, &target_id, &settings, &input.login_cookies) {
+        match process_collection(&input.metadata, &target_id, &settings, &login_cookies) {
             Ok(data) => {
                 HostBridge::progress(100, "元数据获取完成");
                 json!({ "success": true, "data": data })
@@ -473,7 +502,7 @@ fn build_result_payload(input: PluginInput) -> Value {
             Err(error) => json!({ "success": false, "error": error }),
         }
     } else {
-        match process_archive(&input, &target_id, &settings) {
+        match process_archive(&input, &target_id, &settings, &login_cookies) {
             Ok(data) => {
                 HostBridge::progress(100, "元数据获取完成");
                 json!({ "success": true, "data": data })
@@ -483,14 +512,67 @@ fn build_result_payload(input: PluginInput) -> Value {
     }
 }
 
-fn process_archive(input: &PluginInput, target_id: &str, settings: &Settings) -> Result<Value, String> {
+fn load_eh_auth() -> Result<EhAuthData, String> {
+    let Some(value) = HostBridge::task_kv_get(AUTH_DATA_KEY)? else {
+        return Err("Missing E-Hentai auth data in task KV. Ensure ehlogin ran as a pre hook.".to_string());
+    };
+    serde_json::from_value(value).map_err(|e| format!("Invalid E-Hentai auth data in task KV: {e}"))
+}
+
+fn build_eh_login_cookies(auth: &EhAuthData) -> Vec<LoginCookie> {
+    let member_id = auth.ipb_member_id.trim();
+    let pass_hash = auth.ipb_pass_hash.trim();
+    if member_id.is_empty() || pass_hash.is_empty() {
+        return Vec::new();
+    }
+
+    let mut cookies = Vec::new();
+    for domain in ["e-hentai.org", "exhentai.org"] {
+        cookies.push(LoginCookie {
+            name: "ipb_member_id".to_string(),
+            value: member_id.to_string(),
+            domain: domain.to_string(),
+            path: "/".to_string(),
+        });
+        cookies.push(LoginCookie {
+            name: "ipb_pass_hash".to_string(),
+            value: pass_hash.to_string(),
+            domain: domain.to_string(),
+            path: "/".to_string(),
+        });
+        if !auth.star.trim().is_empty() {
+            cookies.push(LoginCookie {
+                name: "star".to_string(),
+                value: auth.star.trim().to_string(),
+                domain: domain.to_string(),
+                path: "/".to_string(),
+            });
+        }
+        if !auth.igneous.trim().is_empty() {
+            cookies.push(LoginCookie {
+                name: "igneous".to_string(),
+                value: auth.igneous.trim().to_string(),
+                domain: domain.to_string(),
+                path: "/".to_string(),
+            });
+        }
+    }
+    cookies
+}
+
+fn process_archive(
+    input: &PluginInput,
+    target_id: &str,
+    settings: &Settings,
+    login_cookies: &[LoginCookie],
+) -> Result<Value, String> {
     HostBridge::progress(10, "准备搜索参数...");
     let lookup = LookupContext {
         archive_id: target_id.trim().to_string(),
         archive_title: metadata_title(&input.metadata),
         existing_tags: metadata_tags_csv(&input.metadata),
         thumbnail_hash: metadata_thumbnail_hash(&input.metadata),
-        login_cookies: input.login_cookies.clone(),
+        login_cookies: login_cookies.to_vec(),
         oneshot_param: input.oneshot_param.trim().to_string(),
         debug: settings.debug,
     };

@@ -189,7 +189,6 @@ fn plugin_info_json() -> Value {
         "name": "Bookof",
         "type": "metadata",
         "namespace": "bofmeta",
-        "login_from": "",
         "author": "lanlu",
         "version": "1.0",
         "description": "Scrapes bookof.moe for series metadata and volume cover info.",

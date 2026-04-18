@@ -21,13 +21,18 @@ use wasmedge_wasi_socket::TcpStream as WasiTcpStream;
 const USER_AGENT: &str = "Lanlu/v1.00 (https://github.com/copurxia/lanlu)";
 const HTTP_TIMEOUT_MS: i32 = 15000;
 const MAX_REDIRECTS: usize = 5;
-const AUTH_KEY_COOKIE_NAME: &str = "__lanlu_nh_api_key";
+const AUTH_DATA_KEY: &str = "__lanlu.phase.nhlogin.data";
 
 #[cfg(target_arch = "wasm32")]
 #[link(wasm_import_module = "wasmedge_host")]
 extern "C" {
     fn host_log(level: i32, ptr: i32, len: i32) -> i32;
     fn host_progress(percent: i32, ptr: i32, len: i32) -> i32;
+    fn host_call(op: i32, req_ptr: i32, req_len: i32) -> i32;
+    fn host_response_len() -> i32;
+    fn host_response_read(dst_ptr: i32, dst_len: i32) -> i32;
+    fn host_last_error_len() -> i32;
+    fn host_last_error_read(dst_ptr: i32, dst_len: i32) -> i32;
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -36,6 +41,26 @@ unsafe fn host_log(_: i32, _: i32, _: i32) -> i32 {
 }
 #[cfg(not(target_arch = "wasm32"))]
 unsafe fn host_progress(_: i32, _: i32, _: i32) -> i32 {
+    0
+}
+#[cfg(not(target_arch = "wasm32"))]
+unsafe fn host_call(_: i32, _: i32, _: i32) -> i32 {
+    1
+}
+#[cfg(not(target_arch = "wasm32"))]
+unsafe fn host_response_len() -> i32 {
+    0
+}
+#[cfg(not(target_arch = "wasm32"))]
+unsafe fn host_response_read(_: i32, _: i32) -> i32 {
+    0
+}
+#[cfg(not(target_arch = "wasm32"))]
+unsafe fn host_last_error_len() -> i32 {
+    0
+}
+#[cfg(not(target_arch = "wasm32"))]
+unsafe fn host_last_error_read(_: i32, _: i32) -> i32 {
     0
 }
 
@@ -58,8 +83,6 @@ struct PluginInput {
     url: String,
     #[serde(rename = "pluginDir", default)]
     plugin_dir: String,
-    #[serde(rename = "loginCookies", default)]
-    login_cookies: Vec<LoginCookie>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -72,6 +95,14 @@ struct LoginCookie {
     domain: String,
     #[serde(default)]
     path: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct NhAuthData {
+    #[serde(default)]
+    mode: String,
+    #[serde(default)]
+    api_key: String,
 }
 
 #[derive(Clone, Debug)]
@@ -95,6 +126,60 @@ impl HostBridge {
         unsafe {
             let _ = host_progress(percent, message.as_ptr() as i32, message.len() as i32);
         }
+    }
+
+    fn call(method: &str, params: Value) -> Result<Value, String> {
+        let req = json!({
+            "method": method,
+            "params": params,
+        });
+        let req_bytes = serde_json::to_vec(&req).map_err(|e| e.to_string())?;
+        let rc = unsafe { host_call(0, req_bytes.as_ptr() as i32, req_bytes.len() as i32) };
+        if rc != 0 {
+            return Err(Self::read_error());
+        }
+        Self::read_response()
+    }
+
+    fn read_response() -> Result<Value, String> {
+        let len = unsafe { host_response_len() };
+        if len < 0 {
+            return Err("host_response_len returned negative length".to_string());
+        }
+        if len == 0 {
+            return Ok(Value::Null);
+        }
+        let mut buf = vec![0u8; len as usize];
+        let read = unsafe { host_response_read(buf.as_mut_ptr() as i32, len) };
+        if read < 0 {
+            return Err("host_response_read failed".to_string());
+        }
+        serde_json::from_slice(&buf[..read as usize]).map_err(|e| e.to_string())
+    }
+
+    fn read_error() -> String {
+        let len = unsafe { host_last_error_len() };
+        if len <= 0 {
+            return "host call failed".to_string();
+        }
+        let mut buf = vec![0u8; len as usize];
+        let read = unsafe { host_last_error_read(buf.as_mut_ptr() as i32, len) };
+        if read <= 0 {
+            return "host call failed".to_string();
+        }
+        String::from_utf8_lossy(&buf[..read as usize]).to_string()
+    }
+
+    fn task_kv_get(key: &str) -> Result<Option<Value>, String> {
+        let response = Self::call("task_kv.get", json!({ "key": key }))?;
+        let found = response
+            .get("found")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if !found {
+            return Ok(None);
+        }
+        Ok(response.get("value").cloned())
     }
 }
 
@@ -249,12 +334,17 @@ fn run_download(input: &PluginInput) -> Value {
     };
     let gallery_url = format!("https://nhentai.net/g/{gallery_id}/");
     let gallery_api_url = format!("https://nhentai.net/api/v2/galleries/{gallery_id}");
-    let auth_headers = build_nh_api_auth_headers(&input.login_cookies);
+    let auth = match load_nh_auth() {
+        Ok(v) => v,
+        Err(e) => return output_err(&e),
+    };
+    let login_cookies = build_nh_login_cookies(&auth);
+    let auth_headers = build_nh_api_auth_headers(&auth);
     HostBridge::progress(1, "Fetching gallery metadata...");
     let resp = match fetch_text_direct(
         &gallery_api_url,
         Some("https://nhentai.net/"),
-        &input.login_cookies,
+        &login_cookies,
         &auth_headers,
     ) {
         Ok(v) => v,
@@ -304,7 +394,7 @@ fn run_download(input: &PluginInput) -> Value {
         match download_file_direct(
             &image_url,
             &gallery_url,
-            &input.login_cookies,
+            &login_cookies,
             &local_path,
             &[],
         ) {
@@ -342,6 +432,17 @@ fn run_download(input: &PluginInput) -> Value {
             "archive_type": "folder"
         }]
     })
+}
+
+fn load_nh_auth() -> Result<NhAuthData, String> {
+    let Some(value) = HostBridge::task_kv_get(AUTH_DATA_KEY)? else {
+        return Err("Missing nHentai auth data in task KV. Ensure nhlogin ran as a pre hook.".to_string());
+    };
+    serde_json::from_value(value).map_err(|e| format!("Invalid nHentai auth data in task KV: {e}"))
+}
+
+fn build_nh_login_cookies(_: &NhAuthData) -> Vec<LoginCookie> {
+    Vec::new()
 }
 
 fn extract_gallery_id(url: &str) -> Option<i64> {
@@ -497,19 +598,12 @@ fn build_cookie_header(url: &str, cookies: &[LoginCookie]) -> String {
     pairs.join("; ")
 }
 
-fn build_nh_api_auth_headers(cookies: &[LoginCookie]) -> Vec<(String, String)> {
-    cookies
-        .iter()
-        .find_map(|cookie| {
-            let name = cookie.name.trim();
-            let value = cookie.value.trim();
-            if name == AUTH_KEY_COOKIE_NAME && !value.is_empty() {
-                Some(vec![("Authorization".to_string(), format!("Key {value}"))])
-            } else {
-                None
-            }
-        })
-        .unwrap_or_default()
+fn build_nh_api_auth_headers(auth: &NhAuthData) -> Vec<(String, String)> {
+    if auth.mode.trim() == "key" && !auth.api_key.trim().is_empty() {
+        vec![("Authorization".to_string(), format!("Key {}", auth.api_key.trim()))]
+    } else {
+        Vec::new()
+    }
 }
 
 fn fetch_text_direct(
@@ -913,7 +1007,7 @@ fn plugin_info_json() -> Value {
         "name": "nhentai Downloader (Rust)",
         "type": "download",
         "namespace": "nhentai",
-        "login_from": "nhlogin",
+        "pre": ["nhlogin"],
         "author": "Lanlu",
         "version": "0.2.0",
         "description": "Rust/WASM nhentai downloader using the nHentai API.",
@@ -922,7 +1016,8 @@ fn plugin_info_json() -> Value {
         "permissions": [
             "log.write",
             "progress.report",
-            "tcp.connect"
+            "tcp.connect",
+            "task_kv.read"
         ]
     })
 }

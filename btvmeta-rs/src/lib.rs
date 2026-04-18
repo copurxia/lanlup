@@ -234,7 +234,6 @@ fn plugin_info_json() -> Value {
         "name": "Bangumi",
         "type": "metadata",
         "namespace": "btvmeta",
-        "login_from": "",
         "author": "lanlu",
         "version": "1.0",
         "description": "Fetches Bangumi subject metadata and returns collection + per-volume metadata payload.",

@@ -22,12 +22,18 @@ const USER_AGENT: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 const DEFAULT_TIMEOUT_MS: i32 = 30_000;
 const MAX_REDIRECTS: usize = 5;
+const AUTH_DATA_KEY: &str = "__lanlu.phase.xlogin.data";
 
 #[cfg(target_arch = "wasm32")]
 #[link(wasm_import_module = "wasmedge_host")]
 extern "C" {
     fn host_log(level: i32, ptr: i32, len: i32) -> i32;
     fn host_progress(percent: i32, ptr: i32, len: i32) -> i32;
+    fn host_call(op: i32, req_ptr: i32, req_len: i32) -> i32;
+    fn host_response_len() -> i32;
+    fn host_response_read(dst_ptr: i32, dst_len: i32) -> i32;
+    fn host_last_error_len() -> i32;
+    fn host_last_error_read(dst_ptr: i32, dst_len: i32) -> i32;
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -36,6 +42,26 @@ unsafe fn host_log(_: i32, _: i32, _: i32) -> i32 {
 }
 #[cfg(not(target_arch = "wasm32"))]
 unsafe fn host_progress(_: i32, _: i32, _: i32) -> i32 {
+    0
+}
+#[cfg(not(target_arch = "wasm32"))]
+unsafe fn host_call(_: i32, _: i32, _: i32) -> i32 {
+    1
+}
+#[cfg(not(target_arch = "wasm32"))]
+unsafe fn host_response_len() -> i32 {
+    0
+}
+#[cfg(not(target_arch = "wasm32"))]
+unsafe fn host_response_read(_: i32, _: i32) -> i32 {
+    0
+}
+#[cfg(not(target_arch = "wasm32"))]
+unsafe fn host_last_error_len() -> i32 {
+    0
+}
+#[cfg(not(target_arch = "wasm32"))]
+unsafe fn host_last_error_read(_: i32, _: i32) -> i32 {
     0
 }
 
@@ -60,8 +86,6 @@ struct PluginInput {
     plugin_dir: String,
     #[serde(default)]
     params: Value,
-    #[serde(rename = "loginCookies", default)]
-    login_cookies: Vec<LoginCookie>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -74,6 +98,14 @@ struct LoginCookie {
     domain: String,
     #[serde(default)]
     path: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct XAuthData {
+    #[serde(default)]
+    auth_token: String,
+    #[serde(default)]
+    ct0: String,
 }
 
 #[derive(Clone)]
@@ -94,6 +126,60 @@ impl HostBridge {
         unsafe {
             let _ = host_progress(percent, message.as_ptr() as i32, message.len() as i32);
         }
+    }
+
+    fn call(method: &str, params: Value) -> Result<Value, String> {
+        let req = json!({
+            "method": method,
+            "params": params,
+        });
+        let req_bytes = serde_json::to_vec(&req).map_err(|e| e.to_string())?;
+        let rc = unsafe { host_call(0, req_bytes.as_ptr() as i32, req_bytes.len() as i32) };
+        if rc != 0 {
+            return Err(Self::read_error());
+        }
+        Self::read_response()
+    }
+
+    fn read_response() -> Result<Value, String> {
+        let len = unsafe { host_response_len() };
+        if len < 0 {
+            return Err("host_response_len returned negative length".to_string());
+        }
+        if len == 0 {
+            return Ok(Value::Null);
+        }
+        let mut buf = vec![0u8; len as usize];
+        let read = unsafe { host_response_read(buf.as_mut_ptr() as i32, len) };
+        if read < 0 {
+            return Err("host_response_read failed".to_string());
+        }
+        serde_json::from_slice(&buf[..read as usize]).map_err(|e| e.to_string())
+    }
+
+    fn read_error() -> String {
+        let len = unsafe { host_last_error_len() };
+        if len <= 0 {
+            return "host call failed".to_string();
+        }
+        let mut buf = vec![0u8; len as usize];
+        let read = unsafe { host_last_error_read(buf.as_mut_ptr() as i32, len) };
+        if read <= 0 {
+            return "host call failed".to_string();
+        }
+        String::from_utf8_lossy(&buf[..read as usize]).to_string()
+    }
+
+    fn task_kv_get(key: &str) -> Result<Option<Value>, String> {
+        let response = Self::call("task_kv.get", json!({ "key": key }))?;
+        let found = response
+            .get("found")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if !found {
+            return Ok(None);
+        }
+        Ok(response.get("value").cloned())
     }
 }
 
@@ -174,7 +260,7 @@ fn plugin_info_json() -> Value {
         "name": "Twitter/X Downloader",
         "type": "download",
         "namespace": "xdl",
-        "login_from": "xlogin",
+        "pre": ["xlogin"],
         "author": "lrr4cj",
         "version": "1.0",
         "description": "Downloads media (photos/videos) from a single X (Twitter) post URL.",
@@ -196,7 +282,8 @@ fn plugin_info_json() -> Value {
             "tcp.connect",
             "fs.write",
             "log.write",
-            "progress.report"
+            "progress.report",
+            "task_kv.read"
         ],
         "update_url": "https://git.copur.xyz/copur/lanlup/raw/branch/master/Download/Twitter.ts"
     })
@@ -214,9 +301,14 @@ fn run_download(input: PluginInput) -> Value {
         .unwrap_or("orig")
         .trim()
         .to_string();
+    let auth = match load_x_auth() {
+        Ok(v) => v,
+        Err(e) => return output_err(&e),
+    };
+    let login_cookies = build_x_login_cookies(&auth);
 
     HostBridge::progress(1, "Fetching tweet info...");
-    let tweet = match fetch_tweet(&tweet_id, &input.login_cookies) {
+    let tweet = match fetch_tweet(&tweet_id, &login_cookies) {
         Ok(v) => v,
         Err(e) => return output_err(&e),
     };
@@ -252,7 +344,7 @@ fn run_download(input: PluginInput) -> Value {
         let pct = (((idx + 1) * 100) / media.len()).clamp(1, 100) as i32;
         HostBridge::progress(pct, &format!("Downloading {} {}/{}...", item.kind, idx + 1, media.len()));
 
-        match download_file(&item.url, Some(&input.url), &input.login_cookies, &out_path) {
+        match download_file(&item.url, Some(&input.url), &login_cookies, &out_path) {
             Ok(_) => ok_count += 1,
             Err(err) => {
                 fail_count += 1;
@@ -278,6 +370,35 @@ fn run_download(input: PluginInput) -> Value {
             "archive_type": "folder"
         }]
     })
+}
+
+fn load_x_auth() -> Result<XAuthData, String> {
+    let Some(value) = HostBridge::task_kv_get(AUTH_DATA_KEY)? else {
+        return Err("Missing X auth data in task KV. Ensure xlogin ran as a pre hook.".to_string());
+    };
+    serde_json::from_value(value).map_err(|e| format!("Invalid X auth data in task KV: {e}"))
+}
+
+fn build_x_login_cookies(auth: &XAuthData) -> Vec<LoginCookie> {
+    if auth.auth_token.trim().is_empty() {
+        return Vec::new();
+    }
+
+    let mut cookies = vec![LoginCookie {
+        name: "auth_token".to_string(),
+        value: auth.auth_token.trim().to_string(),
+        domain: "x.com".to_string(),
+        path: "/".to_string(),
+    }];
+    if !auth.ct0.trim().is_empty() {
+        cookies.push(LoginCookie {
+            name: "ct0".to_string(),
+            value: auth.ct0.trim().to_string(),
+            domain: "x.com".to_string(),
+            path: "/".to_string(),
+        });
+    }
+    cookies
 }
 
 fn fetch_tweet(tweet_id: &str, login_cookies: &[LoginCookie]) -> Result<Value, String> {
@@ -394,7 +515,7 @@ fn dedupe_media(items: Vec<MediaItem>) -> Vec<MediaItem> {
 }
 
 fn photo_url_with_quality(raw: &str, quality: &str) -> String {
-    if let Ok(mut u) = Url::parse(raw) {
+    if let Ok(u) = Url::parse(raw) {
         if u.host_str() == Some("pbs.twimg.com") && u.path().contains("/media/") {
             let filename = u
                 .path_segments()

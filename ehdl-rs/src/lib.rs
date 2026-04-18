@@ -23,12 +23,18 @@ const USER_AGENT: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 const DEFAULT_TIMEOUT_MS: i32 = 30_000;
 const MAX_REDIRECTS: usize = 5;
+const AUTH_DATA_KEY: &str = "__lanlu.phase.ehlogin.data";
 
 #[cfg(target_arch = "wasm32")]
 #[link(wasm_import_module = "wasmedge_host")]
 extern "C" {
     fn host_log(level: i32, ptr: i32, len: i32) -> i32;
     fn host_progress(percent: i32, ptr: i32, len: i32) -> i32;
+    fn host_call(op: i32, req_ptr: i32, req_len: i32) -> i32;
+    fn host_response_len() -> i32;
+    fn host_response_read(dst_ptr: i32, dst_len: i32) -> i32;
+    fn host_last_error_len() -> i32;
+    fn host_last_error_read(dst_ptr: i32, dst_len: i32) -> i32;
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -37,6 +43,26 @@ unsafe fn host_log(_: i32, _: i32, _: i32) -> i32 {
 }
 #[cfg(not(target_arch = "wasm32"))]
 unsafe fn host_progress(_: i32, _: i32, _: i32) -> i32 {
+    0
+}
+#[cfg(not(target_arch = "wasm32"))]
+unsafe fn host_call(_: i32, _: i32, _: i32) -> i32 {
+    1
+}
+#[cfg(not(target_arch = "wasm32"))]
+unsafe fn host_response_len() -> i32 {
+    0
+}
+#[cfg(not(target_arch = "wasm32"))]
+unsafe fn host_response_read(_: i32, _: i32) -> i32 {
+    0
+}
+#[cfg(not(target_arch = "wasm32"))]
+unsafe fn host_last_error_len() -> i32 {
+    0
+}
+#[cfg(not(target_arch = "wasm32"))]
+unsafe fn host_last_error_read(_: i32, _: i32) -> i32 {
     0
 }
 
@@ -71,8 +97,6 @@ struct PluginInput {
     url: String,
     #[serde(rename = "pluginDir", default)]
     plugin_dir: String,
-    #[serde(rename = "loginCookies", default)]
-    login_cookies: Vec<LoginCookie>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -85,6 +109,18 @@ struct LoginCookie {
     domain: String,
     #[serde(default)]
     path: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct EhAuthData {
+    #[serde(default)]
+    ipb_member_id: String,
+    #[serde(default)]
+    ipb_pass_hash: String,
+    #[serde(default)]
+    star: String,
+    #[serde(default)]
+    igneous: String,
 }
 
 struct HostBridge;
@@ -100,6 +136,60 @@ impl HostBridge {
         unsafe {
             let _ = host_progress(percent, message.as_ptr() as i32, message.len() as i32);
         }
+    }
+
+    fn call(method: &str, params: Value) -> Result<Value, String> {
+        let req = json!({
+            "method": method,
+            "params": params,
+        });
+        let req_bytes = serde_json::to_vec(&req).map_err(|e| e.to_string())?;
+        let rc = unsafe { host_call(0, req_bytes.as_ptr() as i32, req_bytes.len() as i32) };
+        if rc != 0 {
+            return Err(Self::read_error());
+        }
+        Self::read_response()
+    }
+
+    fn read_response() -> Result<Value, String> {
+        let len = unsafe { host_response_len() };
+        if len < 0 {
+            return Err("host_response_len returned negative length".to_string());
+        }
+        if len == 0 {
+            return Ok(Value::Null);
+        }
+        let mut buf = vec![0u8; len as usize];
+        let read = unsafe { host_response_read(buf.as_mut_ptr() as i32, len) };
+        if read < 0 {
+            return Err("host_response_read failed".to_string());
+        }
+        serde_json::from_slice(&buf[..read as usize]).map_err(|e| e.to_string())
+    }
+
+    fn read_error() -> String {
+        let len = unsafe { host_last_error_len() };
+        if len <= 0 {
+            return "host call failed".to_string();
+        }
+        let mut buf = vec![0u8; len as usize];
+        let read = unsafe { host_last_error_read(buf.as_mut_ptr() as i32, len) };
+        if read <= 0 {
+            return "host call failed".to_string();
+        }
+        String::from_utf8_lossy(&buf[..read as usize]).to_string()
+    }
+
+    fn task_kv_get(key: &str) -> Result<Option<Value>, String> {
+        let response = Self::call("task_kv.get", json!({ "key": key }))?;
+        let found = response
+            .get("found")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if !found {
+            return Ok(None);
+        }
+        Ok(response.get("value").cloned())
     }
 
 }
@@ -181,6 +271,11 @@ fn run_download(input: &PluginInput) -> Value {
     if url.is_empty() {
         return output_err("No URL provided.");
     }
+    let auth = match load_eh_auth() {
+        Ok(v) => v,
+        Err(e) => return output_err(&e),
+    };
+    let login_cookies = build_eh_login_cookies(&auth);
 
     let forceresampled = read_forceresampled(&input.params);
     HostBridge::progress(1, "Starting E-Hentai download...");
@@ -203,7 +298,7 @@ fn run_download(input: &PluginInput) -> Value {
     HostBridge::log(1, &format!("resolved gallery gid={gid} token={token}"));
 
     HostBridge::progress(15, "Checking archiver page...");
-    let check = match http_request_text("GET", &archiver_url, None, None, &input.login_cookies) {
+    let check = match http_request_text("GET", &archiver_url, None, None, &login_cookies) {
         Ok(v) => v,
         Err(e) => return output_err(&format!("Archiver check failed: {e}")),
     };
@@ -232,7 +327,7 @@ fn run_download(input: &PluginInput) -> Value {
         &archiver_url,
         Some(&body),
         Some(&archiver_url),
-        &input.login_cookies,
+        &login_cookies,
     ) {
         Ok(v) => v,
         Err(e) => return output_err(&format!("Download URL generation failed: {e}")),
@@ -281,7 +376,7 @@ fn run_download(input: &PluginInput) -> Value {
     let (final_relative_path, final_filename) = match download_archive_direct(
         &final_url,
         domain,
-        &input.login_cookies,
+        &login_cookies,
         &plugin_dir,
         title_hint.as_deref(),
         &file_name_hint,
@@ -301,6 +396,54 @@ fn run_download(input: &PluginInput) -> Value {
             "archive_type": "archive"
         }]
     })
+}
+
+fn load_eh_auth() -> Result<EhAuthData, String> {
+    let Some(value) = HostBridge::task_kv_get(AUTH_DATA_KEY)? else {
+        return Err("Missing E-Hentai auth data in task KV. Ensure ehlogin ran as a pre hook.".to_string());
+    };
+    serde_json::from_value(value).map_err(|e| format!("Invalid E-Hentai auth data in task KV: {e}"))
+}
+
+fn build_eh_login_cookies(auth: &EhAuthData) -> Vec<LoginCookie> {
+    let member_id = auth.ipb_member_id.trim();
+    let pass_hash = auth.ipb_pass_hash.trim();
+    if member_id.is_empty() || pass_hash.is_empty() {
+        return Vec::new();
+    }
+
+    let mut cookies = Vec::new();
+    for domain in ["e-hentai.org", "exhentai.org"] {
+        cookies.push(LoginCookie {
+            name: "ipb_member_id".to_string(),
+            value: member_id.to_string(),
+            domain: domain.to_string(),
+            path: "/".to_string(),
+        });
+        cookies.push(LoginCookie {
+            name: "ipb_pass_hash".to_string(),
+            value: pass_hash.to_string(),
+            domain: domain.to_string(),
+            path: "/".to_string(),
+        });
+        if !auth.star.trim().is_empty() {
+            cookies.push(LoginCookie {
+                name: "star".to_string(),
+                value: auth.star.trim().to_string(),
+                domain: domain.to_string(),
+                path: "/".to_string(),
+            });
+        }
+        if !auth.igneous.trim().is_empty() {
+            cookies.push(LoginCookie {
+                name: "igneous".to_string(),
+                value: auth.igneous.trim().to_string(),
+                domain: domain.to_string(),
+                path: "/".to_string(),
+            });
+        }
+    }
+    cookies
 }
 
 fn read_forceresampled(params: &Value) -> bool {
@@ -1299,7 +1442,7 @@ fn plugin_info_json() -> Value {
         "name": "E*Hentai Downloader (Rust)",
         "type": "download",
         "namespace": "ehdl",
-        "login_from": "ehlogin",
+        "pre": ["ehlogin"],
         "author": "Lanlu",
         "version": "0.1.0",
         "description": "Rust/WASM port of EHentai download plugin.",
@@ -1315,7 +1458,8 @@ fn plugin_info_json() -> Value {
         "permissions": [
             "log.write",
             "progress.report",
-            "tcp.connect"
+            "tcp.connect",
+            "task_kv.read"
         ]
     })
 }

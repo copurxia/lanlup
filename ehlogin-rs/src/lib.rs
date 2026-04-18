@@ -21,12 +21,18 @@ const EXHENTAI_URL: &str = "https://exhentai.org";
 const INVALID_LOGIN_MARKER: &str = "You need to be logged in to view this page.";
 const MAX_REDIRECTS: usize = 5;
 const DEFAULT_TIMEOUT_MS: i32 = 30_000;
+const AUTH_DATA_KEY: &str = "__lanlu.phase.ehlogin.data";
 
 #[cfg(target_arch = "wasm32")]
 #[link(wasm_import_module = "wasmedge_host")]
 extern "C" {
     fn host_log(level: i32, ptr: i32, len: i32) -> i32;
     fn host_progress(percent: i32, ptr: i32, len: i32) -> i32;
+    fn host_call(op: i32, req_ptr: i32, req_len: i32) -> i32;
+    fn host_response_len() -> i32;
+    fn host_response_read(dst_ptr: i32, dst_len: i32) -> i32;
+    fn host_last_error_len() -> i32;
+    fn host_last_error_read(dst_ptr: i32, dst_len: i32) -> i32;
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -36,6 +42,26 @@ unsafe fn host_log(_: i32, _: i32, _: i32) -> i32 {
 
 #[cfg(not(target_arch = "wasm32"))]
 unsafe fn host_progress(_: i32, _: i32, _: i32) -> i32 {
+    0
+}
+#[cfg(not(target_arch = "wasm32"))]
+unsafe fn host_call(_: i32, _: i32, _: i32) -> i32 {
+    1
+}
+#[cfg(not(target_arch = "wasm32"))]
+unsafe fn host_response_len() -> i32 {
+    0
+}
+#[cfg(not(target_arch = "wasm32"))]
+unsafe fn host_response_read(_: i32, _: i32) -> i32 {
+    0
+}
+#[cfg(not(target_arch = "wasm32"))]
+unsafe fn host_last_error_len() -> i32 {
+    0
+}
+#[cfg(not(target_arch = "wasm32"))]
+unsafe fn host_last_error_read(_: i32, _: i32) -> i32 {
     0
 }
 
@@ -85,6 +111,56 @@ impl HostBridge {
         unsafe {
             let _ = host_progress(percent, message.as_ptr() as i32, message.len() as i32);
         }
+    }
+
+    fn call(method: &str, params: Value) -> Result<Value, String> {
+        let req = json!({
+            "method": method,
+            "params": params,
+        });
+        let req_bytes = serde_json::to_vec(&req).map_err(|e| e.to_string())?;
+        let rc = unsafe { host_call(0, req_bytes.as_ptr() as i32, req_bytes.len() as i32) };
+        if rc != 0 {
+            return Err(Self::read_error());
+        }
+        Self::read_response()
+    }
+
+    fn read_response() -> Result<Value, String> {
+        let len = unsafe { host_response_len() };
+        if len < 0 {
+            return Err("host_response_len returned negative length".to_string());
+        }
+        if len == 0 {
+            return Ok(Value::Null);
+        }
+        let mut buf = vec![0u8; len as usize];
+        let read = unsafe { host_response_read(buf.as_mut_ptr() as i32, len) };
+        if read < 0 {
+            return Err("host_response_read failed".to_string());
+        }
+        serde_json::from_slice(&buf[..read as usize]).map_err(|e| e.to_string())
+    }
+
+    fn read_error() -> String {
+        let len = unsafe { host_last_error_len() };
+        if len <= 0 {
+            return "host call failed".to_string();
+        }
+        let mut buf = vec![0u8; len as usize];
+        let read = unsafe { host_last_error_read(buf.as_mut_ptr() as i32, len) };
+        if read <= 0 {
+            return "host call failed".to_string();
+        }
+        String::from_utf8_lossy(&buf[..read as usize]).to_string()
+    }
+
+    fn task_kv_set(key: &str, value: Value) -> Result<bool, String> {
+        let response = Self::call("task_kv.set", json!({ "key": key, "value": value }))?;
+        Ok(response
+            .get("stored")
+            .and_then(Value::as_bool)
+            .unwrap_or(false))
     }
 
 }
@@ -177,7 +253,8 @@ fn plugin_info_json() -> Value {
             "net=forums.e-hentai.org",
             "tcp.connect",
             "log.write",
-            "progress.report"
+            "progress.report",
+            "task_kv.write"
         ],
         "parameters": [
             {"name": "ipb_member_id", "type": "string", "desc": "ipb_member_id cookie"},
@@ -219,7 +296,11 @@ fn execute_plugin(input: PluginInput) -> Result<Value, String> {
     HostBridge::progress(30, "验证登录凭据...");
     let result = do_login(&ipb_member_id, &ipb_pass_hash, &star, &igneous)?;
     HostBridge::progress(100, "登录完成");
-    Ok(result)
+    match HostBridge::task_kv_set(AUTH_DATA_KEY, result.clone()) {
+        Ok(true) => Ok(result),
+        Ok(false) => Err("Failed to persist E-Hentai auth data to task KV.".to_string()),
+        Err(e) => Err(format!("Failed to persist E-Hentai auth data: {e}")),
+    }
 }
 
 fn do_login(
@@ -230,25 +311,37 @@ fn do_login(
 ) -> Result<Value, String> {
     if ipb_member_id.is_empty() || ipb_pass_hash.is_empty() {
         return Ok(json!({
-            "cookies": [],
-            "message": "No cookies provided, returning blank UserAgent."
+            "ipb_member_id": "",
+            "ipb_pass_hash": "",
+            "star": "",
+            "igneous": "",
+            "message": "No credentials provided. E-Hentai plugins will run without authenticated cookies."
         }));
     }
 
     let cookies = build_cookies(ipb_member_id, ipb_pass_hash, star, igneous);
     match validate_cookies(&cookies) {
-        Ok(()) => Ok(success_data(cookies, None)),
+        Ok(()) => Ok(success_data(ipb_member_id, ipb_pass_hash, star, igneous, None)),
         Err(ValidationFailure::Invalid(error)) => Err(error),
         Err(ValidationFailure::Warning(warning)) => {
             HostBridge::log(2, &warning);
-            Ok(success_data(cookies, Some(warning)))
+            Ok(success_data(ipb_member_id, ipb_pass_hash, star, igneous, Some(warning)))
         }
     }
 }
 
-fn success_data(cookies: Vec<LoginCookie>, warning: Option<String>) -> Value {
+fn success_data(
+    ipb_member_id: &str,
+    ipb_pass_hash: &str,
+    star: &str,
+    igneous: &str,
+    warning: Option<String>,
+) -> Value {
     let mut data = Map::new();
-    data.insert("cookies".to_string(), json!(cookies));
+    data.insert("ipb_member_id".to_string(), Value::String(ipb_member_id.trim().to_string()));
+    data.insert("ipb_pass_hash".to_string(), Value::String(ipb_pass_hash.trim().to_string()));
+    data.insert("star".to_string(), Value::String(star.trim().to_string()));
+    data.insert("igneous".to_string(), Value::String(igneous.trim().to_string()));
     data.insert(
         "message".to_string(),
         Value::String("Successfully configured E-Hentai authentication cookies.".to_string()),
