@@ -5,6 +5,7 @@ use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use std::alloc::{alloc, dealloc, Layout};
 use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Read, Write};
 use std::slice;
 use std::sync::Arc;
@@ -23,6 +24,10 @@ const USER_AGENT: &str = "Lanlu/v1.00 (https://github.com/copurxia/lanlu)";
 const DEFAULT_TIMEOUT_MS: i32 = 30_000;
 const MAX_REDIRECTS: usize = 5;
 const AUTH_DATA_KEY: &str = "__lanlu.phase.nhlogin.data";
+const STRONG_MATCH_SCORE: i64 = 110;
+const MIN_MATCH_SCORE: i64 = 36;
+const MAX_SEARCH_PAGE: u32 = 2;
+const MAX_SELECT_CANDIDATES: usize = 5;
 
 #[cfg(target_arch = "wasm32")]
 #[link(wasm_import_module = "wasmedge_host")]
@@ -96,6 +101,24 @@ struct NhAuthData {
     api_key: String,
 }
 
+#[derive(Clone, Debug)]
+struct SearchStrategy {
+    label: &'static str,
+    query: String,
+    sort: &'static str,
+    page: u32,
+    exact_phrase: bool,
+}
+
+#[derive(Clone, Debug)]
+struct SearchCandidate {
+    gallery_id: String,
+    title: String,
+    title_alt: String,
+    score: i64,
+    sources: Vec<String>,
+}
+
 struct HostBridge;
 impl HostBridge {
     fn log(level: i32, message: &str) {
@@ -162,6 +185,30 @@ impl HostBridge {
             return Ok(None);
         }
         Ok(response.get("value").cloned())
+    }
+
+    fn select_index(
+        title: &str,
+        options: Vec<Value>,
+        message: &str,
+        default_index: i32,
+        timeout_seconds: i32,
+    ) -> Result<usize, String> {
+        let value = Self::call(
+            "ui.select",
+            json!({
+                "title": title,
+                "message": message,
+                "default_index": default_index,
+                "timeout_seconds": timeout_seconds,
+                "options": options,
+            }),
+        )?;
+        let index = value
+            .get("index")
+            .and_then(Value::as_i64)
+            .ok_or_else(|| "ui.select returned missing index".to_string())?;
+        usize::try_from(index).map_err(|_| "ui.select returned invalid index".to_string())
     }
 }
 
@@ -260,6 +307,7 @@ fn plugin_info_json() -> Value {
         "permissions": [
             "metadata.read_input",
             "net=nhentai.net",
+            "ui.select",
             "tcp.connect",
             "log.write",
             "progress.report",
@@ -296,18 +344,17 @@ fn execute_plugin(input: PluginInput) -> Result<Value, String> {
     let cookie_header = build_cookie_header_for_nh(&auth);
     let auth_header = build_api_key_authorization_for_nh(&auth);
 
-    let gallery_id = extract_gallery_id(&input.oneshot_param)
-        .or_else(|| extract_gallery_id_from_source_tag(&existing_tags))
-        .or_else(|| extract_gallery_id_from_title(&title))
-        .or_else(|| {
-            if title.is_empty() {
-                None
-            } else {
-                search_gallery_id_by_title(&title, &cookie_header, auth_header.as_deref())
-                    .ok()
-                    .flatten()
-            }
-        });
+    let gallery_id = if let Some(id) = extract_gallery_id(&input.oneshot_param) {
+        Some(id)
+    } else if let Some(id) = extract_gallery_id_from_source_tag(&existing_tags) {
+        Some(id)
+    } else if let Some(id) = extract_gallery_id_from_title(&title) {
+        Some(id)
+    } else if title.is_empty() {
+        None
+    } else {
+        search_gallery_id_by_title(&title, &cookie_header, auth_header.as_deref())?
+    };
 
     let Some(gallery_id) = gallery_id else {
         return Err("No matching nHentai Gallery Found!".to_string());
@@ -372,7 +419,83 @@ fn extract_gallery_id_from_title(title: &str) -> Option<String> {
 }
 
 fn sanitize_search_title(title: &str) -> String {
-    title.trim().to_string()
+    title
+        .trim()
+        .trim_matches('"')
+        .trim_matches('\'')
+        .trim()
+        .to_string()
+}
+
+fn simplify_search_title(title: &str) -> String {
+    let sanitized = sanitize_search_title(title);
+    if sanitized.is_empty() {
+        return sanitized;
+    }
+
+    let mut simplified = sanitized.replace('_', " ");
+    for pattern in [
+        r"\[[^\]]+\]",
+        r"\([^\)]+\)",
+        r"\{[^\}]+\}",
+        r"<[^>]+>",
+    ] {
+        if let Ok(re) = Regex::new(pattern) {
+            simplified = re.replace_all(&simplified, " ").to_string();
+        }
+    }
+    if let Ok(re) = Regex::new(r"\s+") {
+        simplified = re.replace_all(&simplified, " ").to_string();
+    }
+    simplified.trim().to_string()
+}
+
+fn build_search_strategies(title: &str, simplified: &str) -> Vec<SearchStrategy> {
+    let mut strategies = Vec::new();
+    let mut seen = BTreeSet::new();
+
+    let exact_phrase = if title.contains('"') {
+        title.replace('"', " ")
+    } else {
+        title.to_string()
+    };
+    let exact_phrase = sanitize_search_title(&exact_phrase);
+    if !exact_phrase.is_empty() {
+        for page in 1..=MAX_SEARCH_PAGE {
+            let query = format!("\"{exact_phrase}\"");
+            let dedup_key = format!("phrase|date|{page}|{query}");
+            if seen.insert(dedup_key) {
+                strategies.push(SearchStrategy {
+                    label: "exact phrase",
+                    query,
+                    sort: "date",
+                    page,
+                    exact_phrase: true,
+                });
+            }
+        }
+    }
+
+    for (label, query) in [("raw title", title), ("simplified title", simplified)] {
+        let clean = sanitize_search_title(query);
+        if clean.is_empty() {
+            continue;
+        }
+        for page in 1..=MAX_SEARCH_PAGE {
+            let dedup_key = format!("{label}|date|{page}|{clean}");
+            if seen.insert(dedup_key) {
+                strategies.push(SearchStrategy {
+                    label,
+                    query: clean.clone(),
+                    sort: "date",
+                    page,
+                    exact_phrase: false,
+                });
+            }
+        }
+    }
+
+    strategies
 }
 
 fn search_gallery_id_by_title(
@@ -380,15 +503,12 @@ fn search_gallery_id_by_title(
     cookie_header: &str,
     auth_header: Option<&str>,
 ) -> Result<Option<String>, String> {
-    let q = sanitize_search_title(title);
-    if q.is_empty() {
+    let raw_title = sanitize_search_title(title);
+    if raw_title.is_empty() {
         return Ok(None);
     }
-
-    let url = format!(
-        "https://nhentai.net/api/v2/search?query={}",
-        urlencoding::encode(&q)
-    );
+    let simplified_title = simplify_search_title(&raw_title);
+    let strategies = build_search_strategies(&raw_title, &simplified_title);
     let mut headers = default_headers();
     if !cookie_header.is_empty() {
         headers.push(("Cookie".to_string(), cookie_header.to_string()));
@@ -396,27 +516,391 @@ fn search_gallery_id_by_title(
     if let Some(auth) = auth_header {
         headers.push(("Authorization".to_string(), auth.to_string()));
     }
-    HostBridge::log(1, &format!("nhmeta-rs GET search {}", url));
-    let response = http_get_text_with_retry(&url, &headers, 4)?;
-    HostBridge::log(
-        1,
-        &format!("nhmeta-rs search response status={}", response.status),
-    );
-    if !(200..300).contains(&response.status) {
-        return Ok(None);
-    }
 
-    let search_json: Value = serde_json::from_str(&response.body_text)
-        .map_err(|e| format!("Failed to parse nHentai search response: {e}"))?;
-    if let Some(results) = search_json.get("result").and_then(Value::as_array) {
-        for gallery in results {
-            if let Some(id) = gallery_json_id(gallery.get("id")) {
-                return Ok(Some(id));
+    let mut candidates = BTreeMap::<String, SearchCandidate>::new();
+    for strategy in strategies {
+        let mut page_candidates = query_search_candidates(
+            &strategy,
+            &raw_title,
+            &simplified_title,
+            &headers,
+        )?;
+        for candidate in page_candidates.drain(..) {
+            if let Some(existing) = candidates.get_mut(&candidate.gallery_id) {
+                if candidate.score > existing.score {
+                    existing.score = candidate.score;
+                    existing.title = candidate.title.clone();
+                    existing.title_alt = candidate.title_alt.clone();
+                }
+                for source in candidate.sources {
+                    if !existing.sources.contains(&source) {
+                        existing.sources.push(source);
+                    }
+                }
+            } else {
+                candidates.insert(candidate.gallery_id.clone(), candidate);
             }
         }
     }
 
-    Ok(None)
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+
+    let mut ranked = candidates.into_values().collect::<Vec<_>>();
+    ranked.sort_by(|a, b| {
+        b.score
+            .cmp(&a.score)
+            .then_with(|| a.gallery_id.cmp(&b.gallery_id))
+    });
+
+    HostBridge::log(
+        1,
+        &format!(
+            "nhmeta-rs ranked candidates={}",
+            ranked
+                .iter()
+                .take(MAX_SELECT_CANDIDATES)
+                .map(|item| format!("{}:{}:{}", item.gallery_id, item.score, item.title))
+                .collect::<Vec<_>>()
+                .join(" | ")
+        ),
+    );
+
+    select_gallery_candidate(&raw_title, ranked)
+}
+
+fn query_search_candidates(
+    strategy: &SearchStrategy,
+    raw_title: &str,
+    simplified_title: &str,
+    headers: &[(String, String)],
+) -> Result<Vec<SearchCandidate>, String> {
+    let url = format!(
+        "https://nhentai.net/api/v2/search?query={}&sort={}&page={}",
+        urlencoding::encode(&strategy.query),
+        urlencoding::encode(strategy.sort),
+        strategy.page
+    );
+    HostBridge::log(
+        1,
+        &format!(
+            "nhmeta-rs GET search {} strategy={} page={}",
+            url, strategy.label, strategy.page
+        ),
+    );
+    let response = http_get_text_with_retry(&url, headers, 4)?;
+    HostBridge::log(
+        1,
+        &format!(
+            "nhmeta-rs search response status={} strategy={} page={}",
+            response.status, strategy.label, strategy.page
+        ),
+    );
+
+    if response.status == 401 {
+        return Err(
+            "nHentai API authentication was rejected (HTTP 401). Please rerun nhlogin with a valid API key."
+                .to_string(),
+        );
+    }
+    if !(200..300).contains(&response.status) {
+        return Ok(Vec::new());
+    }
+
+    let search_json: Value = serde_json::from_str(&response.body_text)
+        .map_err(|e| format!("Failed to parse nHentai search response: {e}"))?;
+    let mut out = Vec::new();
+    if let Some(results) = search_json.get("result").and_then(Value::as_array) {
+        for gallery in results {
+            if let Some(candidate) =
+                build_search_candidate(gallery, raw_title, simplified_title, strategy)
+            {
+                out.push(candidate);
+            }
+        }
+    }
+
+    Ok(out)
+}
+
+fn build_search_candidate(
+    gallery: &Value,
+    raw_title: &str,
+    simplified_title: &str,
+    strategy: &SearchStrategy,
+) -> Option<SearchCandidate> {
+    let gallery_id = gallery_json_id(gallery.get("id"))?;
+    let title = pick_title_from_gallery_json(gallery, &gallery_id);
+    let title_alt = gallery_alternate_title(gallery, &title);
+    let score = score_gallery_title_match(raw_title, simplified_title, gallery, strategy);
+    let source = format!("{} p{}", strategy.label, strategy.page);
+    Some(SearchCandidate {
+        gallery_id,
+        title,
+        title_alt,
+        score,
+        sources: vec![source],
+    })
+}
+
+fn select_gallery_candidate(
+    raw_title: &str,
+    ranked: Vec<SearchCandidate>,
+) -> Result<Option<String>, String> {
+    let Some(top) = ranked.first() else {
+        return Ok(None);
+    };
+    let top_score = top.score;
+    let top_id = top.gallery_id.clone();
+    let second_score = ranked.get(1).map(|item| item.score).unwrap_or(-1);
+    if top_score >= STRONG_MATCH_SCORE && top_score - second_score >= 10 {
+        return Ok(Some(top_id));
+    }
+    if ranked.len() == 1 {
+        if top_score >= MIN_MATCH_SCORE {
+            return Ok(Some(top_id));
+        }
+        return Ok(None);
+    }
+
+    let selectable = ranked
+        .into_iter()
+        .filter(|item| item.score >= MIN_MATCH_SCORE && top_score - item.score <= 12)
+        .take(MAX_SELECT_CANDIDATES)
+        .collect::<Vec<_>>();
+
+    if selectable.is_empty() {
+        return Ok(None);
+    }
+    if selectable.len() == 1 {
+        return Ok(Some(selectable[0].gallery_id.clone()));
+    }
+
+    let options = selectable
+        .iter()
+        .enumerate()
+        .map(|(index, item)| {
+            json!({
+                "label": if item.title.trim().is_empty() { format!("候选 {}", index + 1) } else { item.title.clone() },
+                "description": build_search_candidate_description(item),
+            })
+        })
+        .collect::<Vec<_>>();
+    let selected = HostBridge::select_index(
+        "nHentai 候选匹配",
+        options,
+        &format!("为 “{raw_title}” 选择最合适的 nHentai 画廊"),
+        0,
+        120,
+    )?;
+    Ok(selectable
+        .get(selected)
+        .or_else(|| selectable.first())
+        .map(|item| item.gallery_id.clone()))
+}
+
+fn build_search_candidate_description(candidate: &SearchCandidate) -> String {
+    let mut parts = vec![
+        format!("score: {}", candidate.score),
+        format!("g/{}", candidate.gallery_id),
+    ];
+    if !candidate.title_alt.trim().is_empty() {
+        parts.push(candidate.title_alt.trim().to_string());
+    }
+    if !candidate.sources.is_empty() {
+        parts.push(format!("via {}", candidate.sources.join(" + ")));
+    }
+    parts.join(" | ")
+}
+
+fn score_gallery_title_match(
+    raw_title: &str,
+    simplified_title: &str,
+    gallery: &Value,
+    strategy: &SearchStrategy,
+) -> i64 {
+    let titles = gallery_title_variants(gallery);
+    if titles.is_empty() {
+        return 0;
+    }
+
+    let query_norm = normalize_compare_text(raw_title);
+    let query_compact = compact_compare_text(&query_norm);
+    let query_tokens = split_compare_tokens(&query_norm);
+
+    let simplified_norm = normalize_compare_text(simplified_title);
+    let simplified_compact = compact_compare_text(&simplified_norm);
+    let simplified_tokens = split_compare_tokens(&simplified_norm);
+
+    let mut best = 0i64;
+    for title in titles {
+        let candidate_norm = normalize_compare_text(&title);
+        if candidate_norm.is_empty() {
+            continue;
+        }
+        let candidate_compact = compact_compare_text(&candidate_norm);
+        let candidate_tokens = split_compare_tokens(&candidate_norm);
+        let mut score = calculate_title_score(
+            &query_norm,
+            &query_compact,
+            &query_tokens,
+            &candidate_norm,
+            &candidate_compact,
+            &candidate_tokens,
+        );
+        if !simplified_norm.is_empty() && simplified_norm != query_norm {
+            let simplified_score = calculate_title_score(
+                &simplified_norm,
+                &simplified_compact,
+                &simplified_tokens,
+                &candidate_norm,
+                &candidate_compact,
+                &candidate_tokens,
+            );
+            if simplified_score > 0 {
+                score = score.max(simplified_score - 8);
+            }
+        }
+        best = best.max(score);
+    }
+
+    if strategy.exact_phrase {
+        best += 6;
+    }
+    if strategy.page > 1 {
+        best -= i64::from(strategy.page - 1) * 2;
+    } else {
+        best += 2;
+    }
+    best
+}
+
+fn calculate_title_score(
+    query_norm: &str,
+    query_compact: &str,
+    query_tokens: &[String],
+    candidate_norm: &str,
+    candidate_compact: &str,
+    candidate_tokens: &[String],
+) -> i64 {
+    if query_norm.is_empty() || candidate_norm.is_empty() {
+        return 0;
+    }
+
+    let mut score = 0i64;
+    if candidate_norm == query_norm {
+        score += 120;
+    } else if !query_compact.is_empty() && candidate_compact == query_compact {
+        score += 112;
+    } else if candidate_norm.contains(query_norm) || query_norm.contains(candidate_norm) {
+        let shorter = i64::try_from(query_compact.len().min(candidate_compact.len())).unwrap_or(0);
+        let longer = i64::try_from(query_compact.len().max(candidate_compact.len())).unwrap_or(1);
+        score += 60 + (shorter * 24 / longer.max(1));
+    }
+
+    let prefix = common_prefix_chars(query_compact, candidate_compact);
+    if prefix >= 4 {
+        score += i64::try_from(prefix.min(18)).unwrap_or(0);
+    }
+
+    if !query_tokens.is_empty() {
+        let common = i64::try_from(count_common_tokens(query_tokens, candidate_tokens)).unwrap_or(0);
+        if common > 0 {
+            score += common * 12;
+            score += common * 22 / i64::try_from(query_tokens.len()).unwrap_or(1).max(1);
+            if usize::try_from(common).ok() == Some(query_tokens.len()) && query_tokens.len() >= 2 {
+                score += 18;
+            }
+        }
+    }
+
+    let len_gap =
+        i64::try_from(query_compact.len()).unwrap_or(0) - i64::try_from(candidate_compact.len()).unwrap_or(0);
+    let len_gap = len_gap.abs();
+    if len_gap <= 4 {
+        score += 10;
+    } else if len_gap <= 10 {
+        score += 4;
+    }
+    score
+}
+
+fn gallery_title_variants(gallery: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = BTreeSet::new();
+    for key in ["pretty", "english", "japanese"] {
+        let Some(raw) = gallery
+            .get("title")
+            .and_then(Value::as_object)
+            .and_then(|obj| obj.get(key))
+            .and_then(Value::as_str)
+        else {
+            continue;
+        };
+        let title = raw.trim();
+        if title.is_empty() {
+            continue;
+        }
+        if seen.insert(title.to_string()) {
+            out.push(title.to_string());
+        }
+    }
+    out
+}
+
+fn gallery_alternate_title(gallery: &Value, primary: &str) -> String {
+    gallery_title_variants(gallery)
+        .into_iter()
+        .find(|title| title.trim() != primary.trim())
+        .unwrap_or_default()
+}
+
+fn normalize_compare_text(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut last_space = true;
+    for ch in input.to_lowercase().chars() {
+        if ch.is_alphanumeric() {
+            out.push(ch);
+            last_space = false;
+        } else if ch.is_whitespace() {
+            if !last_space {
+                out.push(' ');
+                last_space = true;
+            }
+        } else if !last_space {
+            out.push(' ');
+            last_space = true;
+        }
+    }
+    out.trim().to_string()
+}
+
+fn compact_compare_text(input: &str) -> String {
+    input.chars().filter(|ch| !ch.is_whitespace()).collect()
+}
+
+fn split_compare_tokens(input: &str) -> Vec<String> {
+    input
+        .split_whitespace()
+        .filter(|part| part.chars().count() >= 2 || !part.is_ascii())
+        .map(|part| part.to_string())
+        .collect()
+}
+
+fn count_common_tokens(query_tokens: &[String], candidate_tokens: &[String]) -> usize {
+    let candidate_set = candidate_tokens.iter().cloned().collect::<BTreeSet<_>>();
+    query_tokens
+        .iter()
+        .filter(|item| candidate_set.contains(*item))
+        .count()
+}
+
+fn common_prefix_chars(left: &str, right: &str) -> usize {
+    left.chars()
+        .zip(right.chars())
+        .take_while(|(lhs, rhs)| lhs == rhs)
+        .count()
 }
 
 fn fetch_gallery_metadata(
@@ -440,6 +924,12 @@ fn fetch_gallery_metadata(
         &format!("nhmeta-rs gallery response status={}", response.status),
     );
 
+    if response.status == 401 {
+        return Err(
+            "nHentai API authentication was rejected (HTTP 401). Please rerun nhlogin with a valid API key."
+                .to_string(),
+        );
+    }
     if response.status == 404 {
         return Err(format!("Gallery not found: {gallery_id}"));
     }
@@ -463,6 +953,23 @@ fn http_get_text_with_retry(
     for attempt in 0..=max_retries {
         match http_get_text(url, headers) {
             Ok(v) => {
+                if v.status == 429 {
+                    let wait_ms = retry_after_millis(&v.headers)
+                        .unwrap_or_else(|| 1_000u64.saturating_mul(attempt as u64 + 1));
+                    HostBridge::log(
+                        1,
+                        &format!(
+                            "nhmeta-rs hit HTTP 429 attempt={attempt}/{max_retries} url={url} wait_ms={wait_ms}"
+                        ),
+                    );
+                    if attempt >= max_retries {
+                        return Err(format!(
+                            "nHentai API rate limit reached (HTTP 429) for {url}. Retry later."
+                        ));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(wait_ms.min(15_000)));
+                    continue;
+                }
                 if attempt > 0 {
                     HostBridge::log(
                         1,
@@ -495,6 +1002,12 @@ fn is_retryable_network_error(err: &str) -> bool {
         || s.contains("would block")
         || s.contains("timed out")
         || s.contains("interrupted")
+}
+
+fn retry_after_millis(headers: &[(String, String)]) -> Option<u64> {
+    header_value(headers, "Retry-After")
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(|seconds| seconds.saturating_mul(1000))
 }
 
 fn gallery_json_id(value: Option<&Value>) -> Option<String> {
@@ -543,9 +1056,7 @@ fn build_tags_from_gallery_json(
         }
     }
 
-    if !tags.is_empty() {
-        tags.push(format!("source:nhentai.net/g/{gallery_id}"));
-    }
+    tags.push(format!("source:nhentai.net/g/{gallery_id}"));
 
     let updated_at = if add_uploaded {
         gallery
@@ -800,6 +1311,7 @@ impl Write for HttpStream {
 
 struct HttpTextResponse {
     status: u16,
+    headers: Vec<(String, String)>,
     body_text: String,
 }
 
@@ -843,6 +1355,7 @@ fn http_get_text(url: &str, headers: &[(String, String)]) -> Result<HttpTextResp
             let Some(location) = header_value(&response_headers, "Location") else {
                 return Ok(HttpTextResponse {
                     status,
+                    headers: response_headers,
                     body_text: String::from_utf8_lossy(&body).to_string(),
                 });
             };
@@ -851,6 +1364,7 @@ fn http_get_text(url: &str, headers: &[(String, String)]) -> Result<HttpTextResp
         }
         return Ok(HttpTextResponse {
             status,
+            headers: response_headers,
             body_text: String::from_utf8_lossy(&body).to_string(),
         });
     }

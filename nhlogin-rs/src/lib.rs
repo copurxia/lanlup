@@ -73,6 +73,7 @@ impl HostBridge {
             let _ = host_log(level, message.as_ptr() as i32, message.len() as i32);
         }
     }
+
     fn progress(percent: i32, message: &str) {
         unsafe {
             let _ = host_progress(percent, message.as_ptr() as i32, message.len() as i32);
@@ -233,8 +234,12 @@ fn execute_plugin(params: Value) -> Value {
     match result {
         Ok(data) => match HostBridge::task_kv_set(AUTH_DATA_KEY, data.clone()) {
             Ok(true) => json!({ "success": true, "data": data }),
-            Ok(false) => json!({ "success": false, "error": "Failed to persist nHentai auth data to task KV." }),
-            Err(e) => json!({ "success": false, "error": format!("Failed to persist nHentai auth data: {e}") }),
+            Ok(false) => {
+                json!({ "success": false, "error": "Failed to persist nHentai auth data to task KV." })
+            }
+            Err(e) => {
+                json!({ "success": false, "error": format!("Failed to persist nHentai auth data: {e}") })
+            }
         },
         Err(e) => json!({ "success": false, "error": e }),
     }
@@ -253,7 +258,7 @@ fn do_login(api_key: &str) -> Result<Value, String> {
 
     HostBridge::log(
         1,
-        "nHentai API key provided; storing auth data in task KV.",
+        "nHentai API key provided; storing auth data in task KV without online validation.",
     );
     Ok(json!({
         "mode": "key",

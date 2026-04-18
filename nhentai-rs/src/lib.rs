@@ -22,6 +22,9 @@ const USER_AGENT: &str = "Lanlu/v1.00 (https://github.com/copurxia/lanlu)";
 const HTTP_TIMEOUT_MS: i32 = 15000;
 const MAX_REDIRECTS: usize = 5;
 const AUTH_DATA_KEY: &str = "__lanlu.phase.nhlogin.data";
+const MAX_HTTP_RETRIES: usize = 3;
+const MAX_PAGE_CDN_FAILOVERS: usize = 4;
+const DEFAULT_IMAGE_CDN: &str = "https://i.nhentai.net";
 
 #[cfg(target_arch = "wasm32")]
 #[link(wasm_import_module = "wasmedge_host")]
@@ -110,6 +113,7 @@ struct GalleryData {
     id: i64,
     name: String,
     pretty_name: String,
+    expected_pages: usize,
     page_paths: Vec<String>,
 }
 
@@ -341,7 +345,7 @@ fn run_download(input: &PluginInput) -> Value {
     let login_cookies = build_nh_login_cookies(&auth);
     let auth_headers = build_nh_api_auth_headers(&auth);
     HostBridge::progress(1, "Fetching gallery metadata...");
-    let resp = match fetch_text_direct(
+    let resp = match fetch_text_with_retry(
         &gallery_api_url,
         Some("https://nhentai.net/"),
         &login_cookies,
@@ -350,6 +354,11 @@ fn run_download(input: &PluginInput) -> Value {
         Ok(v) => v,
         Err(e) => return output_err(&format!("Failed to fetch gallery: {e}")),
     };
+    if resp.0 == 401 {
+        return output_err(
+            "nHentai API authentication was rejected (HTTP 401). Please rerun nhlogin with a valid API key.",
+        );
+    }
     if resp.0 == 404 {
         return output_err(&format!("Gallery not found: {gallery_id}"));
     }
@@ -369,6 +378,17 @@ fn run_download(input: &PluginInput) -> Value {
             gallery.page_paths.len()
         ),
     );
+    let image_servers = match fetch_nh_image_servers(&login_cookies, &auth_headers) {
+        Ok(v) => v,
+        Err(e) => {
+            HostBridge::log(1, &format!("nhentai-rs CDN config fallback: {e}"));
+            vec![DEFAULT_IMAGE_CDN.to_string()]
+        }
+    };
+    HostBridge::log(
+        1,
+        &format!("nhentai-rs image servers={}", image_servers.join(", ")),
+    );
 
     let safe = sanitize_filename(if gallery.pretty_name.is_empty() {
         &gallery.name
@@ -384,32 +404,42 @@ fn run_download(input: &PluginInput) -> Value {
 
     let mut downloaded_count = 0usize;
     let mut failed_count = 0usize;
+    let expected_pages = gallery.expected_pages.max(gallery.page_paths.len()).max(1);
     let total = gallery.page_paths.len().max(1);
     for (offset, page_path) in gallery.page_paths.iter().enumerate() {
         let idx = offset + 1;
         let file_name = gallery_page_filename(page_path, idx);
-        let image_url = gallery_page_url(page_path);
         let mut local_path = PathBuf::from(&plugin_dir);
         local_path.push(file_name);
-        match download_file_direct(
-            &image_url,
+        match download_gallery_page(
+            &image_servers,
+            gallery.id,
+            idx,
+            page_path,
             &gallery_url,
             &login_cookies,
             &local_path,
             &[],
         ) {
             Ok(()) => downloaded_count += 1,
-            Err(_) => failed_count += 1,
+            Err(err) => {
+                failed_count += 1;
+                HostBridge::log(
+                    1,
+                    &format!("nhentai-rs page download failed page={idx} path={page_path} error={err}"),
+                );
+            }
         }
         let percent = ((idx * 100) / total).clamp(1, 99) as i32;
         HostBridge::progress(percent, &format!("Downloading page {idx}/{total}..."));
     }
 
+    let partial = downloaded_count != expected_pages;
     HostBridge::progress(
         100,
         &format!(
-            "Download complete: {} succeeded, {} failed",
-            downloaded_count, failed_count
+            "Download complete: {} succeeded, {} failed, expected {}",
+            downloaded_count, failed_count, expected_pages
         ),
     );
 
@@ -429,6 +459,8 @@ fn run_download(input: &PluginInput) -> Value {
             "source": format!("https://nhentai.net/g/{gallery_id}/"),
             "downloaded_count": downloaded_count,
             "failed_count": failed_count,
+            "expected_count": expected_pages,
+            "partial": partial,
             "archive_type": "folder"
         }]
     })
@@ -503,21 +535,41 @@ fn parse_gallery(json_text: &str, gallery_id: i64) -> Option<GalleryData> {
         return None;
     }
 
+    let expected_pages = gallery
+        .get("num_pages")
+        .and_then(value_to_usize)
+        .filter(|count| *count > 0)
+        .unwrap_or(page_paths.len());
+
     Some(GalleryData {
         id: gallery_id,
         name,
         pretty_name,
+        expected_pages,
         page_paths,
     })
 }
 
-fn gallery_page_url(page_path: &str) -> String {
+fn value_to_usize(value: &Value) -> Option<usize> {
+    if let Some(v) = value.as_u64() {
+        return usize::try_from(v).ok();
+    }
+    if let Some(v) = value.as_i64() {
+        return usize::try_from(v).ok();
+    }
+    value
+        .as_str()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+}
+
+fn gallery_page_url(server: &str, page_path: &str) -> String {
     let normalized = page_path.trim();
     if normalized.starts_with("https://") || normalized.starts_with("http://") {
         return normalized.to_string();
     }
     format!(
-        "https://i.nhentai.net/{}",
+        "{}/{}",
+        server.trim_end_matches('/'),
         normalized.trim_start_matches('/')
     )
 }
@@ -606,21 +658,137 @@ fn build_nh_api_auth_headers(auth: &NhAuthData) -> Vec<(String, String)> {
     }
 }
 
-fn fetch_text_direct(
+fn fetch_nh_image_servers(
+    cookies: &[LoginCookie],
+    extra_headers: &[(String, String)],
+) -> Result<Vec<String>, String> {
+    let mut last_err = String::new();
+    for endpoint in [
+        "https://nhentai.net/api/v2/cdn",
+        "https://nhentai.net/api/v2/config",
+    ] {
+        match fetch_text_with_retry(endpoint, Some("https://nhentai.net/"), cookies, extra_headers) {
+            Ok((status, body)) => {
+                if status == 401 {
+                    return Err(
+                        "nHentai API authentication was rejected (HTTP 401). Please rerun nhlogin with a valid API key."
+                            .to_string(),
+                    );
+                }
+                if !(200..300).contains(&status) {
+                    last_err = format!("CDN config request failed: {endpoint} returned HTTP {status}");
+                    continue;
+                }
+                let servers = extract_image_servers_from_config_text(&body)
+                    .map_err(|e| format!("Failed to parse CDN config from {endpoint}: {e}"))?;
+                if !servers.is_empty() {
+                    return Ok(servers);
+                }
+                last_err = format!("CDN config from {endpoint} did not include image_servers");
+            }
+            Err(err) => {
+                last_err = format!("{endpoint}: {err}");
+            }
+        }
+    }
+
+    if last_err.is_empty() {
+        Err("Unable to resolve nHentai image CDN configuration".to_string())
+    } else {
+        Err(last_err)
+    }
+}
+
+fn extract_image_servers_from_config_text(body: &str) -> Result<Vec<String>, String> {
+    let parsed: Value = serde_json::from_str(body).map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    if let Some(items) = parsed.get("image_servers").and_then(Value::as_array) {
+        for item in items {
+            if let Some(server) = item.as_str().and_then(normalize_cdn_base_url) {
+                if !out.contains(&server) {
+                    out.push(server);
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn normalize_cdn_base_url(raw: &str) -> Option<String> {
+    let trimmed = raw.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return None;
+    }
+    let parsed = Url::parse(trimmed).ok()?;
+    let scheme = parsed.scheme();
+    if scheme != "http" && scheme != "https" {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+fn ordered_image_servers(image_servers: &[String], gallery_id: i64, page_index: usize) -> Vec<String> {
+    if image_servers.is_empty() {
+        return vec![DEFAULT_IMAGE_CDN.to_string()];
+    }
+    let mut ordered = Vec::new();
+    let base = usize::try_from(gallery_id.unsigned_abs()).unwrap_or(0);
+    let start = (base + page_index.saturating_sub(1)) % image_servers.len();
+    let total = image_servers.len().min(MAX_PAGE_CDN_FAILOVERS.max(1));
+    for offset in 0..total {
+        ordered.push(image_servers[(start + offset) % image_servers.len()].clone());
+    }
+    ordered
+}
+
+fn fetch_text_with_retry(
     url: &str,
     referer: Option<&str>,
     cookies: &[LoginCookie],
     extra_headers: &[(String, String)],
 ) -> Result<(u16, String), String> {
-    let response = http_get(
+    let response = http_get_with_retry(
         url,
         referer,
         cookies,
         "application/json,text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
         extra_headers,
+        MAX_HTTP_RETRIES,
     )?;
     let text = String::from_utf8_lossy(&response.body).to_string();
     Ok((response.status, text))
+}
+
+fn download_gallery_page(
+    image_servers: &[String],
+    gallery_id: i64,
+    page_index: usize,
+    page_path: &str,
+    referer: &str,
+    cookies: &[LoginCookie],
+    output: &PathBuf,
+    extra_headers: &[(String, String)],
+) -> Result<(), String> {
+    let mut last_err = String::new();
+    for server in ordered_image_servers(image_servers, gallery_id, page_index) {
+        let image_url = gallery_page_url(&server, page_path);
+        match download_file_direct(&image_url, referer, cookies, output, extra_headers) {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                last_err = format!("{server}: {err}");
+                HostBridge::log(
+                    1,
+                    &format!(
+                        "nhentai-rs switching CDN page={} server={} error={}",
+                        page_index, server, err
+                    ),
+                );
+            }
+        }
+    }
+    Err(format!(
+        "All CDN attempts failed for page {page_index} ({page_path}): {last_err}"
+    ))
 }
 
 fn download_file_direct(
@@ -633,9 +801,22 @@ fn download_file_direct(
     if let Some(parent) = output.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    let resp = http_get(url, Some(referer), cookies, "image/*,*/*", extra_headers)?;
+    let resp = http_get_with_retry(
+        url,
+        Some(referer),
+        cookies,
+        "image/*,*/*",
+        extra_headers,
+        MAX_HTTP_RETRIES,
+    )?;
+    if resp.status == 401 {
+        return Err("HTTP 401".to_string());
+    }
     if resp.status >= 400 {
         return Err(format!("HTTP {}", resp.status));
+    }
+    if resp.body.is_empty() {
+        return Err("empty response body".to_string());
     }
     let mut file = File::create(output).map_err(|e| e.to_string())?;
     file.write_all(&resp.body).map_err(|e| e.to_string())?;
@@ -647,6 +828,78 @@ struct HttpResponse {
     status: u16,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
+}
+
+fn http_get_with_retry(
+    url: &str,
+    referer: Option<&str>,
+    cookies: &[LoginCookie],
+    accept: &str,
+    extra_headers: &[(String, String)],
+    max_retries: usize,
+) -> Result<HttpResponse, String> {
+    let mut last_err = String::new();
+    for attempt in 0..=max_retries {
+        match http_get(url, referer, cookies, accept, extra_headers) {
+            Ok(response) => {
+                if response.status == 429 {
+                    let wait_ms = retry_after_millis(&response.headers)
+                        .unwrap_or_else(|| 1_000u64.saturating_mul(attempt as u64 + 1));
+                    HostBridge::log(
+                        1,
+                        &format!(
+                            "nhentai-rs hit HTTP 429 attempt={attempt}/{max_retries} url={url} wait_ms={wait_ms}"
+                        ),
+                    );
+                    if attempt >= max_retries {
+                        return Err(format!(
+                            "nHentai returned HTTP 429 for {url}. Retry later."
+                        ));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(wait_ms.min(60_000)));
+                    continue;
+                }
+                if is_retryable_status(response.status) {
+                    last_err = format!("HTTP {}", response.status);
+                    HostBridge::log(
+                        1,
+                        &format!(
+                            "nhentai-rs retryable status={} attempt={attempt}/{max_retries} url={url}",
+                            response.status
+                        ),
+                    );
+                    if attempt >= max_retries {
+                        return Ok(response);
+                    }
+                    let wait_ms = 250u64.saturating_mul(attempt as u64 + 1);
+                    std::thread::sleep(std::time::Duration::from_millis(wait_ms));
+                    continue;
+                }
+                if attempt > 0 {
+                    HostBridge::log(
+                        1,
+                        &format!("nhentai-rs retry succeeded attempt={attempt} url={url}"),
+                    );
+                }
+                return Ok(response);
+            }
+            Err(err) => {
+                HostBridge::log(
+                    1,
+                    &format!(
+                        "nhentai-rs request failed attempt={attempt}/{max_retries} url={url} error={err}"
+                    ),
+                );
+                if attempt >= max_retries || !is_retryable_network_error(&err) {
+                    return Err(err);
+                }
+                last_err = err;
+                let wait_ms = 200u64.saturating_mul(attempt as u64 + 1);
+                std::thread::sleep(std::time::Duration::from_millis(wait_ms));
+            }
+        }
+    }
+    Err(last_err)
 }
 
 fn http_get(
@@ -976,6 +1229,27 @@ fn find_header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<
         .iter()
         .find(|(k, _)| k.eq_ignore_ascii_case(name))
         .map(|(_, v)| v.as_str())
+}
+
+fn retry_after_millis(headers: &[(String, String)]) -> Option<u64> {
+    find_header_value(headers, "retry-after")
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(|seconds| seconds.saturating_mul(1000))
+}
+
+fn is_retryable_status(status: u16) -> bool {
+    matches!(status, 408 | 425 | 500 | 502 | 503 | 504)
+}
+
+fn is_retryable_network_error(err: &str) -> bool {
+    let lower = err.to_ascii_lowercase();
+    lower.contains("resource temporarily unavailable")
+        || lower.contains("would block")
+        || lower.contains("timed out")
+        || lower.contains("interrupted")
+        || lower.contains("tls close_notify")
+        || lower.contains("connection reset")
+        || lower.contains("broken pipe")
 }
 
 fn has_default_port(scheme: &str, port: u16) -> bool {
