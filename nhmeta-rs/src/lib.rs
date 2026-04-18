@@ -19,7 +19,7 @@ use wasmedge_wasi_socket::TcpStream as WasiTcpStream;
 #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
 compile_error!("nhmeta-rs requires wasm32-wasip1 (target_os = \"wasi\")");
 
-const USER_AGENT: &str = "Lanlu/v1.00";
+const USER_AGENT: &str = "Lanlu/v1.00 (https://github.com/copurxia/lanlu)";
 const DEFAULT_TIMEOUT_MS: i32 = 30_000;
 const MAX_REDIRECTS: usize = 5;
 const AUTH_KEY_COOKIE_NAME: &str = "__lanlu_nh_api_key";

@@ -18,7 +18,7 @@ use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 #[cfg(target_arch = "wasm32")]
 use wasmedge_wasi_socket::TcpStream as WasiTcpStream;
 
-const USER_AGENT: &str = "Lanlu/v1.00";
+const USER_AGENT: &str = "Lanlu/v1.00 (https://github.com/copurxia/lanlu)";
 const HTTP_TIMEOUT_MS: i32 = 15000;
 const MAX_REDIRECTS: usize = 5;
 const AUTH_KEY_COOKIE_NAME: &str = "__lanlu_nh_api_key";
