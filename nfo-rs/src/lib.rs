@@ -151,6 +151,16 @@ struct IndexedFile {
     episode_stem: bool,
 }
 
+#[derive(Debug, Clone)]
+struct PageAttachmentCandidate {
+    path: String,
+    slot: String,
+    name: String,
+    mime_type: String,
+    kind: String,
+    language: String,
+}
+
 #[derive(Debug, Clone, Default)]
 struct ListingIndex {
     entries: Vec<IndexedFile>,
@@ -280,6 +290,31 @@ impl ListingIndex {
 
         out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         out.into_iter().map(|item| item.0).collect()
+    }
+
+    fn page_attachment_candidates(&self, base_name: &str) -> Vec<PageAttachmentCandidate> {
+        let mut out = Vec::<PageAttachmentCandidate>::new();
+        let mut seen = HashSet::<String>::new();
+
+        for entry in &self.entries {
+            let Some((language, kind)) = match_page_attachment_to_base(&entry.name, base_name) else {
+                continue;
+            };
+            if !seen.insert(entry.lower.clone()) {
+                continue;
+            }
+            out.push(PageAttachmentCandidate {
+                path: entry.name.clone(),
+                slot: "subtitle".to_string(),
+                name: entry.name.clone(),
+                mime_type: attachment_mime_type(&kind).to_string(),
+                kind,
+                language,
+            });
+        }
+
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        out
     }
 
     fn general_cover_candidates(&self) -> Vec<String> {
@@ -785,6 +820,7 @@ fn run_archive_mode(
         if media_path.is_empty() {
             continue;
         }
+        let attachment_candidates = index.page_attachment_candidates(&base_name);
 
         let mut patch = Map::new();
         patch.insert("entry_path".to_string(), Value::String(media_path.clone()));
@@ -827,6 +863,26 @@ fn run_archive_mode(
                 first_page_cover_fallback = thumb_ref;
                 first_page_cover_sort = sort;
             }
+        }
+        if !attachment_candidates.is_empty() {
+            patch.insert(
+                "attachments".to_string(),
+                Value::Array(
+                    attachment_candidates
+                        .iter()
+                        .map(|attachment| {
+                            json!({
+                                "slot": attachment.slot,
+                                "path": adjacent_ref(&attachment.path, 0),
+                                "name": attachment.name,
+                                "mime_type": attachment.mime_type,
+                                "kind": attachment.kind,
+                                "language": attachment.language,
+                            })
+                        })
+                        .collect(),
+                ),
+            );
         }
 
         page_patches.insert(media_path.clone(), Value::Object(patch));
@@ -1100,6 +1156,7 @@ fn read_season_metadata(archive_id: &str, options: ArchiveModeOptions) -> Option
             }
         }
         let cover_candidates = index.cover_candidates(&base_name, &media_path);
+        let attachment_candidates = index.page_attachment_candidates(&base_name);
         if let Some(first) = cover_candidates.first() {
             patch.insert("thumb".to_string(), Value::String(adjacent_ref(first, 0)));
             if first_page_cover.is_empty()
@@ -1108,6 +1165,26 @@ fn read_season_metadata(archive_id: &str, options: ArchiveModeOptions) -> Option
                 first_page_cover = adjacent_ref(first, 0);
                 first_page_cover_sort = sort;
             }
+        }
+        if !attachment_candidates.is_empty() {
+            patch.insert(
+                "attachments".to_string(),
+                Value::Array(
+                    attachment_candidates
+                        .iter()
+                        .map(|attachment| {
+                            json!({
+                                "slot": attachment.slot,
+                                "path": adjacent_ref(&attachment.path, 0),
+                                "name": attachment.name,
+                                "mime_type": attachment.mime_type,
+                                "kind": attachment.kind,
+                                "language": attachment.language,
+                            })
+                        })
+                        .collect(),
+                ),
+            );
         }
         page_patches.insert(media_path, Value::Object(patch));
         if options.hide_thumb_images {
@@ -1760,6 +1837,73 @@ fn strip_extension(name: &str) -> String {
         .unwrap_or_else(|| name.to_string())
 }
 
+fn parse_page_attachment_stem(name: &str) -> Option<(String, String, String)> {
+    let lower = name.to_ascii_lowercase();
+    let (without_kind, kind) = lower.rsplit_once('.')?;
+    if !matches!(
+        kind,
+        "ass" | "ssa" | "srt" | "vtt" | "sub" | "idx" | "sup"
+    ) {
+        return None;
+    }
+    let mut base = without_kind.to_string();
+    let mut language = String::new();
+    if let Some((candidate_base, candidate_language)) = without_kind.rsplit_once('.') {
+        if looks_like_attachment_language(candidate_language) {
+            base = candidate_base.to_string();
+            language = candidate_language.to_string();
+        }
+    }
+    Some((base, language, kind.to_string()))
+}
+
+fn match_page_attachment_to_base(name: &str, media_base: &str) -> Option<(String, String)> {
+    let (attachment_base, language, kind) = parse_page_attachment_stem(name)?;
+    let normalized_media_base = media_base.to_ascii_lowercase();
+    if attachment_base == normalized_media_base {
+        return Some((language, kind));
+    }
+    let rest = attachment_base.strip_prefix(&normalized_media_base)?;
+    if !rest.starts_with('.') {
+        return None;
+    }
+    let suffix = rest.trim_start_matches('.');
+    if suffix.is_empty() {
+        return Some((language, kind));
+    }
+
+    let mut detected_language = language;
+    if detected_language.is_empty() {
+        for segment in suffix.rsplit('.') {
+            if looks_like_attachment_language(segment) {
+                detected_language = segment.to_string();
+                break;
+            }
+        }
+    }
+    Some((detected_language, kind))
+}
+
+fn looks_like_attachment_language(value: &str) -> bool {
+    let trimmed = value.trim();
+    let size = trimmed.len();
+    if !(2..=15).contains(&size) {
+        return false;
+    }
+    trimmed
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+}
+
+fn attachment_mime_type(kind: &str) -> &'static str {
+    match kind {
+        "ass" | "ssa" => "text/x-ssa",
+        "srt" => "application/x-subrip",
+        "vtt" => "text/vtt",
+        _ => "application/octet-stream",
+    }
+}
+
 fn classify_file_kind(lower_name: &str) -> FileKind {
     if has_any_suffix(lower_name, &[".nfo"]) {
         FileKind::Nfo
@@ -2058,6 +2202,60 @@ fn strip_sidecar_cover_suffix(stem: &str) -> String {
 
 fn adjacent_ref(path: &str, levels_up: i64) -> String {
     format!("adjacent://{levels_up}/{path}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_language_suffix_subtitle_attachment() {
+        let parsed = parse_page_attachment_stem("episode01.zh-cn.ass").unwrap();
+        assert_eq!(parsed.0, "episode01");
+        assert_eq!(parsed.1, "zh-cn");
+        assert_eq!(parsed.2, "ass");
+    }
+
+    #[test]
+    fn parses_plain_subtitle_attachment() {
+        let parsed = parse_page_attachment_stem("episode01.srt").unwrap();
+        assert_eq!(parsed.0, "episode01");
+        assert_eq!(parsed.1, "");
+        assert_eq!(parsed.2, "srt");
+    }
+
+    #[test]
+    fn matches_attachment_with_nonstandard_suffix() {
+        let matched = match_page_attachment_to_base(
+            "episode01.chs[DandanID_danmu].ass",
+            "episode01",
+        )
+        .unwrap();
+        assert_eq!(matched.0, "");
+        assert_eq!(matched.1, "ass");
+    }
+
+    #[test]
+    fn matches_attachment_with_non_ascii_descriptor_suffix() {
+        let matched = match_page_attachment_to_base(
+            "episode01.chinese(简).srt",
+            "episode01",
+        )
+        .unwrap();
+        assert_eq!(matched.0, "");
+        assert_eq!(matched.1, "srt");
+    }
+
+    #[test]
+    fn extracts_language_from_multi_suffix_attachment() {
+        let matched = match_page_attachment_to_base(
+            "episode01.default.zh-cn.ass",
+            "episode01",
+        )
+        .unwrap();
+        assert_eq!(matched.0, "zh-cn");
+        assert_eq!(matched.1, "ass");
+    }
 }
 
 unsafe fn read_guest_bytes<'a>(ptr: i32, len: i32) -> &'a [u8] {
