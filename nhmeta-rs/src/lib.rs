@@ -23,6 +23,7 @@ const USER_AGENT: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 const DEFAULT_TIMEOUT_MS: i32 = 30_000;
 const MAX_REDIRECTS: usize = 5;
+const AUTH_KEY_COOKIE_NAME: &str = "__lanlu_nh_api_key";
 
 #[cfg(target_arch = "wasm32")]
 #[link(wasm_import_module = "wasmedge_host")]
@@ -219,6 +220,7 @@ fn execute_plugin(input: PluginInput) -> Result<Value, String> {
         .to_string();
 
     let cookie_header = build_cookie_header_for_nh(&input.login_cookies);
+    let auth_header = build_api_key_authorization_for_nh(&input.login_cookies);
 
     let gallery_id = extract_gallery_id(&input.oneshot_param)
         .or_else(|| extract_gallery_id_from_source_tag(&existing_tags))
@@ -227,7 +229,9 @@ fn execute_plugin(input: PluginInput) -> Result<Value, String> {
             if title.is_empty() {
                 None
             } else {
-                search_gallery_id_by_title(&title, &cookie_header).ok().flatten()
+                search_gallery_id_by_title(&title, &cookie_header, auth_header.as_deref())
+                    .ok()
+                    .flatten()
             }
         });
 
@@ -237,7 +241,12 @@ fn execute_plugin(input: PluginInput) -> Result<Value, String> {
     HostBridge::log(1, &format!("nhmeta-rs resolved gallery_id={gallery_id}"));
 
     HostBridge::progress(30, &format!("获取画廊 {} 元数据...", gallery_id));
-    let (next_title, tags_csv, updated_at) = fetch_gallery_metadata(&gallery_id, add_uploaded, &cookie_header)?;
+    let (next_title, tags_csv, updated_at) = fetch_gallery_metadata(
+        &gallery_id,
+        add_uploaded,
+        &cookie_header,
+        auth_header.as_deref(),
+    )?;
 
     if !next_title.trim().is_empty() {
         metadata.insert("title".to_string(), Value::String(next_title));
@@ -282,40 +291,46 @@ fn extract_gallery_id_from_title(title: &str) -> Option<String> {
 }
 
 fn sanitize_search_title(title: &str) -> String {
-    title.replace(['-', '\''], " ").trim().to_string()
+    title.trim().to_string()
 }
 
-fn search_gallery_id_by_title(title: &str, cookie_header: &str) -> Result<Option<String>, String> {
+fn search_gallery_id_by_title(
+    title: &str,
+    cookie_header: &str,
+    auth_header: Option<&str>,
+) -> Result<Option<String>, String> {
     let q = sanitize_search_title(title);
     if q.is_empty() {
         return Ok(None);
     }
 
-    let url = format!("https://nhentai.net/search/?q={}", urlencoding::encode(&q));
+    let url = format!(
+        "https://nhentai.net/api/v2/search?query={}",
+        urlencoding::encode(&q)
+    );
     let mut headers = default_headers();
     if !cookie_header.is_empty() {
         headers.push(("Cookie".to_string(), cookie_header.to_string()));
     }
+    if let Some(auth) = auth_header {
+        headers.push(("Authorization".to_string(), auth.to_string()));
+    }
     HostBridge::log(1, &format!("nhmeta-rs GET search {}", url));
     let response = http_get_text_with_retry(&url, &headers, 4)?;
-    HostBridge::log(1, &format!("nhmeta-rs search response status={}", response.status));
+    HostBridge::log(
+        1,
+        &format!("nhmeta-rs search response status={}", response.status),
+    );
     if !(200..300).contains(&response.status) {
         return Ok(None);
     }
 
-    if looks_like_cloudflare_block(&response.body_text) {
-        return Err("Cloudflare protection detected. Please configure nhlogin cookies (cf_clearance).".to_string());
-    }
-
-    let re = Regex::new(r#"class=\"cover\"[^>]*href=\"([^\"]+)\""#)
-        .map_err(|e| e.to_string())?;
-    if let Some(caps) = re.captures(&response.body_text) {
-        if let Some(href) = caps.get(1) {
-            let re_id = Regex::new(r"/g/(\d+)/").map_err(|e| e.to_string())?;
-            if let Some(id_caps) = re_id.captures(href.as_str()) {
-                if let Some(id) = id_caps.get(1) {
-                    return Ok(Some(id.as_str().to_string()));
-                }
+    let search_json: Value = serde_json::from_str(&response.body_text)
+        .map_err(|e| format!("Failed to parse nHentai search response: {e}"))?;
+    if let Some(results) = search_json.get("result").and_then(Value::as_array) {
+        for gallery in results {
+            if let Some(id) = gallery_json_id(gallery.get("id")) {
+                return Ok(Some(id));
             }
         }
     }
@@ -327,37 +342,32 @@ fn fetch_gallery_metadata(
     gallery_id: &str,
     add_uploaded: bool,
     cookie_header: &str,
+    auth_header: Option<&str>,
 ) -> Result<(String, String, Option<String>), String> {
-    let url = format!("https://nhentai.net/g/{gallery_id}/");
+    let url = format!("https://nhentai.net/api/v2/galleries/{gallery_id}");
     let mut headers = default_headers();
     if !cookie_header.is_empty() {
         headers.push(("Cookie".to_string(), cookie_header.to_string()));
     }
+    if let Some(auth) = auth_header {
+        headers.push(("Authorization".to_string(), auth.to_string()));
+    }
     HostBridge::log(1, &format!("nhmeta-rs GET gallery {}", url));
     let response = http_get_text_with_retry(&url, &headers, 4)?;
-    HostBridge::log(1, &format!("nhmeta-rs gallery response status={}", response.status));
+    HostBridge::log(
+        1,
+        &format!("nhmeta-rs gallery response status={}", response.status),
+    );
 
     if response.status == 404 {
         return Err(format!("Gallery not found: {gallery_id}"));
-    }
-    if response.status == 403 {
-        return Err(
-            "Blocked by Cloudflare. Please configure nhlogin cookies (cf_clearance) and retry."
-                .to_string(),
-        );
     }
     if !(200..300).contains(&response.status) {
         return Err(format!("Failed to fetch gallery: HTTP {}", response.status));
     }
 
-    if looks_like_cloudflare_block(&response.body_text) {
-        return Err(
-            "Cloudflare protection detected. Please configure nhlogin cookies (cf_clearance) and retry."
-                .to_string(),
-        );
-    }
-
-    let gallery = extract_gallery_json_from_html(&response.body_text)?;
+    let gallery: Value = serde_json::from_str(&response.body_text)
+        .map_err(|e| format!("Failed to parse nHentai gallery response: {e}"))?;
     let title = pick_title_from_gallery_json(&gallery, gallery_id);
     let (tags, updated_at) = build_tags_from_gallery_json(&gallery, gallery_id, add_uploaded);
     Ok((title, tags, updated_at))
@@ -373,7 +383,10 @@ fn http_get_text_with_retry(
         match http_get_text(url, headers) {
             Ok(v) => {
                 if attempt > 0 {
-                    HostBridge::log(1, &format!("nhmeta-rs retry succeeded attempt={attempt} url={url}"));
+                    HostBridge::log(
+                        1,
+                        &format!("nhmeta-rs retry succeeded attempt={attempt} url={url}"),
+                    );
                 }
                 return Ok(v);
             }
@@ -403,23 +416,19 @@ fn is_retryable_network_error(err: &str) -> bool {
         || s.contains("interrupted")
 }
 
-fn extract_gallery_json_from_html(html: &str) -> Result<Value, String> {
-    let re = Regex::new(
-        r#"window\._gallery\s*=\s*JSON\.parse\(\s*(\"(?:\\.|[^\"\\])*\")\s*\)\s*;"#,
-    )
-    .map_err(|e| e.to_string())?;
-    let caps = re
-        .captures(html)
-        .ok_or_else(|| "Failed to parse gallery metadata (missing embedded JSON)".to_string())?;
-    let quoted = caps
-        .get(1)
-        .ok_or_else(|| "Failed to parse gallery metadata (json string missing)".to_string())?
-        .as_str();
-
-    let json_string: String = serde_json::from_str(quoted)
-        .map_err(|e| format!("Failed to decode embedded gallery JSON string: {e}"))?;
-    serde_json::from_str::<Value>(&json_string)
-        .map_err(|e| format!("Failed to parse embedded gallery JSON: {e}"))
+fn gallery_json_id(value: Option<&Value>) -> Option<String> {
+    match value? {
+        Value::String(v) => {
+            let trimmed = v.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        }
+        Value::Number(v) => Some(v.to_string()),
+        _ => None,
+    }
 }
 
 fn build_tags_from_gallery_json(
@@ -458,7 +467,9 @@ fn build_tags_from_gallery_json(
     }
 
     let updated_at = if add_uploaded {
-        gallery.get("upload_date").and_then(format_uploaded_at_value)
+        gallery
+            .get("upload_date")
+            .and_then(format_uploaded_at_value)
     } else {
         None
     };
@@ -505,16 +516,10 @@ fn pick_title_from_gallery_json(gallery: &Value, gallery_id: &str) -> String {
     format!("Gallery {gallery_id}")
 }
 
-fn looks_like_cloudflare_block(html: &str) -> bool {
-    let lc = html.to_ascii_lowercase();
-    lc.contains("just a moment")
-        || lc.contains("checking your browser")
-        || lc.contains("cf-browser-verification")
-}
-
 fn build_cookie_header_for_nh(cookies: &[LoginCookie]) -> String {
     cookies
         .iter()
+        .filter(|c| !c.name.trim().starts_with("__lanlu_"))
         .filter(|c| {
             let d = c.domain.trim().to_ascii_lowercase();
             d.is_empty() || d == "nhentai.net" || d.ends_with(".nhentai.net")
@@ -557,7 +562,10 @@ fn metadata_tags_to_csv(metadata: &Map<String, Value>) -> String {
             .iter()
             .filter_map(|v| match v {
                 Value::String(s) => Some(s.trim().to_string()),
-                Value::Object(o) => o.get("name").and_then(Value::as_str).map(|s| s.trim().to_string()),
+                Value::Object(o) => o
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .map(|s| s.trim().to_string()),
                 _ => None,
             })
             .filter(|s| !s.is_empty())
@@ -577,12 +585,25 @@ fn metadata_tags_from_csv(csv: &str) -> Value {
     Value::Array(tags)
 }
 
+fn build_api_key_authorization_for_nh(cookies: &[LoginCookie]) -> Option<String> {
+    cookies.iter().find_map(|cookie| {
+        let name = cookie.name.trim();
+        let value = cookie.value.trim();
+        if name == AUTH_KEY_COOKIE_NAME && !value.is_empty() {
+            Some(format!("Key {value}"))
+        } else {
+            None
+        }
+    })
+}
+
 fn default_headers() -> Vec<(String, String)> {
     vec![
         ("User-Agent".to_string(), USER_AGENT.to_string()),
         (
             "Accept".to_string(),
-            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8".to_string(),
+            "application/json,text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+                .to_string(),
         ),
         ("Accept-Language".to_string(), "en-US,en;q=0.5".to_string()),
         ("Referer".to_string(), "https://nhentai.net/".to_string()),
@@ -840,8 +861,8 @@ fn connect_tls_stream(host: &str, port: u16) -> Result<HttpStream, String> {
     let config = ClientConfig::builder()
         .with_root_certificates(roots)
         .with_no_client_auth();
-    let server_name = ServerName::try_from(host.to_string())
-        .map_err(|_| format!("invalid dns name: {host}"))?;
+    let server_name =
+        ServerName::try_from(host.to_string()).map_err(|_| format!("invalid dns name: {host}"))?;
     let conn = ClientConnection::new(Arc::new(config), server_name).map_err(|e| e.to_string())?;
     Ok(HttpStream::Tls(Box::new(StreamOwned::new(conn, tcp))))
 }
@@ -862,10 +883,7 @@ fn parse_proxy_endpoint(raw: &str) -> Option<(String, u16)> {
     if trimmed.is_empty() {
         return None;
     }
-    let without_scheme = trimmed
-        .split_once("://")
-        .map(|(_, v)| v)
-        .unwrap_or(trimmed);
+    let without_scheme = trimmed.split_once("://").map(|(_, v)| v).unwrap_or(trimmed);
     let authority = without_scheme.split('/').next()?.trim();
     let host_port = authority
         .rsplit_once('@')
@@ -914,7 +932,9 @@ fn establish_proxy_connect_tunnel(
     Ok(())
 }
 
-fn read_http_response(stream: &mut HttpStream) -> Result<(u16, Vec<(String, String)>, Vec<u8>), String> {
+fn read_http_response(
+    stream: &mut HttpStream,
+) -> Result<(u16, Vec<(String, String)>, Vec<u8>), String> {
     let mut buf = Vec::with_capacity(16 * 1024);
     let mut chunk = [0u8; 16 * 1024];
     let header_end = loop {
@@ -1053,7 +1073,11 @@ fn decode_chunked_body(raw: &[u8]) -> Result<Vec<u8>, String> {
     Err("invalid chunked body: missing final zero chunk".to_string())
 }
 
-fn read_stream_chunk(stream: &mut HttpStream, buf: &mut [u8], allow_tls_eof: bool) -> Result<usize, String> {
+fn read_stream_chunk(
+    stream: &mut HttpStream,
+    buf: &mut [u8],
+    allow_tls_eof: bool,
+) -> Result<usize, String> {
     let mut retries = 0u8;
     loop {
         match stream.read(buf) {
@@ -1100,7 +1124,9 @@ fn header_value<'a>(headers: &'a [(String, String)], key: &str) -> Option<&'a st
 
 #[cfg(not(target_arch = "wasm32"))]
 fn resolve_socket_addr(host: &str, port: u16) -> Result<SocketAddr, String> {
-    let mut addrs = format!("{host}:{port}").to_socket_addrs().map_err(|e| e.to_string())?;
+    let mut addrs = format!("{host}:{port}")
+        .to_socket_addrs()
+        .map_err(|e| e.to_string())?;
     addrs
         .next()
         .ok_or_else(|| format!("unable to resolve host: {host}:{port}"))

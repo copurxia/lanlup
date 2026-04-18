@@ -22,6 +22,7 @@ const USER_AGENT: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 const HTTP_TIMEOUT_MS: i32 = 15000;
 const MAX_REDIRECTS: usize = 5;
+const AUTH_KEY_COOKIE_NAME: &str = "__lanlu_nh_api_key";
 
 #[cfg(target_arch = "wasm32")]
 #[link(wasm_import_module = "wasmedge_host")]
@@ -79,9 +80,7 @@ struct GalleryData {
     id: i64,
     name: String,
     pretty_name: String,
-    media_id: String,
-    pages: usize,
-    ext: Vec<String>,
+    page_paths: Vec<String>,
 }
 
 struct HostBridge;
@@ -250,20 +249,20 @@ fn run_download(input: &PluginInput) -> Value {
         None => return output_err("Invalid nhentai URL. Use https://nhentai.net/g/123456/"),
     };
     let gallery_url = format!("https://nhentai.net/g/{gallery_id}/");
-    HostBridge::progress(1, "Fetching gallery page...");
+    let gallery_api_url = format!("https://nhentai.net/api/v2/galleries/{gallery_id}");
+    let auth_headers = build_nh_api_auth_headers(&input.login_cookies);
+    HostBridge::progress(1, "Fetching gallery metadata...");
     let resp = match fetch_text_direct(
-        &gallery_url,
+        &gallery_api_url,
         Some("https://nhentai.net/"),
         &input.login_cookies,
+        &auth_headers,
     ) {
         Ok(v) => v,
         Err(e) => return output_err(&format!("Failed to fetch gallery: {e}")),
     };
     if resp.0 == 404 {
         return output_err(&format!("Gallery not found: {gallery_id}"));
-    }
-    if resp.0 == 403 {
-        return output_err("Blocked by Cloudflare. Please configure login cookies.");
     }
     if resp.0 >= 400 {
         return output_err(&format!("Failed to fetch gallery: status {}", resp.0));
@@ -273,7 +272,14 @@ fn run_download(input: &PluginInput) -> Value {
         Some(v) => v,
         None => return output_err("Failed to parse gallery information"),
     };
-    HostBridge::log(1, &format!("parsed gallery name={} pages={}", gallery.name, gallery.pages));
+    HostBridge::log(
+        1,
+        &format!(
+            "parsed gallery name={} pages={}",
+            gallery.name,
+            gallery.page_paths.len()
+        ),
+    );
 
     let safe = sanitize_filename(if gallery.pretty_name.is_empty() {
         &gallery.name
@@ -289,14 +295,20 @@ fn run_download(input: &PluginInput) -> Value {
 
     let mut downloaded_count = 0usize;
     let mut failed_count = 0usize;
-    let total = gallery.pages.max(1);
-    for idx in 1..=gallery.pages {
-        let ext = gallery.ext.get(idx - 1).cloned().unwrap_or_else(|| "jpg".to_string());
-        let file_name = format!("{idx}.{ext}");
-        let image_url = format!("https://i1.nhentai.net/galleries/{}/{}.{}", gallery.media_id, idx, ext);
+    let total = gallery.page_paths.len().max(1);
+    for (offset, page_path) in gallery.page_paths.iter().enumerate() {
+        let idx = offset + 1;
+        let file_name = gallery_page_filename(page_path, idx);
+        let image_url = gallery_page_url(page_path);
         let mut local_path = PathBuf::from(&plugin_dir);
         local_path.push(file_name);
-        match download_file_direct(&image_url, &gallery_url, &input.login_cookies, &local_path) {
+        match download_file_direct(
+            &image_url,
+            &gallery_url,
+            &input.login_cookies,
+            &local_path,
+            &[],
+        ) {
             Ok(()) => downloaded_count += 1,
             Err(_) => failed_count += 1,
         }
@@ -339,15 +351,8 @@ fn extract_gallery_id(url: &str) -> Option<i64> {
     caps.get(1)?.as_str().parse::<i64>().ok()
 }
 
-fn parse_gallery(html: &str, gallery_id: i64) -> Option<GalleryData> {
-    let reg = Regex::new(r#"window\._gallery\s*=\s*JSON\.parse\(\s*"(.+?)"\s*\)\s*;"#).ok()?;
-    let caps = reg.captures(html)?;
-    let raw_inner = caps.get(1)?.as_str();
-    let quoted = format!("\"{}\"", raw_inner);
-    let decoded: String = serde_json::from_str(&quoted).ok()?;
-    let gallery: Value = serde_json::from_str(&decoded).ok()?;
-
-    let media_id = gallery.get("media_id")?.as_str()?.to_string();
+fn parse_gallery(json_text: &str, gallery_id: i64) -> Option<GalleryData> {
+    let gallery: Value = serde_json::from_str(json_text).ok()?;
     let title = gallery.get("title").cloned().unwrap_or(Value::Null);
     let pretty_name = title
         .get("pretty")
@@ -360,37 +365,76 @@ fn parse_gallery(html: &str, gallery_id: i64) -> Option<GalleryData> {
         .or_else(|| title.get("japanese").and_then(Value::as_str))
         .unwrap_or("Untitled")
         .to_string();
-    let pages = gallery.get("num_pages")?.as_u64()? as usize;
 
-    let mut ext = Vec::new();
-    if let Some(items) = gallery
-        .get("images")
-        .and_then(|x| x.get("pages"))
+    let mut page_paths = gallery
+        .get("pages")
         .and_then(Value::as_array)
-    {
-        for page in items {
-            let code = page.get("t").and_then(Value::as_str).unwrap_or("j");
-            ext.push(match code {
-                "j" => "jpg".to_string(),
-                "p" => "png".to_string(),
-                "g" => "gif".to_string(),
-                "w" => "webp".to_string(),
-                _ => "jpg".to_string(),
-            });
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|page| page.get("path").and_then(Value::as_str))
+                .map(|path| path.trim().trim_start_matches('/').to_string())
+                .filter(|path| !path.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    if page_paths.is_empty() {
+        let media_id = gallery.get("media_id")?.as_str()?.to_string();
+        if let Some(items) = gallery
+            .get("images")
+            .and_then(|x| x.get("pages"))
+            .and_then(Value::as_array)
+        {
+            for (index, page) in items.iter().enumerate() {
+                let ext = match page.get("t").and_then(Value::as_str).unwrap_or("j") {
+                    "j" => "jpg",
+                    "p" => "png",
+                    "g" => "gif",
+                    "w" => "webp",
+                    _ => "jpg",
+                };
+                page_paths.push(format!("galleries/{media_id}/{}.{}", index + 1, ext));
+            }
         }
     }
-    while ext.len() < pages {
-        ext.push("jpg".to_string());
+
+    if page_paths.is_empty() {
+        return None;
     }
 
     Some(GalleryData {
         id: gallery_id,
         name,
         pretty_name,
-        media_id,
-        pages,
-        ext,
+        page_paths,
     })
+}
+
+fn gallery_page_url(page_path: &str) -> String {
+    let normalized = page_path.trim();
+    if normalized.starts_with("https://") || normalized.starts_with("http://") {
+        return normalized.to_string();
+    }
+    format!(
+        "https://i.nhentai.net/{}",
+        normalized.trim_start_matches('/')
+    )
+}
+
+fn gallery_page_filename(page_path: &str, index: usize) -> String {
+    let normalized = page_path
+        .trim()
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or_default()
+        .trim();
+    if normalized.is_empty() {
+        format!("{index}.jpg")
+    } else {
+        normalized.to_string()
+    }
 }
 
 fn sanitize_filename(input: &str) -> String {
@@ -438,11 +482,15 @@ fn build_cookie_header(url: &str, cookies: &[LoginCookie]) -> String {
     for c in cookies {
         let name = c.name.trim();
         let value = c.value.trim();
-        if name.is_empty() {
+        if name.is_empty() || name.starts_with("__lanlu_") {
             continue;
         }
         let domain = c.domain.trim().trim_start_matches('.').to_ascii_lowercase();
-        if !domain.is_empty() && !host.is_empty() && host != domain && !host.ends_with(&format!(".{domain}")) {
+        if !domain.is_empty()
+            && !host.is_empty()
+            && host != domain
+            && !host.ends_with(&format!(".{domain}"))
+        {
             continue;
         }
         pairs.push(format!("{name}={value}"));
@@ -450,16 +498,33 @@ fn build_cookie_header(url: &str, cookies: &[LoginCookie]) -> String {
     pairs.join("; ")
 }
 
+fn build_nh_api_auth_headers(cookies: &[LoginCookie]) -> Vec<(String, String)> {
+    cookies
+        .iter()
+        .find_map(|cookie| {
+            let name = cookie.name.trim();
+            let value = cookie.value.trim();
+            if name == AUTH_KEY_COOKIE_NAME && !value.is_empty() {
+                Some(vec![("Authorization".to_string(), format!("Key {value}"))])
+            } else {
+                None
+            }
+        })
+        .unwrap_or_default()
+}
+
 fn fetch_text_direct(
     url: &str,
     referer: Option<&str>,
     cookies: &[LoginCookie],
+    extra_headers: &[(String, String)],
 ) -> Result<(u16, String), String> {
     let response = http_get(
         url,
         referer,
         cookies,
-        "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "application/json,text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        extra_headers,
     )?;
     let text = String::from_utf8_lossy(&response.body).to_string();
     Ok((response.status, text))
@@ -470,11 +535,12 @@ fn download_file_direct(
     referer: &str,
     cookies: &[LoginCookie],
     output: &PathBuf,
+    extra_headers: &[(String, String)],
 ) -> Result<(), String> {
     if let Some(parent) = output.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    let resp = http_get(url, Some(referer), cookies, "image/*,*/*")?;
+    let resp = http_get(url, Some(referer), cookies, "image/*,*/*", extra_headers)?;
     if resp.status >= 400 {
         return Err(format!("HTTP {}", resp.status));
     }
@@ -495,11 +561,18 @@ fn http_get(
     referer: Option<&str>,
     cookies: &[LoginCookie],
     accept: &str,
+    extra_headers: &[(String, String)],
 ) -> Result<HttpResponse, String> {
     let mut current_url = url.to_string();
     let mut current_referer = referer.map(|v| v.to_string());
     for _ in 0..=MAX_REDIRECTS {
-        let response = http_get_once(&current_url, current_referer.as_deref(), cookies, accept)?;
+        let response = http_get_once(
+            &current_url,
+            current_referer.as_deref(),
+            cookies,
+            accept,
+            extra_headers,
+        )?;
         if is_redirect_status(response.status) {
             let location = find_header_value(&response.headers, "location")
                 .ok_or_else(|| format!("redirect {} without Location", response.status))?;
@@ -519,6 +592,7 @@ fn http_get_once(
     referer: Option<&str>,
     cookies: &[LoginCookie],
     accept: &str,
+    extra_headers: &[(String, String)],
 ) -> Result<HttpResponse, String> {
     let parsed = Url::parse(url).map_err(|e| format!("invalid url {url}: {e}"))?;
     let scheme = parsed.scheme();
@@ -558,6 +632,9 @@ fn http_get_once(
     }
     if !cookie_header.is_empty() {
         req.push_str(&format!("Cookie: {cookie_header}\r\n"));
+    }
+    for (name, value) in extra_headers {
+        req.push_str(&format!("{name}: {value}\r\n"));
     }
     req.push_str("\r\n");
 
@@ -682,7 +759,11 @@ fn read_all_from_stream<T: Read>(stream: &mut T) -> Result<Vec<u8>, String> {
     Ok(data)
 }
 
-fn read_https_response(stream: HostTcpStream, host: &str, request: &[u8]) -> Result<Vec<u8>, String> {
+fn read_https_response(
+    stream: HostTcpStream,
+    host: &str,
+    request: &[u8],
+) -> Result<Vec<u8>, String> {
     let server_name = ServerName::try_from(host.to_string())
         .map_err(|_| format!("invalid tls server name: {host}"))?;
     let conn = ClientConnection::new(tls_client_config().clone(), server_name)
@@ -790,7 +871,10 @@ fn content_length(headers: &[(String, String)]) -> Option<usize> {
 
 fn is_chunked(headers: &[(String, String)]) -> bool {
     find_header_value(headers, "transfer-encoding")
-        .map(|v| v.split(',').any(|part| part.trim().eq_ignore_ascii_case("chunked")))
+        .map(|v| {
+            v.split(',')
+                .any(|part| part.trim().eq_ignore_ascii_case("chunked"))
+        })
         .unwrap_or(false)
 }
 
@@ -832,8 +916,8 @@ fn plugin_info_json() -> Value {
         "namespace": "nhentai",
         "login_from": "nhlogin",
         "author": "Lanlu",
-        "version": "0.1.0",
-        "description": "Rust/WASM port of nhentai download plugin.",
+        "version": "0.2.0",
+        "description": "Rust/WASM nhentai downloader using the nHentai API.",
         "parameters": [],
         "url_regex": "https?://nhentai\\.net/g/\\d+/?",
         "permissions": [
