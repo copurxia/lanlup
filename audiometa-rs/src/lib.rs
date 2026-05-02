@@ -563,7 +563,8 @@ fn extract_archive_audio(
 
         let page_description = build_track_description(&parsed);
         let mut page_obj = Map::<String, Value>::new();
-        page_obj.insert("path".to_string(), Value::String(entry.clone()));
+        page_obj.insert("page_number".to_string(), Value::from((idx + 1) as i64));
+        page_obj.insert("entry_path".to_string(), Value::String(entry.clone()));
         if !parsed.title.trim().is_empty() {
             page_obj.insert("title".to_string(), Value::String(parsed.title.clone()));
         }
@@ -578,8 +579,14 @@ fn extract_archive_audio(
         }
         if let Some(lyrics) = &extracted_lyrics {
             page_obj.insert(
-                "lyrics".to_string(),
-                Value::String(lyrics.relative_path.clone()),
+                "attachments".to_string(),
+                Value::Array(vec![json!({
+                    "slot": "lyrics",
+                    "path": lyrics.relative_path.clone(),
+                    "name": attachment_name_from_path(&lyrics.relative_path),
+                    "kind": attachment_extension_from_path(&lyrics.relative_path),
+                    "mime_type": "text/plain",
+                })]),
             );
         }
         page_patches.push(Value::Object(page_obj));
@@ -970,6 +977,24 @@ fn format_runtime_path_for_host(path: &str) -> String {
         return trimmed.to_string();
     }
     format!("plugins/audiometa/{trimmed}")
+}
+
+fn attachment_name_from_path(path: &str) -> String {
+    let normalized = path.trim().replace('\\', "/");
+    normalized
+        .rsplit('/')
+        .next()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("attachment")
+        .to_string()
+}
+
+fn attachment_extension_from_path(path: &str) -> String {
+    let name = attachment_name_from_path(path);
+    name.rsplit_once('.')
+        .map(|(_, ext)| ext.trim().to_ascii_lowercase())
+        .filter(|ext| !ext.is_empty())
+        .unwrap_or_default()
 }
 
 fn build_runtime_output_name(output_prefix: &str, execution_tag: &str, ext: &str) -> String {
