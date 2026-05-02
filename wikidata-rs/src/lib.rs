@@ -201,12 +201,12 @@ pub extern "C" fn lanlu_plugin_last_error_len() -> i32 {
 
 fn plugin_info_json() -> Value {
     json!({
-        "name": "Wikidata",
+        "name": "Wikidata (Music)",
         "type": "metadata",
         "namespace": "wikidata",
         "author": "codex",
         "version": "0.1.0",
-        "description": "Fetches artist and creator entity metadata from Wikidata.",
+        "description": "Fetches music artist and creator entity metadata from Wikidata.",
         "parameters": [
             {"name": "language", "type": "string", "desc": "Preferred Wikidata language code.", "default_value": "zh"},
             {"name": "fallback_language", "type": "string", "desc": "Fallback Wikidata language code.", "default_value": "en"},
@@ -214,7 +214,7 @@ fn plugin_info_json() -> Value {
             {"name": "merge_existing_tags", "type": "bool", "desc": "Merge existing metadata tags into the result.", "default_value": "1"},
             {"name": "cache_image", "type": "bool", "desc": "Download Commons image into plugin cache.", "default_value": "1"}
         ],
-        "oneshot_arg": "Wikidata QID, Wikidata URL, or artist/creator search keyword",
+        "oneshot_arg": "Wikidata QID, Wikidata URL, or music artist/creator search keyword",
         "cooldown": 1,
         "permissions": [
             "metadata.read_input",
@@ -315,6 +315,8 @@ fn execute_plugin(input: PluginInput) -> Result<Value, String> {
     );
     metadata.remove("archive");
     metadata.remove("archive_id");
+    metadata.remove("children");
+    metadata.remove("pages");
     HostBridge::progress(100, "Wikidata 元数据完成");
     Ok(Value::Object(metadata))
 }
