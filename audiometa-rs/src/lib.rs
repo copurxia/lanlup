@@ -6,7 +6,6 @@ use std::alloc::{alloc, dealloc, Layout};
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
-use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::slice;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -234,12 +233,12 @@ fn plugin_info_json() -> Value {
         "type": "metadata",
         "namespace": "audiometa",
         "author": "codex",
-        "version": "0.1.0",
+        "version": "0.1.1",
         "description": "Extracts embedded tags from audio files (ID3/FLAC/Vorbis/MP4) using lofty.",
         "permissions": [
             "metadata.read_input",
             "archive.list_files",
-            "archive.read_entry_bytes",
+            "archive.export_entries",
             "tankoubon.list_archives",
             "log.write",
             "progress.report"
@@ -300,10 +299,22 @@ fn execute_plugin(input: PluginInput) -> Result<Value, String> {
     ]);
 
     if target_type == "tankoubon" || target_type == "tank" {
-        return execute_tankoubon_mode(target_id, &preferred, options, execution_tag.as_str(), input.metadata);
+        return execute_tankoubon_mode(
+            target_id,
+            &preferred,
+            options,
+            execution_tag.as_str(),
+            input.metadata,
+        );
     }
 
-    execute_archive_mode(target_id, &preferred, options, execution_tag.as_str(), input.metadata)
+    execute_archive_mode(
+        target_id,
+        &preferred,
+        options,
+        execution_tag.as_str(),
+        input.metadata,
+    )
 }
 
 fn execute_archive_mode(
@@ -390,7 +401,9 @@ fn execute_tankoubon_mode(
         .filter(|value| !value.is_empty())
         .collect::<Vec<_>>();
     if archive_ids.is_empty() {
-        return Err(format!("No member archives found in collection {tankoubon_id}"));
+        return Err(format!(
+            "No member archives found in collection {tankoubon_id}"
+        ));
     }
 
     let mut root_metadata = ensure_metadata_object(metadata_input);
@@ -406,10 +419,19 @@ fn execute_tankoubon_mode(
 
     for (index, archive_id) in archive_ids.iter().enumerate() {
         let percent = 10 + (((index + 1) * 80) / archive_ids.len()) as i32;
-        HostBridge::progress(percent.min(90), &format!("处理合集成员 {}/{}", index + 1, archive_ids.len()));
+        HostBridge::progress(
+            percent.min(90),
+            &format!("处理合集成员 {}/{}", index + 1, archive_ids.len()),
+        );
         let member_exec_tag = format!("{execution_tag}_v{}", index + 1);
         let extracted = extract_archive_audio(archive_id, preferred, options, &member_exec_tag)?;
-        merge_archive_tags(&mut aggregate_tags, &extracted.parsed, options, Some(&extracted.target_entry), Some(&extracted.target_source_name));
+        merge_archive_tags(
+            &mut aggregate_tags,
+            &extracted.parsed,
+            options,
+            Some(&extracted.target_entry),
+            Some(&extracted.target_source_name),
+        );
 
         if common_album.is_empty() && !extracted.parsed.album.trim().is_empty() {
             common_album = extracted.parsed.album.trim().to_string();
@@ -468,52 +490,73 @@ fn extract_archive_audio(
     let mut page_patches = Vec::<Value>::new();
     let mut target_parsed: Option<ParsedAudioTags> = None;
     let mut target_cover: Option<ExtractedCover> = None;
+    let exported_entries = export_audio_entries(archive_id, &audio_entries, options.levels_up)?;
 
     for (idx, entry) in audio_entries.iter().enumerate() {
-        let audio_bytes = match HostBridge::read_entry_bytes(archive_id, entry) {
-            Ok(b) => b,
-            Err(e) => {
+        let exported_relative_path = match exported_entries.get(&normalize_entry_key(entry)) {
+            Some(path) => path,
+            None => {
                 if normalize_entry_key(entry) == normalize_entry_key(&target_entry) {
-                    return Err(format!("failed to read target audio entry bytes: {e}"));
+                    return Err(format!(
+                        "failed to export target audio entry: entry={entry}"
+                    ));
                 }
-                HostBridge::log(2, &format!("skip entry: failed to read bytes for archive={archive_id}, entry={entry}: {e}"));
+                HostBridge::log(
+                    2,
+                    &format!("skip entry: not exported for archive={archive_id}, entry={entry}"),
+                );
                 continue;
             }
         };
+        let runtime_audio_path = format!("/plugin/{exported_relative_path}");
 
-        let parsed = match read_audio_tags_from_bytes(&audio_bytes) {
+        let parsed = match read_audio_tags(&runtime_audio_path) {
             Ok(v) => v,
             Err(e) => {
                 if normalize_entry_key(entry) == normalize_entry_key(&target_entry) {
                     return Err(e);
                 }
-                HostBridge::log(2, &format!("skip entry due to parse error archive={archive_id}, entry={entry}: {e}"));
+                HostBridge::log(
+                    2,
+                    &format!(
+                        "skip entry due to parse error archive={archive_id}, entry={entry}: {e}"
+                    ),
+                );
                 continue;
             }
         };
 
         let cover_prefix = format!("__embedded_cover_{}", idx + 1);
-        let extracted_cover = match extract_embedded_cover_from_bytes(
-            &audio_bytes,
+        let extracted_cover = match extract_embedded_cover(
+            &runtime_audio_path,
+            exported_relative_path,
             &cover_prefix,
             execution_tag,
         ) {
             Ok(v) => v,
             Err(e) => {
-                HostBridge::log(2, &format!("cover extract failed archive={archive_id}, entry={entry}: {e}"));
+                HostBridge::log(
+                    2,
+                    &format!("cover extract failed archive={archive_id}, entry={entry}: {e}"),
+                );
                 None
             }
         };
 
         let lyrics_prefix = format!("__embedded_lyrics_{}", idx + 1);
-        let extracted_lyrics = match extract_embedded_lyrics_from_bytes(
+        let extracted_lyrics = match extract_embedded_lyrics(
+            &runtime_audio_path,
+            exported_relative_path,
             &lyrics_prefix,
             parsed.lyrics.trim(),
             execution_tag,
         ) {
             Ok(v) => v,
             Err(e) => {
-                HostBridge::log(2, &format!("lyrics extract failed archive={archive_id}, entry={entry}: {e}"));
+                HostBridge::log(
+                    2,
+                    &format!("lyrics extract failed archive={archive_id}, entry={entry}: {e}"),
+                );
                 None
             }
         };
@@ -528,10 +571,16 @@ fn extract_archive_audio(
             page_obj.insert("description".to_string(), Value::String(page_description));
         }
         if let Some(cover) = &extracted_cover {
-            page_obj.insert("thumb".to_string(), Value::String(cover.relative_path.clone()));
+            page_obj.insert(
+                "thumb".to_string(),
+                Value::String(cover.relative_path.clone()),
+            );
         }
         if let Some(lyrics) = &extracted_lyrics {
-            page_obj.insert("lyrics".to_string(), Value::String(lyrics.relative_path.clone()));
+            page_obj.insert(
+                "lyrics".to_string(),
+                Value::String(lyrics.relative_path.clone()),
+            );
         }
         page_patches.push(Value::Object(page_obj));
 
@@ -551,6 +600,27 @@ fn extract_archive_audio(
         cover: target_cover,
         pages: page_patches,
     })
+}
+
+fn export_audio_entries(
+    archive_id: &str,
+    audio_entries: &[String],
+    levels_up: i64,
+) -> Result<HashMap<String, String>, String> {
+    let exported = HostBridge::export_entries(archive_id, audio_entries.to_vec(), levels_up)?;
+    let mut by_source = HashMap::<String, String>::new();
+    for file in exported.files {
+        let source_key = normalize_entry_key(&file.source);
+        let relative_path = file
+            .relative_path
+            .trim()
+            .trim_start_matches('/')
+            .to_string();
+        if !source_key.is_empty() && !relative_path.is_empty() {
+            by_source.insert(source_key, relative_path);
+        }
+    }
+    Ok(by_source)
 }
 
 fn merge_archive_tags(
@@ -590,12 +660,21 @@ fn merge_archive_tags(
 
 fn build_child_patch_value(index: usize, extracted: &ArchiveAudioExtraction) -> Value {
     let mut child = Map::<String, Value>::new();
-    child.insert("entity_type".to_string(), Value::String("archive".to_string()));
-    child.insert("entity_id".to_string(), Value::String(extracted.archive_id.clone()));
+    child.insert(
+        "entity_type".to_string(),
+        Value::String("archive".to_string()),
+    );
+    child.insert(
+        "entity_id".to_string(),
+        Value::String(extracted.archive_id.clone()),
+    );
     child.insert("volume_no".to_string(), Value::from((index + 1) as i64));
 
     if !extracted.parsed.title.trim().is_empty() {
-        child.insert("title".to_string(), Value::String(extracted.parsed.title.clone()));
+        child.insert(
+            "title".to_string(),
+            Value::String(extracted.parsed.title.clone()),
+        );
     }
 
     let summary = build_track_description(&extracted.parsed);
@@ -717,19 +796,14 @@ fn read_audio_tags(path: &str) -> Result<ParsedAudioTags, String> {
     parse_tags_from_tagged_file(&tagged_file)
 }
 
-fn read_audio_tags_from_bytes(bytes: &[u8]) -> Result<ParsedAudioTags, String> {
-    let cursor = Cursor::new(bytes);
-    let tagged_file = Probe::new(cursor)
-        .guess_file_type()
-        .map_err(|e| format!("failed to detect audio format: {e}"))?
-        .read()
-        .map_err(|e| format!("failed to parse tags from bytes: {e}"))?;
-    parse_tags_from_tagged_file(&tagged_file)
-}
-
-fn parse_tags_from_tagged_file(tagged_file: &lofty::file::TaggedFile) -> Result<ParsedAudioTags, String> {
+fn parse_tags_from_tagged_file(
+    tagged_file: &lofty::file::TaggedFile,
+) -> Result<ParsedAudioTags, String> {
     let mut out = ParsedAudioTags::default();
-    if let Some(primary) = tagged_file.primary_tag().or_else(|| tagged_file.first_tag()) {
+    if let Some(primary) = tagged_file
+        .primary_tag()
+        .or_else(|| tagged_file.first_tag())
+    {
         out.title = primary.title().unwrap_or_default().trim().to_string();
         out.artist = primary.artist().unwrap_or_default().trim().to_string();
         out.album = primary.album().unwrap_or_default().trim().to_string();
@@ -884,82 +958,6 @@ fn extract_embedded_lyrics(
 
     Ok(Some(ExtractedLyrics {
         relative_path: format_runtime_path_for_host(&rel_lyrics_path),
-    }))
-}
-
-/// 从内存 bytes 提取封面图，输出到 plugin 运行时根目录（/plugin/plugins/audiometa/）
-fn extract_embedded_cover_from_bytes(
-    audio_bytes: &[u8],
-    output_prefix: &str,
-    execution_tag: &str,
-) -> Result<Option<ExtractedCover>, String> {
-    let cursor = Cursor::new(audio_bytes);
-    let tagged_file = Probe::new(cursor)
-        .guess_file_type()
-        .map_err(|e| format!("failed to detect audio format for cover extraction: {e}"))?
-        .read()
-        .map_err(|e| format!("failed to parse tags for cover extraction: {e}"))?;
-
-    let picture_data = tagged_file
-        .primary_tag()
-        .and_then(|tag| tag.pictures().first())
-        .or_else(|| {
-            tagged_file
-                .first_tag()
-                .and_then(|tag| tag.pictures().first())
-        })
-        .map(|pic| pic.data().to_vec());
-
-    let Some(pic_bytes) = picture_data else {
-        return Ok(None);
-    };
-    if pic_bytes.is_empty() {
-        return Ok(None);
-    }
-
-    let ext = detect_image_extension(&pic_bytes);
-    let output_name = build_runtime_output_name(output_prefix, execution_tag, ext);
-    let runtime_dir = Path::new("/plugin/plugins/audiometa");
-    if let Err(e) = fs::create_dir_all(runtime_dir) {
-        return Err(format!("failed to create runtime output dir: {e}"));
-    }
-    let runtime_cover_path = runtime_dir.join(&output_name);
-    if let Err(e) = fs::write(&runtime_cover_path, &pic_bytes) {
-        return Err(format!("failed to write extracted cover: {e}"));
-    }
-
-    Ok(Some(ExtractedCover {
-        relative_path: format!("plugins/audiometa/{output_name}"),
-    }))
-}
-
-/// 从歌词文本生成 lrc/txt 文件，输出到 plugin 运行时根目录（/plugin/plugins/audiometa/）
-fn extract_embedded_lyrics_from_bytes(
-    output_prefix: &str,
-    lyrics_text: &str,
-    execution_tag: &str,
-) -> Result<Option<ExtractedLyrics>, String> {
-    let text = lyrics_text.trim();
-    if text.is_empty() {
-        return Ok(None);
-    }
-
-    let has_time_tag = text
-        .lines()
-        .any(|line| line.trim_start().starts_with('[') && line.contains(':') && line.contains(']'));
-    let ext = if has_time_tag { "lrc" } else { "txt" };
-    let output_name = build_runtime_output_name(output_prefix, execution_tag, ext);
-    let runtime_dir = Path::new("/plugin/plugins/audiometa");
-    if let Err(e) = fs::create_dir_all(runtime_dir) {
-        return Err(format!("failed to create runtime output dir: {e}"));
-    }
-    let runtime_lyrics_path = runtime_dir.join(&output_name);
-    if let Err(e) = fs::write(&runtime_lyrics_path, text.as_bytes()) {
-        return Err(format!("failed to write extracted lyrics: {e}"));
-    }
-
-    Ok(Some(ExtractedLyrics {
-        relative_path: format!("plugins/audiometa/{output_name}"),
     }))
 }
 
@@ -1225,44 +1223,6 @@ impl HostBridge {
         )
     }
 
-    fn read_entry_bytes(archive_id: &str, entry_name: &str) -> Result<Vec<u8>, String> {
-        #[derive(serde::Deserialize)]
-        struct EntryBytesResponse {
-            #[serde(default)]
-            data: String,
-        }
-        let resp = Self::call_typed::<EntryBytesResponse>(
-            "archive.read_entry_bytes",
-            json!({ "archive_id": archive_id, "entry_name": entry_name }),
-        )?;
-        if resp.data.is_empty() {
-            return Err(format!("archive.read_entry_bytes returned empty data for entry={entry_name}"));
-        }
-        // hex-decode
-        fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
-            if s.len() % 2 != 0 {
-                return Err("hex string has odd length".to_string());
-            }
-            let mut out = Vec::with_capacity(s.len() / 2);
-            let bytes = s.as_bytes();
-            for chunk in bytes.chunks(2) {
-                let hi = hex_nibble(chunk[0])?;
-                let lo = hex_nibble(chunk[1])?;
-                out.push((hi << 4) | lo);
-            }
-            Ok(out)
-        }
-        fn hex_nibble(b: u8) -> Result<u8, String> {
-            match b {
-                b'0'..=b'9' => Ok(b - b'0'),
-                b'a'..=b'f' => Ok(b - b'a' + 10),
-                b'A'..=b'F' => Ok(b - b'A' + 10),
-                _ => Err(format!("invalid hex char: {}", b as char)),
-            }
-        }
-        hex_decode(&resp.data)
-    }
-
     fn list_tankoubon_archives(tankoubon_id: &str) -> Result<Vec<String>, String> {
         let response = Self::call_typed::<TankoubonArchivesResponse>(
             "tankoubon.list_archives",
@@ -1273,7 +1233,8 @@ impl HostBridge {
 
     fn call_typed<T: DeserializeOwned>(method: &str, params: Value) -> Result<T, String> {
         let value = Self::call(method, params)?;
-        serde_json::from_value(value).map_err(|e| format!("invalid host response for {method}: {e}"))
+        serde_json::from_value(value)
+            .map_err(|e| format!("invalid host response for {method}: {e}"))
     }
 
     fn call(method: &str, params: Value) -> Result<Value, String> {
