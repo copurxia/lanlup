@@ -116,6 +116,8 @@ struct TankoubonArchivesResponse {
 struct ParsedAudioTags {
     title: String,
     artist: String,
+    album_artist: String,
+    composer: String,
     album: String,
     comment: String,
     genre: String,
@@ -147,8 +149,6 @@ struct AudioMetaOptions {
 #[derive(Debug, Clone)]
 struct ArchiveAudioExtraction {
     archive_id: String,
-    target_entry: String,
-    target_source_name: String,
     parsed: ParsedAudioTags,
     cover: Option<ExtractedCover>,
     pages: Vec<Value>,
@@ -233,7 +233,7 @@ fn plugin_info_json() -> Value {
         "type": "metadata",
         "namespace": "audiometa",
         "author": "codex",
-        "version": "0.1.1",
+        "version": "0.1.2",
         "description": "Extracts embedded tags from audio files (ID3/FLAC/Vorbis/MP4) using lofty.",
         "permissions": [
             "metadata.read_input",
@@ -330,6 +330,7 @@ fn execute_archive_mode(
     let mut metadata = ensure_metadata_object(metadata_input);
 
     let next_title = first_non_empty(&[
+        extracted.parsed.album.clone(),
         extracted.parsed.title.clone(),
         metadata_string(&metadata, "title"),
     ]);
@@ -350,6 +351,12 @@ fn execute_archive_mode(
     if options.include_artist_tag && !extracted.parsed.artist.is_empty() {
         tags.push(format!("artist:{}", extracted.parsed.artist));
     }
+    if options.include_artist_tag && !extracted.parsed.album_artist.is_empty() {
+        tags.push(format!("artist:{}", extracted.parsed.album_artist));
+    }
+    if options.include_artist_tag && !extracted.parsed.composer.is_empty() {
+        tags.push(format!("composer:{}", extracted.parsed.composer));
+    }
     if options.include_album_tag && !extracted.parsed.album.is_empty() {
         tags.push(format!("album:{}", extracted.parsed.album));
     }
@@ -360,10 +367,6 @@ fn execute_archive_mode(
         if let Some(year) = extracted.parsed.year {
             tags.push(format!("year:{year}"));
         }
-    }
-    tags.push(format!("audio_entry:{}", extracted.target_entry));
-    if !extracted.target_source_name.is_empty() {
-        tags.push(format!("audio_source:{}", extracted.target_source_name));
     }
     metadata.insert("tags".to_string(), json!(unique_strings(tags)));
 
@@ -413,9 +416,12 @@ fn execute_tankoubon_mode(
     } else {
         Vec::new()
     };
+    let mut creator_names = Vec::<String>::new();
     let mut common_album = String::new();
     let mut first_cover = String::new();
-    let mut first_summary = String::new();
+    let mut album_names = Vec::<String>::new();
+    let mut genre_names = Vec::<String>::new();
+    let mut year_values = Vec::<String>::new();
 
     for (index, archive_id) in archive_ids.iter().enumerate() {
         let percent = 10 + (((index + 1) * 80) / archive_ids.len()) as i32;
@@ -425,13 +431,17 @@ fn execute_tankoubon_mode(
         );
         let member_exec_tag = format!("{execution_tag}_v{}", index + 1);
         let extracted = extract_archive_audio(archive_id, preferred, options, &member_exec_tag)?;
-        merge_archive_tags(
-            &mut aggregate_tags,
-            &extracted.parsed,
-            options,
-            Some(&extracted.target_entry),
-            Some(&extracted.target_source_name),
+        merge_archive_tags(&mut aggregate_tags, &extracted.parsed, options);
+
+        push_unique_value(
+            &mut creator_names,
+            preferred_creator_name(&extracted.parsed),
         );
+        push_unique_value(&mut album_names, extracted.parsed.album.trim().to_string());
+        push_unique_value(&mut genre_names, extracted.parsed.genre.trim().to_string());
+        if let Some(year) = extracted.parsed.year {
+            push_unique_value(&mut year_values, year.to_string());
+        }
 
         if common_album.is_empty() && !extracted.parsed.album.trim().is_empty() {
             common_album = extracted.parsed.album.trim().to_string();
@@ -441,21 +451,24 @@ fn execute_tankoubon_mode(
                 first_cover = cover.relative_path.clone();
             }
         }
-        if first_summary.is_empty() {
-            let summary = build_track_description(&extracted.parsed);
-            if !summary.is_empty() {
-                first_summary = summary;
-            }
-        }
 
         children.push(build_child_patch_value(index, &extracted));
     }
 
-    if metadata_string(&root_metadata, "title").is_empty() && !common_album.is_empty() {
-        root_metadata.insert("title".to_string(), Value::String(common_album));
+    let creator_title = join_limited(&creator_names, 4);
+    let next_title = first_non_empty(&[
+        creator_title.clone(),
+        common_album.clone(),
+        metadata_string(&root_metadata, "title"),
+    ]);
+    if !next_title.is_empty() {
+        root_metadata.insert("title".to_string(), Value::String(next_title));
     }
-    if metadata_string(&root_metadata, "description").is_empty() && !first_summary.is_empty() {
-        root_metadata.insert("description".to_string(), Value::String(first_summary));
+
+    let summary =
+        build_collection_description(&creator_names, &album_names, &genre_names, &year_values);
+    if !summary.is_empty() {
+        root_metadata.insert("description".to_string(), Value::String(summary));
     }
     root_metadata.insert("tags".to_string(), json!(unique_strings(aggregate_tags)));
     if !first_cover.is_empty() {
@@ -601,8 +614,6 @@ fn extract_archive_audio(
         .ok_or_else(|| "Target audio was read but tags could not be parsed".to_string())?;
     Ok(ArchiveAudioExtraction {
         archive_id: archive_id.to_string(),
-        target_entry,
-        target_source_name: String::new(),
         parsed,
         cover: target_cover,
         pages: page_patches,
@@ -634,11 +645,15 @@ fn merge_archive_tags(
     aggregate_tags: &mut Vec<String>,
     parsed: &ParsedAudioTags,
     options: AudioMetaOptions,
-    target_entry: Option<&str>,
-    target_source_name: Option<&str>,
 ) {
     if options.include_artist_tag && !parsed.artist.is_empty() {
         aggregate_tags.push(format!("artist:{}", parsed.artist));
+    }
+    if options.include_artist_tag && !parsed.album_artist.is_empty() {
+        aggregate_tags.push(format!("artist:{}", parsed.album_artist));
+    }
+    if options.include_artist_tag && !parsed.composer.is_empty() {
+        aggregate_tags.push(format!("composer:{}", parsed.composer));
     }
     if options.include_album_tag && !parsed.album.is_empty() {
         aggregate_tags.push(format!("album:{}", parsed.album));
@@ -649,18 +664,6 @@ fn merge_archive_tags(
     if options.include_year_tag {
         if let Some(year) = parsed.year {
             aggregate_tags.push(format!("year:{year}"));
-        }
-    }
-    if let Some(entry) = target_entry {
-        let trimmed = entry.trim();
-        if !trimmed.is_empty() {
-            aggregate_tags.push(format!("audio_entry:{trimmed}"));
-        }
-    }
-    if let Some(source_name) = target_source_name {
-        let trimmed = source_name.trim();
-        if !trimmed.is_empty() {
-            aggregate_tags.push(format!("audio_source:{trimmed}"));
         }
     }
 }
@@ -677,11 +680,12 @@ fn build_child_patch_value(index: usize, extracted: &ArchiveAudioExtraction) -> 
     );
     child.insert("volume_no".to_string(), Value::from((index + 1) as i64));
 
-    if !extracted.parsed.title.trim().is_empty() {
-        child.insert(
-            "title".to_string(),
-            Value::String(extracted.parsed.title.clone()),
-        );
+    let child_title = first_non_empty(&[
+        extracted.parsed.album.clone(),
+        extracted.parsed.title.clone(),
+    ]);
+    if !child_title.is_empty() {
+        child.insert("title".to_string(), Value::String(child_title));
     }
 
     let summary = build_track_description(&extracted.parsed);
@@ -701,8 +705,6 @@ fn build_child_patch_value(index: usize, extracted: &ArchiveAudioExtraction) -> 
             include_year_tag: true,
             levels_up: 0,
         },
-        Some(&extracted.target_entry),
-        Some(&extracted.target_source_name),
     );
     child.insert("tags".to_string(), json!(unique_strings(child_tags)));
 
@@ -813,6 +815,16 @@ fn parse_tags_from_tagged_file(
     {
         out.title = primary.title().unwrap_or_default().trim().to_string();
         out.artist = primary.artist().unwrap_or_default().trim().to_string();
+        out.album_artist = primary
+            .get_string(&ItemKey::AlbumArtist)
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        out.composer = primary
+            .get_string(&ItemKey::Composer)
+            .unwrap_or_default()
+            .trim()
+            .to_string();
         out.album = primary.album().unwrap_or_default().trim().to_string();
         out.genre = primary.genre().unwrap_or_default().trim().to_string();
         out.comment = primary.comment().unwrap_or_default().trim().to_string();
@@ -851,6 +863,12 @@ fn build_track_description(parsed: &ParsedAudioTags) -> String {
     if !parsed.artist.is_empty() {
         summary_parts.push(format!("Artist: {}", parsed.artist));
     }
+    if !parsed.album_artist.is_empty() && parsed.album_artist != parsed.artist {
+        summary_parts.push(format!("Album Artist: {}", parsed.album_artist));
+    }
+    if !parsed.composer.is_empty() {
+        summary_parts.push(format!("Composer: {}", parsed.composer));
+    }
     if !parsed.album.is_empty() {
         summary_parts.push(format!("Album: {}", parsed.album));
     }
@@ -865,6 +883,32 @@ fn build_track_description(parsed: &ParsedAudioTags) -> String {
     }
     if !parsed.comment.is_empty() {
         summary_parts.push(parsed.comment.clone());
+    }
+    summary_parts.join("\n")
+}
+
+fn build_collection_description(
+    creators: &[String],
+    albums: &[String],
+    genres: &[String],
+    years: &[String],
+) -> String {
+    let mut summary_parts = Vec::<String>::new();
+    let creator_summary = join_limited(creators, 8);
+    if !creator_summary.is_empty() {
+        summary_parts.push(format!("Artist: {creator_summary}"));
+    }
+    let album_summary = join_limited(albums, 8);
+    if !album_summary.is_empty() {
+        summary_parts.push(format!("Albums: {album_summary}"));
+    }
+    let genre_summary = join_limited(genres, 6);
+    if !genre_summary.is_empty() {
+        summary_parts.push(format!("Genre: {genre_summary}"));
+    }
+    let year_summary = join_limited(years, 8);
+    if !year_summary.is_empty() {
+        summary_parts.push(format!("Years: {year_summary}"));
     }
     summary_parts.join("\n")
 }
@@ -1135,6 +1179,46 @@ fn unique_strings(values: Vec<String>) -> Vec<String> {
         }
     }
     out
+}
+
+fn push_unique_value(values: &mut Vec<String>, value: String) {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    let normalized = trimmed.to_ascii_lowercase();
+    if values
+        .iter()
+        .any(|existing| existing.trim().to_ascii_lowercase() == normalized)
+    {
+        return;
+    }
+    values.push(trimmed.to_string());
+}
+
+fn preferred_creator_name(parsed: &ParsedAudioTags) -> String {
+    first_non_empty(&[
+        parsed.album_artist.clone(),
+        parsed.artist.clone(),
+        parsed.composer.clone(),
+    ])
+}
+
+fn join_limited(values: &[String], limit: usize) -> String {
+    if values.is_empty() || limit == 0 {
+        return String::new();
+    }
+    let mut selected = values
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .take(limit)
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    if values.len() > limit {
+        selected.push(format!("+{} more", values.len() - limit));
+    }
+    selected.join(", ")
 }
 
 fn read_bool_param(params: &Value, key: &str, default_value: bool) -> bool {
