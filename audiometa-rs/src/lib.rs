@@ -1,3 +1,4 @@
+use lofty::picture::PictureType;
 use lofty::prelude::*;
 use lofty::probe::Probe;
 use serde::{de::DeserializeOwned, Deserialize};
@@ -151,6 +152,7 @@ struct ArchiveAudioExtraction {
     archive_id: String,
     parsed: ParsedAudioTags,
     cover: Option<ExtractedCover>,
+    artist_cover: Option<ExtractedCover>,
     pages: Vec<Value>,
 }
 
@@ -418,7 +420,7 @@ fn execute_tankoubon_mode(
     };
     let mut creator_names = Vec::<String>::new();
     let mut common_album = String::new();
-    let mut first_cover = String::new();
+    let mut first_artist_cover = String::new();
     let mut album_names = Vec::<String>::new();
     let mut genre_names = Vec::<String>::new();
     let mut year_values = Vec::<String>::new();
@@ -446,9 +448,9 @@ fn execute_tankoubon_mode(
         if common_album.is_empty() && !extracted.parsed.album.trim().is_empty() {
             common_album = extracted.parsed.album.trim().to_string();
         }
-        if first_cover.is_empty() {
-            if let Some(cover) = &extracted.cover {
-                first_cover = cover.relative_path.clone();
+        if first_artist_cover.is_empty() {
+            if let Some(cover) = &extracted.artist_cover {
+                first_artist_cover = cover.relative_path.clone();
             }
         }
 
@@ -471,12 +473,12 @@ fn execute_tankoubon_mode(
         root_metadata.insert("description".to_string(), Value::String(summary));
     }
     root_metadata.insert("tags".to_string(), json!(unique_strings(aggregate_tags)));
-    if !first_cover.is_empty() {
+    if !first_artist_cover.is_empty() {
         root_metadata.insert(
             "assets".to_string(),
             Value::Array(vec![json!({
                 "key": "cover",
-                "value": first_cover,
+                "value": first_artist_cover,
             })]),
         );
     }
@@ -503,6 +505,7 @@ fn extract_archive_audio(
     let mut page_patches = Vec::<Value>::new();
     let mut target_parsed: Option<ParsedAudioTags> = None;
     let mut target_cover: Option<ExtractedCover> = None;
+    let mut target_artist_cover: Option<ExtractedCover> = None;
     let exported_entries = export_audio_entries(archive_id, &audio_entries, options.levels_up)?;
 
     for (idx, entry) in audio_entries.iter().enumerate() {
@@ -551,6 +554,25 @@ fn extract_archive_audio(
                 HostBridge::log(
                     2,
                     &format!("cover extract failed archive={archive_id}, entry={entry}: {e}"),
+                );
+                None
+            }
+        };
+
+        let artist_cover_prefix = format!("__embedded_artist_cover_{}", idx + 1);
+        let extracted_artist_cover = match extract_embedded_artist_cover(
+            &runtime_audio_path,
+            exported_relative_path,
+            &artist_cover_prefix,
+            execution_tag,
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                HostBridge::log(
+                    2,
+                    &format!(
+                        "artist cover extract failed archive={archive_id}, entry={entry}: {e}"
+                    ),
                 );
                 None
             }
@@ -607,6 +629,7 @@ fn extract_archive_audio(
         if normalize_entry_key(entry) == normalize_entry_key(&target_entry) {
             target_parsed = Some(parsed);
             target_cover = extracted_cover;
+            target_artist_cover = extracted_artist_cover;
         }
     }
 
@@ -616,6 +639,7 @@ fn extract_archive_audio(
         archive_id: archive_id.to_string(),
         parsed,
         cover: target_cover,
+        artist_cover: target_artist_cover,
         pages: page_patches,
     })
 }
@@ -919,20 +943,72 @@ fn extract_embedded_cover(
     output_prefix: &str,
     execution_tag: &str,
 ) -> Result<Option<ExtractedCover>, String> {
+    extract_embedded_picture(
+        runtime_audio_path,
+        exported_relative_path,
+        output_prefix,
+        execution_tag,
+        &[PictureType::CoverFront],
+        true,
+    )
+}
+
+fn extract_embedded_artist_cover(
+    runtime_audio_path: &str,
+    exported_relative_path: &str,
+    output_prefix: &str,
+    execution_tag: &str,
+) -> Result<Option<ExtractedCover>, String> {
+    extract_embedded_picture(
+        runtime_audio_path,
+        exported_relative_path,
+        output_prefix,
+        execution_tag,
+        &[PictureType::LeadArtist, PictureType::Artist],
+        false,
+    )
+}
+
+fn extract_embedded_picture(
+    runtime_audio_path: &str,
+    exported_relative_path: &str,
+    output_prefix: &str,
+    execution_tag: &str,
+    preferred_types: &[PictureType],
+    fallback_first: bool,
+) -> Result<Option<ExtractedCover>, String> {
     let tagged_file = Probe::open(runtime_audio_path)
         .map_err(|e| format!("failed to open audio file for picture extraction: {e}"))?
         .read()
         .map_err(|e| format!("failed to parse tags for picture extraction: {e}"))?;
 
-    let picture_data = tagged_file
-        .primary_tag()
-        .and_then(|tag| tag.pictures().first())
-        .or_else(|| {
-            tagged_file
-                .first_tag()
-                .and_then(|tag| tag.pictures().first())
-        })
-        .map(|pic| pic.data().to_vec());
+    let mut picture_data: Option<Vec<u8>> = None;
+    for preferred_type in preferred_types {
+        for tag in tagged_file.tags() {
+            if let Some(pic) = tag
+                .pictures()
+                .iter()
+                .find(|pic| pic.pic_type() == *preferred_type)
+            {
+                picture_data = Some(pic.data().to_vec());
+                break;
+            }
+        }
+        if picture_data.is_some() {
+            break;
+        }
+    }
+    if picture_data.is_none() && fallback_first {
+        picture_data = tagged_file
+            .primary_tag()
+            .and_then(|tag| tag.pictures().first())
+            .or_else(|| {
+                tagged_file
+                    .first_tag()
+                    .and_then(|tag| tag.pictures().first())
+            })
+            .map(|pic| pic.data().to_vec());
+    }
 
     let Some(bytes) = picture_data else {
         return Ok(None);
@@ -951,7 +1027,7 @@ fn extract_embedded_cover(
     let runtime_cover_path = runtime_parent.join(&output_name);
 
     if let Err(e) = fs::write(&runtime_cover_path, &bytes) {
-        return Err(format!("failed to write extracted cover: {e}"));
+        return Err(format!("failed to write extracted picture: {e}"));
     }
 
     let rel_parent = Path::new(exported_relative_path)
