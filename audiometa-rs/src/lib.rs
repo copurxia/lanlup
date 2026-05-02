@@ -113,6 +113,16 @@ struct TankoubonArchivesResponse {
     archive_ids: Vec<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct EnsureTankoubonResponse {
+    #[serde(default)]
+    tankoubon_id: String,
+    #[serde(default)]
+    created: bool,
+    #[serde(default)]
+    attached: bool,
+}
+
 #[derive(Debug, Clone, Default)]
 struct ParsedAudioTags {
     title: String,
@@ -144,6 +154,7 @@ struct AudioMetaOptions {
     include_album_tag: bool,
     include_genre_tag: bool,
     include_year_tag: bool,
+    ensure_artist_collection: bool,
     levels_up: i64,
 }
 
@@ -235,13 +246,14 @@ fn plugin_info_json() -> Value {
         "type": "metadata",
         "namespace": "audiometa",
         "author": "codex",
-        "version": "0.1.2",
+        "version": "0.1.3",
         "description": "Extracts embedded tags from audio files (ID3/FLAC/Vorbis/MP4) using lofty.",
         "permissions": [
             "metadata.read_input",
             "archive.list_files",
             "archive.export_entries",
             "tankoubon.list_archives",
+            "tankoubon.ensure_named_collection_for_archive",
             "log.write",
             "progress.report"
         ],
@@ -252,7 +264,8 @@ fn plugin_info_json() -> Value {
             {"name": "include_artist_tag", "type": "bool", "desc": "Add artist:<name> into metadata.tags", "default_value": "1"},
             {"name": "include_album_tag", "type": "bool", "desc": "Add album:<name> into metadata.tags", "default_value": "1"},
             {"name": "include_genre_tag", "type": "bool", "desc": "Add genre:<name> into metadata.tags", "default_value": "1"},
-            {"name": "include_year_tag", "type": "bool", "desc": "Add year:<yyyy> into metadata.tags", "default_value": "1"}
+            {"name": "include_year_tag", "type": "bool", "desc": "Add year:<yyyy> into metadata.tags", "default_value": "1"},
+            {"name": "ensure_artist_collection", "type": "bool", "desc": "Create/reuse an artist Tankoubon and attach album archives", "default_value": "1"}
         ],
         "oneshot_arg": "Optional audio entry path (e.g. track01.flac)",
         "cooldown": 0,
@@ -292,6 +305,7 @@ fn execute_plugin(input: PluginInput) -> Result<Value, String> {
         include_album_tag: read_bool_param(&input.params, "include_album_tag", true),
         include_genre_tag: read_bool_param(&input.params, "include_genre_tag", true),
         include_year_tag: read_bool_param(&input.params, "include_year_tag", true),
+        ensure_artist_collection: read_bool_param(&input.params, "ensure_artist_collection", true),
         levels_up: read_i64_param(&input.params, "levels_up", 0).clamp(0, 8),
     };
     let execution_tag = resolve_execution_tag(&input.params);
@@ -328,6 +342,7 @@ fn execute_archive_mode(
 ) -> Result<Value, String> {
     HostBridge::progress(5, "扫描归档音频文件...");
     let extracted = extract_archive_audio(archive_id, preferred, options, execution_tag)?;
+    ensure_artist_collection_for_archive(archive_id, &extracted.parsed, options);
     HostBridge::progress(85, "合并元数据输出...");
     let mut metadata = ensure_metadata_object(metadata_input);
 
@@ -433,6 +448,7 @@ fn execute_tankoubon_mode(
         );
         let member_exec_tag = format!("{execution_tag}_v{}", index + 1);
         let extracted = extract_archive_audio(archive_id, preferred, options, &member_exec_tag)?;
+        ensure_artist_collection_for_archive(archive_id, &extracted.parsed, options);
         merge_archive_tags(&mut aggregate_tags, &extracted.parsed, options);
 
         push_unique_value(
@@ -692,6 +708,31 @@ fn merge_archive_tags(
     }
 }
 
+fn ensure_artist_collection_for_archive(
+    archive_id: &str,
+    parsed: &ParsedAudioTags,
+    options: AudioMetaOptions,
+) {
+    if !options.ensure_artist_collection {
+        return;
+    }
+    let artist_name = preferred_creator_name(parsed);
+    if artist_name.is_empty() {
+        return;
+    }
+    match HostBridge::ensure_named_collection_for_archive(archive_id, &artist_name) {
+        Ok(resp) => {
+            let _ = (&resp.tankoubon_id, resp.created, resp.attached);
+        }
+        Err(err) => HostBridge::log(
+            1,
+            &format!(
+                "failed to ensure artist collection archive={archive_id}, artist={artist_name}: {err}"
+            ),
+        ),
+    }
+}
+
 fn build_child_patch_value(index: usize, extracted: &ArchiveAudioExtraction) -> Value {
     let mut child = Map::<String, Value>::new();
     child.insert(
@@ -727,6 +768,7 @@ fn build_child_patch_value(index: usize, extracted: &ArchiveAudioExtraction) -> 
             include_album_tag: true,
             include_genre_tag: true,
             include_year_tag: true,
+            ensure_artist_collection: false,
             levels_up: 0,
         },
     );
@@ -1414,6 +1456,19 @@ impl HostBridge {
             json!({ "tankoubon_id": tankoubon_id }),
         )?;
         Ok(response.archive_ids)
+    }
+
+    fn ensure_named_collection_for_archive(
+        archive_id: &str,
+        name: &str,
+    ) -> Result<EnsureTankoubonResponse, String> {
+        Self::call_typed(
+            "tankoubon.ensure_named_collection_for_archive",
+            json!({
+                "archive_id": archive_id,
+                "name": name,
+            }),
+        )
     }
 
     fn call_typed<T: DeserializeOwned>(method: &str, params: Value) -> Result<T, String> {
