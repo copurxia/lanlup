@@ -48,18 +48,6 @@ jobs:
           path: ${{ inputs.plugin }}/${{ steps.locate.outputs.wasm_file }}
           if-no-files-found: error
 
-      - name: Compute release tag
-        if: github.event_name != 'pull_request'
-        id: release_meta
-        shell: bash
-        run: |
-          release_date="$(date -u +%Y%m%d)"
-          release_no="$(git rev-list --count "${GITHUB_SHA}")"
-          release_tag="daily-${release_date}-${release_no}"
-          echo "date=${release_date}" >> "${GITHUB_OUTPUT}"
-          echo "no=${release_no}" >> "${GITHUB_OUTPUT}"
-          echo "tag=${release_tag}" >> "${GITHUB_OUTPUT}"
-
       - name: Prepare release asset
         if: github.event_name != 'pull_request'
         id: release_asset
@@ -69,12 +57,12 @@ jobs:
           cp "${{ steps.locate.outputs.wasm_file }}" "${asset}"
           echo "file=${asset}" >> "${GITHUB_OUTPUT}"
 
-      - name: Publish to shared daily release
+      - name: Publish to shared nightly release
         if: github.event_name != 'pull_request'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.release_meta.outputs.tag }}
-          name: "Daily ${{ steps.release_meta.outputs.date }} #${{ steps.release_meta.outputs.no }}"
+          tag_name: nightly
+          name: nightly
           target_commitish: ${{ github.sha }}
           make_latest: false
           generate_release_notes: true
