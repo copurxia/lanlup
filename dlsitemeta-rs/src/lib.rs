@@ -208,7 +208,11 @@ fn execute_plugin(input: PluginInput) -> Result<Value, String> {
 
     HostBridge::progress(60, "Parsing metadata...");
 
-    let parsed = parse_dlsite_html(&page_html)?;
+    let mut parsed = parse_dlsite_html(&page_html)?;
+
+    if parsed.cover_url.is_none() {
+        parsed.cover_url = build_cover_url_from_rj(&rj_id);
+    }
 
     let new_tags_csv = build_tags_csv(&parsed, &rj_id, include_circle, include_va);
 
@@ -237,39 +241,29 @@ fn execute_plugin(input: PluginInput) -> Result<Value, String> {
     };
     metadata.insert("tags".to_string(), tags_value);
 
-    let cover_path = if let Some(cover_url) = &parsed.cover_url {
+    if let Some(cover_url) = &parsed.cover_url {
         HostBridge::progress(75, "Downloading cover...");
-        match download_cover(cover_url) {
-            Ok(path) => {
-                let assets = metadata_set_asset_value(
-                    metadata.get("assets").cloned(),
-                    "cover",
-                    &path,
-                );
-                metadata.insert("assets".to_string(), assets);
-                Some(path)
+        match download_cover_to(cover_url, "/plugin/cover.jpg") {
+            Ok(()) => {
+                HostBridge::log(1, "Cover downloaded from DLsite");
+                metadata.insert("assets".to_string(), json!([
+                    {"key": "cover", "value": "cover.jpg"}
+                ]));
             }
             Err(e) => {
                 HostBridge::log(1, &format!("Cover download failed: {}", e));
-                None
             }
         }
-    } else {
-        None
-    };
+    }
 
     if !parsed.tracks.is_empty() {
         let pages: Vec<Value> = parsed.tracks.iter().enumerate().map(|(i, track)| {
-            let mut page = json!({
+            json!({
                 "page_number": i + 1,
                 "entry_path": format!("{}.wav", i + 1),
                 "title": track.title,
                 "description": track.duration
-            });
-            if let Some(ref cp) = cover_path {
-                page["thumb"] = json!(cp);
-            }
-            page
+            })
         }).collect();
         metadata.insert("pages".to_string(), Value::Array(pages));
     }
@@ -503,7 +497,21 @@ fn extract_cover_url(html: &str) -> Option<String> {
             }
         }
     }
+
+    let re3 = Regex::new(r#"(?i)https://img\.dlsite\.jp/modpub/images2/work/doujin/RJ\d+/RJ\d+_img_main\.jpg"#).ok();
+    if let Some(re3) = re3 {
+        if let Some(cap) = re3.find(html) {
+            return Some(cap.as_str().to_string());
+        }
+    }
+
     None
+}
+
+fn build_cover_url_from_rj(rj_id: &str) -> Option<String> {
+    let id: u64 = rj_id.parse().ok()?;
+    let range = (id / 1000) * 1000;
+    Some(format!("https://img.dlsite.jp/modpub/images2/work/doujin/RJ{:0>8}/RJ{:0>8}_img_main.jpg", range, id))
 }
 
 fn build_description(meta: &DlsiteMetadata, html: &str) -> String {
@@ -743,7 +751,7 @@ fn fetch_dlsite_page_once(parsed: &ParsedUrl, host: &str, port: u16) -> Result<S
     }
 }
 
-fn download_cover(url: &str) -> Result<String, String> {
+fn download_cover_to(url: &str, save_path: &str) -> Result<(), String> {
     let parsed = parse_url(url)?;
     let host = parsed.host.clone();
     let port = parsed.port;
@@ -769,16 +777,13 @@ fn download_cover(url: &str) -> Result<String, String> {
         return Err("Cover too small".to_string());
     }
 
-    let ext = detect_image_extension(data);
-    let filename = format!("cover.{}", ext);
-    let save_path = std::path::Path::new("/plugin").join(&filename);
-
-    if let Some(parent) = save_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+    let path = std::path::Path::new(save_path);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("Failed to create dir: {}", e))?;
     }
-    std::fs::write(&save_path, data).map_err(|e| format!("Failed to save cover: {}", e))?;
+    std::fs::write(path, data).map_err(|e| format!("Failed to save cover: {}", e))?;
 
-    Ok(filename)
+    Ok(())
 }
 
 fn detect_image_extension(data: &[u8]) -> &'static str {
