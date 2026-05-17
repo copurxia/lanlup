@@ -70,6 +70,8 @@ struct TranscriptionResponse {
 struct VerboseTranscriptionResponse {
     text: String,
     #[serde(default)]
+    language: String,
+    #[serde(default)]
     segments: Vec<TranscriptionSegmentItem>,
 }
 
@@ -89,6 +91,7 @@ struct TranscribedPage {
     entry_path: String,
     transcription: String,
     lrc_lines: Vec<String>,
+    detected_language: String,
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -323,15 +326,16 @@ fn execute_archive_mode(
             .map_err(|e| format!("failed to read exported audio at {runtime_path}: {e}"))?;
 
         let filename = entry.rsplit('/').next().unwrap_or(entry);
-        let (transcription, lrc_lines) = transcribe_audio(&audio_bytes, filename, server_url, server_token, model, language)
+        let (transcription, lrc_lines, detected_language) = transcribe_audio(&audio_bytes, filename, server_url, server_token, model, language)
             .map_err(|e| format!("transcription failed for {entry}: {e}"))?;
 
-        HostBridge::log(1, &format!("transcription for {entry}: {} chars, {} segments", transcription.len(), lrc_lines.len()));
+        HostBridge::log(1, &format!("transcription for {entry}: {} chars, {} segments, lang={}", transcription.len(), lrc_lines.len(), detected_language));
 
         transcribed_pages.push(TranscribedPage {
             entry_path: entry.clone(),
             transcription,
             lrc_lines,
+            detected_language,
         });
     }
 
@@ -345,19 +349,22 @@ fn execute_archive_mode(
     let mut metadata = ensure_metadata_object(metadata_input);
 
     if !target_page_text.is_empty() {
-        let target_lrc = transcribed_pages.iter()
-            .find(|p| normalize_entry_key(&p.entry_path) == normalize_entry_key(&target_entry))
+        let target_page = transcribed_pages.iter()
+            .find(|p| normalize_entry_key(&p.entry_path) == normalize_entry_key(&target_entry));
+        let target_lrc = target_page
             .map(|p| &p.lrc_lines)
             .filter(|l| !l.is_empty())
             .map(|l| l.join("\n"))
             .unwrap_or_else(|| target_page_text.clone());
+        let target_lang = target_page.map(|p| p.detected_language.clone()).unwrap_or_default();
         let has_timestamps = target_lrc.contains('[') && target_lrc.contains(']');
         let lyrics_out = write_lyrics_file(&target_lrc, "target", execution_tag, &exported, &target_entry, has_timestamps)?;
         let ext = if has_timestamps { "lrc" } else { "txt" };
+        let attachment_name = if !target_lang.is_empty() { target_lang } else { attachment_name_from_path(&lyrics_out) };
         let attachment = json!({
             "slot": "lyrics",
             "path": lyrics_out,
-            "name": attachment_name_from_path(&lyrics_out),
+            "name": attachment_name,
             "kind": ext,
             "mime_type": if has_timestamps { "text/x-lrc" } else { "text/plain" },
         });
@@ -377,10 +384,11 @@ fn execute_archive_mode(
         let mut page_obj = Map::<String, Value>::new();
         page_obj.insert("page_number".to_string(), Value::from((idx + 1) as i64));
         page_obj.insert("entry_path".to_string(), Value::String(tp.entry_path.clone()));
+        let page_attach_name = if !tp.detected_language.is_empty() { tp.detected_language.clone() } else { attachment_name_from_path(&lyrics_out) };
         page_obj.insert("attachments".to_string(), Value::Array(vec![json!({
             "slot": "lyrics",
             "path": lyrics_out,
-            "name": attachment_name_from_path(&lyrics_out),
+            "name": page_attach_name,
             "kind": ext,
             "mime_type": if has_timestamps { "text/x-lrc" } else { "text/plain" },
         })]));
@@ -532,7 +540,7 @@ fn transcribe_audio(
     server_token: &str,
     model: &str,
     language: &str,
-) -> Result<(String, Vec<String>), String> {
+) -> Result<(String, Vec<String>, String), String> {
     let parsed = parse_url(server_url)?;
     let boundary = format_boundary();
     let mime_type = detect_mime_from_filename(filename);
@@ -575,13 +583,13 @@ fn transcribe_audio(
                 format!("[{:02}:{:02}.{:02}]{}", m, sec, cs, text)
             })
             .collect();
-        return Ok((verbose.text, lrc_lines));
+        return Ok((verbose.text, lrc_lines, verbose.language));
     }
 
     let tr: TranscriptionResponse = serde_json::from_str(&json_body)
         .map_err(|e| format!("failed to parse whisper response: {e}, body: {json_body}"))?;
 
-    Ok((tr.text, Vec::new()))
+    Ok((tr.text, Vec::new(), String::new()))
 }
 
 fn format_boundary() -> String {
