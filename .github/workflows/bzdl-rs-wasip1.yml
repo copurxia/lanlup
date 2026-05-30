@@ -1,0 +1,23 @@
+name: CI bzdl-rs (wasip1)
+
+on:
+  push:
+    paths:
+      - 'bzdl-rs/**'
+      - '.github/workflows/bzdl-rs-wasip1.yml'
+      - '.github/workflows/_build-wasip1.yml'
+  pull_request:
+    paths:
+      - 'bzdl-rs/**'
+      - '.github/workflows/bzdl-rs-wasip1.yml'
+      - '.github/workflows/_build-wasip1.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    uses: ./.github/workflows/_build-wasip1.yml
+    with:
+      plugin: bzdl-rs

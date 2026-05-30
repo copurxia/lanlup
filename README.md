@@ -54,4 +54,8 @@ The CI uploads artifact name:
 | `tagmerge-rs` | [![GitHub tagmerge-rs](https://github.com/copurxia/lanlup/actions/workflows/tagmerge-rs-wasip1.yml/badge.svg?branch=master)](https://github.com/copurxia/lanlup/actions/workflows/tagmerge-rs-wasip1.yml) |
 | `xdl-rs` | [![GitHub xdl-rs](https://github.com/copurxia/lanlup/actions/workflows/xdl-rs-wasip1.yml/badge.svg?branch=master)](https://github.com/copurxia/lanlup/actions/workflows/xdl-rs-wasip1.yml) |
 | `xlogin-rs` | [![GitHub xlogin-rs](https://github.com/copurxia/lanlup/actions/workflows/xlogin-rs-wasip1.yml/badge.svg?branch=master)](https://github.com/copurxia/lanlup/actions/workflows/xlogin-rs-wasip1.yml) |
+| `bzdl-rs` | [![GitHub bzdl-rs](https://github.com/copurxia/lanlup/actions/workflows/bzdl-rs-wasip1.yml/badge.svg?branch=master)](https://github.com/copurxia/lanlup/actions/workflows/bzdl-rs-wasip1.yml) |
+| `bzlogin-rs` | [![GitHub bzlogin-rs](https://github.com/copurxia/lanlup/actions/workflows/bzlogin-rs-wasip1.yml/badge.svg?branch=master)](https://github.com/copurxia/lanlup/actions/workflows/bzlogin-rs-wasip1.yml) |
+| `bzmeta-rs` | [![GitHub bzmeta-rs](https://github.com/copurxia/lanlup/actions/workflows/bzmeta-rs-wasip1.yml/badge.svg?branch=master)](https://github.com/copurxia/lanlup/actions/workflows/bzmeta-rs-wasip1.yml) |
+| `bzsource-rs` | [![GitHub bzsource-rs](https://github.com/copurxia/lanlup/actions/workflows/bzsource-rs-wasip1.yml/badge.svg?branch=master)](https://github.com/copurxia/lanlup/actions/workflows/bzsource-rs-wasip1.yml) |
 | `xmeta-rs` | [![GitHub xmeta-rs](https://github.com/copurxia/lanlup/actions/workflows/xmeta-rs-wasip1.yml/badge.svg?branch=master)](https://github.com/copurxia/lanlup/actions/workflows/xmeta-rs-wasip1.yml) |
