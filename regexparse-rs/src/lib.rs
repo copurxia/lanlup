@@ -198,11 +198,23 @@ fn execute_plugin(input: PluginInput) -> Result<Value, String> {
         .unwrap_or("")
         .to_string();
 
-    if filename.is_empty() {
+    let parse_source = if !filename.is_empty() {
+        filename
+    } else {
+        // Fall back to title when filename is not available
+        input
+            .metadata
+            .get("title")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    };
+
+    if parse_source.is_empty() {
         return Err("Missing filename in metadata".to_string());
     }
 
-    let (tags, title) = parse_filename(&filename, &input.params, &input.oneshot_param)?;
+    let (tags, title) = parse_filename(&parse_source, &input.params, &input.oneshot_param)?;
 
     let mut metadata = ensure_metadata_object(input.metadata);
     if !title.is_empty() {
