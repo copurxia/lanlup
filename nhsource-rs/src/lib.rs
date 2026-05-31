@@ -4,6 +4,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::alloc::{alloc, dealloc, Layout};
 use std::cell::RefCell;
+use std::fs;
 use std::io::{Read, Write};
 use std::slice;
 use std::sync::{Arc, OnceLock};
@@ -21,6 +22,7 @@ const MAX_REDIRECTS: usize = 5;
 const AUTH_DATA_KEY: &str = "__lanlu.phase.nhlogin.data";
 const MAX_HTTP_RETRIES: usize = 3;
 const NHENTAI_API_BASE: &str = "https://nhentai.net/api/v2";
+const DEFAULT_IMAGE_CDN: &str = "https://i.nhentai.net";
 
 #[cfg(target_arch = "wasm32")]
 #[link(wasm_import_module = "wasmedge_host")]
@@ -205,10 +207,15 @@ impl HostBridge {
     }
 
     fn task_kv_get(key: &str) -> Result<Option<Value>, String> {
-        let response = Self::call("task_kv.get", json!({ "key": key }))?;
+        let response = Self::call("task_kv.get", json!({"key": key}))?;
         let found = response.get("found").and_then(Value::as_bool).unwrap_or(false);
         if !found { return Ok(None); }
         Ok(response.get("value").cloned())
+    }
+
+    fn task_kv_set(key: &str, value: Value) -> Result<(), String> {
+        Self::call("task_kv.set", json!({"key": key, "value": value}))?;
+        Ok(())
     }
 }
 
@@ -262,6 +269,10 @@ pub extern "C" fn lanlu_plugin_run(input_ptr: i32, input_len: i32) -> i32 {
         "source_search" => run_source_search(&input),
         "source_detail" => run_source_detail(&input),
         "source_download" => run_source_download(&input),
+        "source_reader" => run_source_reader(&input),
+        "source_filters" => run_source_filters(&input),
+        "source_page_asset" => run_source_page_asset(&input),
+        "source_cover_asset" => run_source_cover_asset(&input),
         _ => output_err(&format!("unknown source action: {}", input.action)),
     };
 
@@ -304,6 +315,46 @@ fn set_error_and_zero(msg: String) -> i32 {
         state.error = msg.into_bytes();
         0
     })
+}
+
+fn run_source_filters(_input: &PluginInput) -> Value {
+    output_ok_data(json!({
+        "filters": [
+            {
+                "key": "category",
+                "label": "分类",
+                "type": "select",
+                "options": [
+                    { "label": "全部", "value": "" },
+                    { "label": "同人志", "value": "doujinshi" },
+                    { "label": "漫画", "value": "manga" },
+                    { "label": "画集", "value": "artistcg" },
+                    { "label": "游戏CG", "value": "game" }
+                ]
+            },
+            {
+                "key": "language",
+                "label": "语言",
+                "type": "select",
+                "options": [
+                    { "label": "全部", "value": "" },
+                    { "label": "中文", "value": "chinese" },
+                    { "label": "日文", "value": "japanese" },
+                    { "label": "英文", "value": "english" }
+                ]
+            },
+            {
+                "key": "sort",
+                "label": "排序",
+                "type": "select",
+                "options": [
+                    { "label": "最新", "value": "date" },
+                    { "label": "人气", "value": "popular" },
+                    { "label": "评分", "value": "rating" }
+                ]
+            }
+        ]
+    }))
 }
 
 fn output_err(message: &str) -> Value {
@@ -493,21 +544,24 @@ fn run_source_detail(input: &PluginInput) -> Value {
 
     let display_title = if !pretty_title.is_empty() { pretty_title } else if !english_title.is_empty() { english_title } else { "Untitled" };
 
-    let archive_item = json!({
-        "id": gallery_id,
-        "title": format!("{}", display_title),
-        "filename": format!("nhentai-{gallery_id}.zip"),
-        "size": 0
-    });
-
     HostBridge::progress(100, "详情加载完成");
     output_ok_data(json!({
-        "id": gallery_id,
+        "kind": "archive",
+        "source_namespace": "nhsource",
+        "remote_id": gallery_id,
         "title": display_title,
         "description": description,
         "cover": cover_url,
+        "cover_asset_id": ensure_cover_asset(&cover_url, &gallery_id),
         "tags": tags,
-        "archives": [archive_item],
+        "page_count": num_pages,
+        "downloadable": true,
+        "readable": true,
+        "reader": {
+            "page_count": num_pages,
+            "reader_action": "source_reader",
+            "download_action": "source_download",
+        },
     }))
 }
 
@@ -524,6 +578,320 @@ fn run_source_download(input: &PluginInput) -> Value {
         "gallery_url": gallery_url,
         "gallery_id": gallery_id,
     }))
+}
+
+fn run_source_reader(input: &PluginInput) -> Value {
+    HostBridge::progress(2, "加载阅读器...");
+    let auth = match load_nh_auth() {
+        Ok(v) => v,
+        Err(_) => NhAuthData { mode: String::new(), api_key: String::new() },
+    };
+
+    let gallery_id = extract_remote_id(&input.params);
+    if gallery_id.is_empty() {
+        return output_err("remote_id (gallery_id) is required for reader");
+    }
+
+    let url = format!("{NHENTAI_API_BASE}/galleries/{gallery_id}");
+    let (status, text) = match api_get(&url, &auth) {
+        Ok(v) => v,
+        Err(e) => return output_err(&format!("Reader fetch failed: {e}")),
+    };
+    if status != 200 {
+        return output_err(&format!("Reader API returned status {status}"));
+    }
+
+    let gallery: Value = match serde_json::from_str(&text) {
+        Ok(v) => v,
+        Err(e) => return output_err(&format!("Failed to parse gallery: {e}")),
+    };
+
+    let page_paths = parse_gallery_page_paths(&gallery);
+    if page_paths.is_empty() {
+        return output_err("Gallery has no pages");
+    }
+
+    let total_pages = page_paths.len();
+    let mut pages = Vec::with_capacity(total_pages);
+
+    for (idx, path) in page_paths.iter().enumerate() {
+        let page_num = idx + 1;
+        let filename = path.trim().trim_end_matches('/').rsplit('/').next().unwrap_or_default().trim();
+        let page_filename = if filename.is_empty() { format!("{page_num}.jpg") } else { filename.to_string() };
+        let cached_asset_id = get_cached_page_asset_id(&gallery_id, page_num as u64);
+        if cached_asset_id > 0 {
+            pages.push(json!({
+                "path": page_filename,
+                "asset_id": cached_asset_id,
+                "asset_ref": path,
+                "type": "image"
+            }));
+        } else {
+            pages.push(json!({
+                "path": page_filename,
+                "asset_ref": path,
+                "type": "image"
+            }));
+        }
+    }
+
+    HostBridge::progress(100, "阅读器加载完成");
+    output_ok_data(json!({ "pages": pages }))
+}
+
+fn run_source_page_asset(input: &PluginInput) -> Value {
+    let gallery_id = extract_remote_id(&input.params);
+    if gallery_id.is_empty() {
+        return output_err("remote_id (gallery_id) is required for page_asset");
+    }
+
+    let page = input.params.get("page").and_then(|v| match v {
+        Value::Number(n) => n.as_u64(),
+        Value::String(s) => s.parse::<u64>().ok(),
+        _ => None,
+    }).unwrap_or(0);
+    if page == 0 {
+        return output_err("page is required for page_asset");
+    }
+
+    let asset_ref = input.params.get("asset_ref").and_then(Value::as_str).unwrap_or("");
+    if asset_ref.is_empty() {
+        return output_err("asset_ref is required for page_asset");
+    }
+
+    let cached_asset_id = get_cached_page_asset_id(&gallery_id, page);
+    if cached_asset_id > 0 {
+        return output_ok_data(json!({"asset_id": cached_asset_id}));
+    }
+
+    let auth = match load_nh_auth() {
+        Ok(v) => v,
+        Err(_) => NhAuthData { mode: String::new(), api_key: String::new() },
+    };
+
+    let image_servers = match fetch_image_servers(&auth) {
+        Ok(v) => v,
+        Err(e) => {
+            HostBridge::log(1, &format!("nhsource CDN fallback: {e}"));
+            vec![DEFAULT_IMAGE_CDN.to_string()]
+        }
+    };
+
+    let gallery_id_i64 = gallery_id.parse::<i64>().unwrap_or(0);
+    let server = pick_image_server(&image_servers, gallery_id_i64, page as usize);
+    let image_url = format!("{}/{}", server.trim_end_matches('/'), asset_ref.trim_start_matches('/'));
+
+    let ext = asset_ref.rsplit('.').next().unwrap_or("jpg").to_ascii_lowercase();
+    let guest_path = format!("/plugin/{gallery_id}_{page}.{ext}");
+
+    let gallery_url = format!("https://nhentai.net/g/{gallery_id}/");
+    let referer = Some(gallery_url.as_str());
+    let response = match http_get_with_retry(
+        &image_url, referer, &[], "image/*", &[], MAX_HTTP_RETRIES,
+    ) {
+        Ok(resp) => resp,
+        Err(e) => return output_err(&format!("下载第 {page} 页失败: {e}")),
+    };
+
+    if let Err(e) = fs::write(&guest_path, &response.body) {
+        return output_err(&format!("写入第 {page} 页文件失败: {e}"));
+    }
+
+    match HostBridge::call(
+        "asset.install_from_file",
+        json!({
+            "guest_path": &guest_path,
+            "original_filename": &format!("{page}.{ext}"),
+            "content_type": guess_content_type(&ext),
+        }),
+    ) {
+        Ok(resp) => {
+            let asset_id = resp.get("asset_id").and_then(Value::as_i64).unwrap_or(0);
+            if asset_id <= 0 {
+                return output_err(&format!("注册第 {page} 页资产失败: asset_id 无效"));
+            }
+            cache_page_asset_id(&gallery_id, page, asset_id);
+            output_ok_data(json!({"asset_id": asset_id}))
+        }
+        Err(e) => output_err(&format!("注册第 {page} 页资产失败: {e}")),
+    }
+}
+
+fn run_source_cover_asset(input: &PluginInput) -> Value {
+    let gallery_id = extract_remote_id(&input.params);
+    if gallery_id.is_empty() {
+        return output_err("remote_id (gallery_id) is required for cover_asset");
+    }
+    let cover_ref = input.params.get("cover_ref").and_then(Value::as_str).unwrap_or("");
+    if cover_ref.is_empty() {
+        return output_err("cover_ref is required for cover_asset");
+    }
+    match ensure_cover_asset(cover_ref, &gallery_id) {
+        Some(asset_id) => output_ok_data(json!({"asset_id": asset_id})),
+        None => output_err("failed to create cover asset"),
+    }
+}
+
+fn guess_content_type(ext: &str) -> &'static str {
+    match ext {
+        "jpg" | "jpeg" => "image/jpeg",
+        "png" => "image/png",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        _ => "application/octet-stream",
+    }
+}
+
+/// Download an image and register it as a system asset via HostBridge
+fn download_and_install_asset(
+    url: &str,
+    guest_path: &str,
+    original_filename: &str,
+    content_type: &str,
+    referer: Option<&str>,
+) -> Result<i64, String> {
+    let response = http_get_with_retry(url, referer, &[], "image/*", &[], MAX_HTTP_RETRIES)?;
+    fs::write(guest_path, &response.body).map_err(|e| format!("write failed: {e}"))?;
+    let resp = HostBridge::call("asset.install_from_file", json!({
+        "guest_path": guest_path,
+        "original_filename": original_filename,
+        "content_type": content_type,
+    }))?;
+    resp.get("asset_id").and_then(Value::as_i64).ok_or_else(|| "no asset_id in response".to_string())
+}
+
+fn page_asset_cache_key(gallery_id: &str, page: u64) -> String {
+    format!("nh_page_{gallery_id}_{page}")
+}
+
+fn get_cached_page_asset_id(gallery_id: &str, page: u64) -> i64 {
+    let cache_key = page_asset_cache_key(gallery_id, page);
+    match HostBridge::task_kv_get(&cache_key) {
+        Ok(Some(cached)) => cached.as_i64().filter(|id| *id > 0).unwrap_or(0),
+        _ => 0,
+    }
+}
+
+fn cache_page_asset_id(gallery_id: &str, page: u64, asset_id: i64) {
+    if asset_id > 0 {
+        let cache_key = page_asset_cache_key(gallery_id, page);
+        let _ = HostBridge::task_kv_set(&cache_key, json!(asset_id));
+    }
+}
+
+fn cover_asset_cache_key(gallery_id: &str) -> String {
+    format!("nh_cover_{gallery_id}")
+}
+
+fn get_cached_cover_asset_id(gallery_id: &str) -> Option<i64> {
+    let cache_key = cover_asset_cache_key(gallery_id);
+    match HostBridge::task_kv_get(&cache_key) {
+        Ok(Some(cached)) => cached.as_i64().filter(|id| *id > 0),
+        _ => None,
+    }
+}
+
+/// Ensure cover asset exists for a gallery, using task_kv cache
+/// Returns Some(asset_id) on success, None on failure or empty url
+fn ensure_cover_asset(cover_url: &str, gallery_id: &str) -> Option<i64> {
+    if cover_url.is_empty() { return None; }
+
+    // Check cache
+    let cache_key = cover_asset_cache_key(gallery_id);
+    if let Some(id) = get_cached_cover_asset_id(gallery_id) {
+        return Some(id);
+    }
+
+    // Determine extension from URL
+    let url_lower = cover_url.to_ascii_lowercase();
+    let ext = if url_lower.ends_with(".png") { "png" }
+              else if url_lower.ends_with(".gif") { "gif" }
+              else if url_lower.ends_with(".webp") { "webp" }
+              else { "jpg" };
+
+    let guest_path = format!("/plugin/nh_cover_{gallery_id}.{ext}");
+    match download_and_install_asset(cover_url, &guest_path, &format!("cover.{ext}"), guess_content_type(ext), None) {
+        Ok(asset_id) => {
+            let _ = HostBridge::task_kv_set(&cache_key, json!(asset_id));
+            Some(asset_id)
+        }
+        Err(e) => {
+            HostBridge::log(2, &format!("nhsource cover asset failed for {gallery_id}: {e}"));
+            None
+        }
+    }
+}
+
+fn parse_gallery_page_paths(gallery: &Value) -> Vec<String> {
+    let mut page_paths = gallery
+        .get("pages")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|page| page.get("path").and_then(Value::as_str))
+                .map(|path| path.trim().trim_start_matches('/').to_string())
+                .filter(|path| !path.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    if page_paths.is_empty() {
+        if let Some(media_id) = gallery.get("media_id").and_then(Value::as_str) {
+            if let Some(items) = gallery
+                .get("images")
+                .and_then(|x| x.get("pages"))
+                .and_then(Value::as_array)
+            {
+                for (index, page) in items.iter().enumerate() {
+                    let ext = match page.get("t").and_then(Value::as_str).unwrap_or("j") {
+                        "j" => "jpg",
+                        "p" => "png",
+                        "g" => "gif",
+                        "w" => "webp",
+                        _ => "jpg",
+                    };
+                    page_paths.push(format!("galleries/{media_id}/{}.{}", index + 1, ext));
+                }
+            }
+        }
+    }
+
+    page_paths
+}
+
+fn fetch_image_servers(auth: &NhAuthData) -> Result<Vec<String>, String> {
+    let url = format!("{NHENTAI_API_BASE}/cdn");
+    let (status, text) = api_get(&url, auth)?;
+    if status != 200 {
+        return Err(format!("CDN API returned status {status}"));
+    }
+    let parsed: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    if let Some(items) = parsed.get("image_servers").and_then(Value::as_array) {
+        for item in items {
+            if let Some(server) = item.as_str() {
+                let trimmed = server.trim().trim_end_matches('/');
+                if !trimmed.is_empty() && !out.contains(&trimmed.to_string()) {
+                    out.push(trimmed.to_string());
+                }
+            }
+        }
+    }
+    if out.is_empty() {
+        return Err("No image servers in CDN response".to_string());
+    }
+    Ok(out)
+}
+
+fn pick_image_server(image_servers: &[String], gallery_id: i64, page_index: usize) -> String {
+    if image_servers.is_empty() {
+        return DEFAULT_IMAGE_CDN.to_string();
+    }
+    let base = gallery_id.unsigned_abs() as usize;
+    let start = (base + page_index.saturating_sub(1)) % image_servers.len();
+    image_servers[start].clone()
 }
 
 fn extract_remote_id(params: &Value) -> String {
@@ -577,13 +945,22 @@ fn map_gallery_list_items(parsed: &Value) -> Vec<Value> {
             }
 
             json!({
-                "id": id,
+                "kind": "archive",
+                "source_namespace": "nhsource",
+                "remote_id": id,
                 "title": title,
                 "subtitle": subtitle,
                 "cover": cover,
+                "cover_asset_id": get_cached_cover_asset_id(&id),
                 "tags": tag_ids,
                 "page_count": num_pages,
-                "source": "nhentai"
+                "downloadable": true,
+                "readable": true,
+                "reader": {
+                    "page_count": num_pages,
+                    "reader_action": "source_reader",
+                    "download_action": "source_download",
+                },
             })
         }).collect(),
         None => Vec::new(),
@@ -959,14 +1336,16 @@ fn plugin_info_json() -> Value {
         "namespace": "nhsource",
         "pre": ["nhlogin"],
         "author": "Lanlu",
-        "version": "0.1.0",
+        "version": "0.2.0",
         "description": "Browse and search nhentai.net online galleries for Lanlu.",
         "parameters": [],
         "permissions": [
             "log.write",
             "progress.report",
             "tcp.connect",
-            "task_kv.read"
+            "task_kv.read",
+            "task_kv.write",
+            "asset.install_from_file"
         ]
     })
 }

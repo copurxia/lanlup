@@ -7,6 +7,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::alloc::{alloc, dealloc, Layout};
 use std::cell::RefCell;
+use std::fs;
 use std::io::{Read, Write};
 use std::slice;
 use std::sync::{Arc, OnceLock};
@@ -259,6 +260,11 @@ impl HostBridge {
         }
         Ok(response.get("value").cloned())
     }
+
+    fn task_kv_set(key: &str, value: Value) -> Result<(), String> {
+        Self::call("task_kv.set", json!({ "key": key, "value": value }))?;
+        Ok(())
+    }
 }
 
 unsafe fn read_guest_bytes(ptr: i32, len: i32) -> &'static [u8] {
@@ -321,6 +327,10 @@ pub extern "C" fn lanlu_plugin_run(input_ptr: i32, input_len: i32) -> i32 {
         "source_search" => run_source_search(&input),
         "source_detail" => run_source_detail(&input),
         "source_download" => run_source_download(&input),
+        "source_reader" => run_source_reader(&input),
+        "source_filters" => run_source_filters(&input),
+        "source_page_asset" => run_source_page_asset(&input),
+        "source_cover_asset" => run_source_cover_asset(&input),
         _ => output_err(&format!("unknown source action: {}", input.action)),
     };
 
@@ -363,7 +373,9 @@ fn plugin_info_json() -> Value {
             "log.write",
             "progress.report",
             "tcp.connect",
-            "task_kv.read"
+            "task_kv.read",
+            "task_kv.write",
+            "asset.install_from_file"
         ],
         "update_url": ""
     })
@@ -602,7 +614,7 @@ fn run_source_detail(input: &PluginInput) -> Value {
     }
 
     // Build archives (chapters) list
-    let mut archives = Vec::new();
+    let mut children = Vec::new();
     if let Some(series) = album.get("series").and_then(Value::as_array) {
         for item in series {
             let ep_id = value_to_id_string(item.get("id"));
@@ -620,31 +632,57 @@ fn run_source_detail(input: &PluginInput) -> Value {
             } else {
                 ep_name
             };
-            archives.push(json!({
-                "id": ep_id,
+            children.push(json!({
+                "kind": "archive",
+                "source_namespace": "jmcomicsource",
+                "remote_id": ep_id,
                 "title": display_name,
-                "filename": format!("jm_{}_{}.zip", album_id, ep_id),
-                "size": 0
+                "subtitle": "",
+                "cover": cover.clone(),
+                "cover_asset_id": ensure_cover_asset(&cover, &ep_id),
+                "tags": [],
+                "downloadable": true,
+                "readable": true,
+                "parent_remote_id": album_id,
+                "reader": {
+                    "reader_action": "source_reader",
+                    "download_action": "source_download",
+                },
             }));
         }
     }
-    if archives.is_empty() {
-        archives.push(json!({
-            "id": album_id,
+    if children.is_empty() {
+        children.push(json!({
+            "kind": "archive",
+            "source_namespace": "jmcomicsource",
+            "remote_id": album_id,
             "title": title.clone(),
-            "filename": format!("jm_{}.zip", album_id),
-            "size": 0
+            "subtitle": "",
+            "cover": cover.clone(),
+            "cover_asset_id": ensure_cover_asset(&cover, &album_id),
+            "tags": [],
+            "downloadable": true,
+            "readable": true,
+            "reader": {
+                "reader_action": "source_reader",
+                "download_action": "source_download",
+            },
         }));
     }
 
     HostBridge::progress(100, "详情加载完成");
     output_ok_data(json!({
-        "id": album_id,
+        "kind": "tankoubon",
+        "source_namespace": "jmcomicsource",
+        "remote_id": album_id,
         "title": title,
         "description": description,
         "cover": cover,
+        "cover_asset_id": ensure_cover_asset(&cover, &album_id),
         "tags": tags,
-        "archives": archives,
+        "downloadable": true,
+        "readable": true,
+        "children": children,
     }))
 }
 
@@ -672,6 +710,277 @@ fn run_source_download(input: &PluginInput) -> Value {
         "gallery_url": gallery_url,
         "gallery_id": album_id,
     }))
+}
+
+fn run_source_reader(input: &PluginInput) -> Value {
+    let remote_id = extract_remote_id(&input.params);
+    if remote_id.is_empty() {
+        return output_err("remote_id is required for reader");
+    }
+
+    let auth = match load_jm_auth() {
+        Ok(v) => v,
+        Err(e) => return output_err(&format!("Auth failed: {e}")),
+    };
+    let api_base = resolve_api_base(&input.params, &auth);
+    let bypass_url = resolve_bypass_url(&input.params, &auth);
+
+    let parent_remote_id = input
+        .params
+        .get("parent_remote_id")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+
+    let ep_id = if parent_remote_id.is_empty() {
+        let album_url = format!("{}/album?id={}", api_base, remote_id);
+        let response = match api_get(&album_url, &auth, &bypass_url) {
+            Ok(v) => v,
+            Err(e) => return output_err(&format!("Album fetch failed: {e}")),
+        };
+        if response.0 != 200 {
+            return output_err(&format!("Album API returned status {}", response.0));
+        }
+        let album: Value = match parse_encrypted_body(&response.1, response.2) {
+            Ok(v) => v,
+            Err(e) => return output_err(&format!("Failed to parse album: {e}")),
+        };
+        if let Some(series) = album.get("series").and_then(Value::as_array) {
+            if let Some(first) = series.first() {
+                value_to_id_string(first.get("id"))
+            } else {
+                remote_id
+            }
+        } else {
+            remote_id
+        }
+    } else {
+        remote_id
+    };
+
+    if ep_id.is_empty() {
+        return output_err("Could not determine chapter ID");
+    }
+
+    let image_base = match resolve_image_base(&api_base, &input.params, &auth, &bypass_url) {
+        Ok(v) => v,
+        Err(e) => {
+            HostBridge::log(1, &format!("jmcomicsource image base fallback: {}", e));
+            DEFAULT_IMAGE_BASE.to_string()
+        }
+    };
+
+    let chapter_url = format!("{}/chapter?id={}", api_base, ep_id);
+    let chapter_response = match api_get(&chapter_url, &auth, &bypass_url) {
+        Ok(v) => v,
+        Err(e) => return output_err(&format!("Chapter fetch failed: {e}")),
+    };
+    if chapter_response.0 != 200 {
+        return output_err(&format!("Chapter API returned status {}", chapter_response.0));
+    }
+
+    let chapter: Value = match parse_encrypted_body(&chapter_response.1, chapter_response.2) {
+        Ok(v) => v,
+        Err(e) => return output_err(&format!("Failed to parse chapter: {e}")),
+    };
+
+    let images = chapter
+        .get("images")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    let total_images = images.len();
+
+    // Lazy mode: return asset_ref (image URL) for each page without downloading
+    let mut pages = Vec::new();
+    for (idx, img_name_val) in images.iter().enumerate() {
+        let img_name = img_name_val.as_str().unwrap_or("");
+        if img_name.is_empty() {
+            continue;
+        }
+        let page_num = idx + 1;
+        HostBridge::progress(50, &format!("解析第 {page_num}/{total_images} 页..."));
+        let img_url = format!("{}/media/photos/{}/{}", image_base, ep_id, img_name);
+        pages.push(json!({
+            "asset_ref": img_url,
+            "type": "image",
+            "page": page_num,
+        }));
+    }
+
+    if pages.is_empty() {
+        return output_err("failed to resolve any pages");
+    }
+
+    output_ok_data(json!({ "pages": pages }))
+}
+
+fn run_source_page_asset(input: &PluginInput) -> Value {
+    let remote_id = extract_remote_id(&input.params);
+    if remote_id.is_empty() {
+        return output_err("remote_id is required for page_asset");
+    }
+    let page = input.params.get("page").and_then(|v| match v {
+        Value::Number(n) => n.as_u64(),
+        Value::String(s) => s.parse::<u64>().ok(),
+        _ => None,
+    }).unwrap_or(0);
+    if page == 0 {
+        return output_err("page is required for page_asset");
+    }
+    let asset_ref = input.params.get("asset_ref").and_then(Value::as_str).unwrap_or("");
+    if asset_ref.is_empty() {
+        return output_err("asset_ref is required for page_asset");
+    }
+
+    let cached_asset_id = get_cached_page_asset_id(&remote_id, page);
+    if cached_asset_id > 0 {
+        return output_ok_data(json!({"asset_id": cached_asset_id}));
+    }
+
+    let auth = match load_jm_auth() {
+        Ok(v) => v,
+        Err(e) => return output_err(&format!("Auth failed: {e}")),
+    };
+    let bypass_url = resolve_bypass_url(&input.params, &auth);
+
+    let ep_id = remote_id.as_str();
+    let ext = asset_ref.rsplit('.').next().unwrap_or("jpg").to_ascii_lowercase();
+    let guest_path = format!("/plugin/jm_{ep_id}_{page}.{ext}");
+
+    let response = match http_get(asset_ref, None, "image/*", &[], &bypass_url) {
+        Ok(resp) => resp,
+        Err(e) => return output_err(&format!("下载第 {page} 页失败: {e}")),
+    };
+    if response.status >= 400 {
+        return output_err(&format!("下载第 {page} 页 HTTP {}", response.status));
+    }
+    if let Err(e) = fs::write(&guest_path, &response.body) {
+        return output_err(&format!("写入第 {page} 页文件失败: {e}"));
+    }
+    match HostBridge::call(
+        "asset.install_from_file",
+        json!({
+            "guest_path": &guest_path,
+            "original_filename": &format!("{page}.{ext}"),
+            "content_type": guess_content_type(&ext),
+        }),
+    ) {
+        Ok(resp) => {
+            let asset_id = resp.get("asset_id").and_then(Value::as_i64).unwrap_or(0);
+            if asset_id <= 0 {
+                return output_err("asset.install_from_file returned invalid asset_id");
+            }
+            cache_page_asset_id(&remote_id, page, asset_id);
+            output_ok_data(json!({"asset_id": asset_id}))
+        }
+        Err(e) => output_err(&format!("asset.install_from_file failed: {e}")),
+    }
+}
+
+fn guess_content_type(ext: &str) -> &'static str {
+    match ext {
+        "jpg" | "jpeg" => "image/jpeg",
+        "png" => "image/png",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        _ => "application/octet-stream",
+    }
+}
+
+/// Download an image and register it as a system asset via HostBridge
+fn download_and_install_asset(
+    url: &str,
+    guest_path: &str,
+    original_filename: &str,
+    content_type: &str,
+    bypass_url: &str,
+) -> Result<i64, String> {
+    let response = http_get(url, None, "image/*", &[], bypass_url)
+        .map_err(|e| format!("download failed: {e}"))?;
+    if response.status >= 400 {
+        return Err(format!("download HTTP {}", response.status));
+    }
+    fs::write(guest_path, &response.body).map_err(|e| format!("write failed: {e}"))?;
+    let resp = HostBridge::call("asset.install_from_file", json!({
+        "guest_path": guest_path,
+        "original_filename": original_filename,
+        "content_type": content_type,
+    }))?;
+    resp.get("asset_id").and_then(Value::as_i64).ok_or_else(|| "no asset_id in response".to_string())
+}
+
+/// Ensure cover asset exists, using task_kv cache
+fn ensure_cover_asset(cover_url: &str, album_id: &str) -> Option<i64> {
+    if cover_url.is_empty() { return None; }
+    let cache_key = jm_cover_cache_key(album_id);
+    if let Some(id) = get_cached_cover_asset_id(album_id) {
+        return Some(id);
+    }
+    let url_lower = cover_url.to_ascii_lowercase();
+    let ext = if url_lower.ends_with(".png") { "png" }
+              else if url_lower.ends_with(".gif") { "gif" }
+              else if url_lower.ends_with(".webp") { "webp" }
+              else { "jpg" };
+    let guest_path = format!("/plugin/jm_cover_{album_id}.{ext}");
+    match download_and_install_asset(cover_url, &guest_path, &format!("cover.{ext}"), guess_content_type(ext), "") {
+        Ok(asset_id) => {
+            let _ = HostBridge::task_kv_set(&cache_key, json!(asset_id));
+            Some(asset_id)
+        }
+        Err(e) => {
+            HostBridge::log(2, &format!("jm cover asset failed for {album_id}: {e}"));
+            None
+        }
+    }
+}
+
+fn run_source_cover_asset(input: &PluginInput) -> Value {
+    let album_id = extract_remote_id(&input.params);
+    if album_id.is_empty() {
+        return output_err("remote_id is required for cover_asset");
+    }
+    let cover_ref = input.params.get("cover_ref").and_then(Value::as_str).unwrap_or("");
+    if cover_ref.is_empty() {
+        return output_err("cover_ref is required for cover_asset");
+    }
+    match ensure_cover_asset(cover_ref, &album_id) {
+        Some(asset_id) => output_ok_data(json!({"asset_id": asset_id})),
+        None => output_err("failed to create cover asset"),
+    }
+}
+
+fn jm_cover_cache_key(album_id: &str) -> String {
+    format!("jm_cover_{album_id}")
+}
+
+fn jm_page_cache_key(remote_id: &str, page: u64) -> String {
+    format!("jm_page_{remote_id}_{page}")
+}
+
+fn get_cached_cover_asset_id(album_id: &str) -> Option<i64> {
+    let cache_key = jm_cover_cache_key(album_id);
+    match HostBridge::task_kv_get(&cache_key) {
+        Ok(Some(cached)) => cached.as_i64().filter(|id| *id > 0),
+        _ => None,
+    }
+}
+
+fn get_cached_page_asset_id(remote_id: &str, page: u64) -> i64 {
+    let cache_key = jm_page_cache_key(remote_id, page);
+    match HostBridge::task_kv_get(&cache_key) {
+        Ok(Some(cached)) => cached.as_i64().filter(|id| *id > 0).unwrap_or(0),
+        _ => 0,
+    }
+}
+
+fn cache_page_asset_id(remote_id: &str, page: u64, asset_id: i64) {
+    if asset_id > 0 {
+        let cache_key = jm_page_cache_key(remote_id, page);
+        let _ = HostBridge::task_kv_set(&cache_key, json!(asset_id));
+    }
 }
 
 fn extract_remote_id(params: &Value) -> String {
@@ -894,12 +1203,16 @@ fn parse_comic_item(comic: &Value, image_base: &str) -> Option<Value> {
     }
 
     Some(json!({
-        "id": id,
+        "kind": "tankoubon",
+        "source_namespace": "jmcomicsource",
+        "remote_id": id,
         "title": title,
         "subtitle": author,
         "cover": cover,
+        "cover_asset_id": get_cached_cover_asset_id(&id),
         "tags": tags,
-        "source": "jmcomicsource"
+        "downloadable": true,
+        "readable": true,
     }))
 }
 
@@ -1054,6 +1367,36 @@ fn urlencoding_encode(input: &str) -> String {
         }
     }
     result
+}
+
+fn run_source_filters(_input: &PluginInput) -> Value {
+    output_ok_data(json!({
+        "filters": [
+            {
+                "key": "category",
+                "label": "分类",
+                "type": "select",
+                "options": [
+                    { "label": "全部", "value": "" },
+                    { "label": "單行本", "value": "single" },
+                    { "label": "同人", "value": "doujin" },
+                    { "label": "韓漫", "value": "korean" },
+                    { "label": "美漫", "value": "western" },
+                    { "label": "連載", "value": "serial" }
+                ]
+            },
+            {
+                "key": "sort",
+                "label": "排序",
+                "type": "select",
+                "options": [
+                    { "label": "最新", "value": "date" },
+                    { "label": "人气", "value": "popular" },
+                    { "label": "评分", "value": "rating" }
+                ]
+            }
+        ]
+    }))
 }
 
 fn output_err(message: &str) -> Value {

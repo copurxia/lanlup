@@ -6,6 +6,7 @@ use serde_json::{json, Value};
 use sha2::Sha256;
 use std::alloc::{alloc, dealloc, Layout};
 use std::cell::RefCell;
+use std::fs;
 use std::io::{self, Read, Write};
 use std::slice;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -129,6 +130,11 @@ impl HostBridge {
         let found = response.get("found").and_then(Value::as_bool).unwrap_or(false);
         if !found { return Ok(None); }
         Ok(response.get("value").cloned())
+    }
+
+    fn task_kv_set(key: &str, value: Value) -> Result<(), String> {
+        Self::call("task_kv.set", json!({"key": key, "value": value}))?;
+        Ok(())
     }
 }
 
@@ -764,14 +770,17 @@ fn map_comic_to_source_item(comic: &Value) -> Value {
     }
 
     json!({
-        "id": id,
+        "kind": "tankoubon",
+        "source_namespace": "picacgsource",
+        "remote_id": id,
         "title": title,
         "subtitle": author,
         "cover": cover,
+        "cover_asset_id": get_cached_cover_asset_id(&id),
         "tags": tags,
-        "source": "picacg",
         "page_count": page_count,
-        "likes_count": likes,
+        "downloadable": true,
+        "readable": true,
     })
 }
 
@@ -913,16 +922,30 @@ fn run_source_detail(input: &PluginInput) -> Value {
         for t in comic_tags { if let Some(s) = t.as_str() { tags.push(s.to_string()); } }
     }
 
-    let archive_item = json!({
-        "id": comic_id,
+    let child = json!({
+        "kind": "archive",
+        "source_namespace": "picacgsource",
+        "remote_id": comic_id,
         "title": title.clone(),
-        "filename": format!("picacg-{comic_id}.zip"),
-        "size": 0
+        "subtitle": author,
+        "cover": cover.clone(),
+        "cover_asset_id": ensure_cover_asset(&cover, &comic_id),
+        "tags": tags.clone(),
+        "page_count": page_count,
+        "downloadable": true,
+        "readable": true,
+        "reader": {
+            "page_count": page_count,
+            "reader_action": "source_reader",
+            "download_action": "source_download",
+        },
     });
 
     HostBridge::progress(100, "详情加载完成");
     output_ok_data(json!({
-        "id": comic_id,
+        "kind": "tankoubon",
+        "source_namespace": "picacgsource",
+        "remote_id": comic_id,
         "title": title,
         "description": if description.is_empty() {
             format!("Author: {} | Pages: {}", author, page_count)
@@ -930,8 +953,11 @@ fn run_source_detail(input: &PluginInput) -> Value {
             description
         },
         "cover": cover,
+        "cover_asset_id": ensure_cover_asset(&cover, &comic_id),
         "tags": tags,
-        "archives": [archive_item],
+        "downloadable": true,
+        "readable": true,
+        "children": [child],
     }))
 }
 
@@ -950,12 +976,334 @@ fn run_source_download(input: &PluginInput) -> Value {
     }))
 }
 
+fn run_source_reader(input: &PluginInput) -> Value {
+    let comic_id = extract_remote_id(&input.params);
+    if comic_id.is_empty() {
+        return output_err("remote_id (comic_id) is required for reader");
+    }
+
+    let auth = match load_picacg_auth() {
+        Ok(v) => v,
+        Err(e) => return output_err(&e),
+    };
+
+    HostBridge::progress(10, "加载章节...");
+
+    let ep_order = match get_first_ep_order(&comic_id, &auth) {
+        Ok(v) => v,
+        Err(e) => {
+            HostBridge::log(1, &format!("picacgsource failed to get first ep order: {e}, fallback to 1"));
+            1
+        }
+    };
+
+    HostBridge::progress(30, "加载页面...");
+
+    let pages_meta = match fetch_reader_pages(&comic_id, ep_order, &auth) {
+        Ok(v) => v,
+        Err(e) => return output_err(&format!("Failed to fetch pages: {e}")),
+    };
+
+    if pages_meta.is_empty() {
+        return output_err("No pages found");
+    }
+
+    // Lazy mode: return asset_ref instead of downloading images eagerly
+    let pages: Vec<Value> = pages_meta.iter().enumerate().map(|(idx, page_meta)| {
+        let page_num = idx + 1;
+        let img_url = page_meta.get("url").and_then(Value::as_str).unwrap_or("");
+        json!({
+            "asset_ref": img_url,
+            "type": "image",
+            "page": page_num,
+        })
+    }).collect();
+
+    HostBridge::progress(100, "加载完成");
+    output_ok_data(json!({ "pages": pages }))
+}
+
+fn run_source_page_asset(input: &PluginInput) -> Value {
+    let comic_id = extract_remote_id(&input.params);
+    if comic_id.is_empty() {
+        return output_err("remote_id (comic_id) is required for page_asset");
+    }
+
+    let page = input.params.get("page").and_then(|v| match v {
+        Value::Number(n) => n.as_u64(),
+        Value::String(s) => s.parse::<u64>().ok(),
+        _ => None,
+    }).unwrap_or(0);
+    if page == 0 {
+        return output_err("page is required for page_asset");
+    }
+
+    let asset_ref = input.params.get("asset_ref").and_then(Value::as_str).unwrap_or("");
+    if asset_ref.is_empty() {
+        return output_err("asset_ref is required for page_asset");
+    }
+
+    let cached_asset_id = get_cached_page_asset_id(&comic_id, page);
+    if cached_asset_id > 0 {
+        return output_ok_data(json!({"asset_id": cached_asset_id}));
+    }
+
+    // Load auth to verify login credentials are available
+    let _auth = match load_picacg_auth() {
+        Ok(v) => v,
+        Err(e) => return output_err(&e),
+    };
+
+    // Download image from the asset_ref URL
+    let response = match http_get_with_retry(asset_ref, &[], MAX_HTTP_RETRIES) {
+        Ok(resp) => resp,
+        Err(e) => return output_err(&format!("下载第 {page} 页失败: {e}")),
+    };
+
+    if response.status >= 400 {
+        return output_err(&format!("下载第 {page} 页 HTTP {}", response.status));
+    }
+
+    // Determine extension from URL
+    let url_lower = asset_ref.to_ascii_lowercase();
+    let ext = if url_lower.ends_with(".png") { "png" }
+              else if url_lower.ends_with(".gif") { "gif" }
+              else if url_lower.ends_with(".webp") { "webp" }
+              else if url_lower.ends_with(".bmp") { "bmp" }
+              else { "jpg" };
+
+    let guest_path = format!("/plugin/picacg_{comic_id}_{page}.{ext}");
+
+    if let Err(e) = fs::write(&guest_path, &response.body) {
+        return output_err(&format!("写入第 {page} 页文件失败: {e}"));
+    }
+
+    match HostBridge::call(
+        "asset.install_from_file",
+        json!({
+            "guest_path": &guest_path,
+            "original_filename": format!("{page}.{ext}"),
+            "content_type": guess_content_type(ext),
+        }),
+    ) {
+        Ok(resp) => {
+            let asset_id = resp.get("asset_id").and_then(Value::as_i64).unwrap_or(0);
+            if asset_id <= 0 {
+                return output_err(&format!("注册第 {page} 页资产失败: asset_id 无效"));
+            }
+            cache_page_asset_id(&comic_id, page, asset_id);
+            output_ok_data(json!({"asset_id": asset_id}))
+        }
+        Err(e) => output_err(&format!("注册第 {page} 页资产失败: {e}")),
+    }
+}
+
+fn guess_content_type(ext: &str) -> &'static str {
+    match ext {
+        "jpg" | "jpeg" => "image/jpeg",
+        "png" => "image/png",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        _ => "application/octet-stream",
+    }
+}
+
+/// Download an image and register it as a system asset via HostBridge
+fn download_and_install_asset(url: &str, guest_path: &str, filename: &str, content_type: &str) -> Result<i64, String> {
+    let response = http_get_with_retry(url, &[], MAX_HTTP_RETRIES)?;
+    fs::write(guest_path, &response.body).map_err(|e| format!("write failed: {e}"))?;
+    let resp = HostBridge::call("asset.install_from_file", json!({
+        "guest_path": guest_path,
+        "original_filename": filename,
+        "content_type": content_type,
+    }))?;
+    resp.get("asset_id").and_then(Value::as_i64).ok_or_else(|| "no asset_id in response".to_string())
+}
+
+/// Ensure cover asset exists for a comic, using task_kv cache
+/// Returns Some(asset_id) on success, None on failure or empty url
+fn ensure_cover_asset(cover_url: &str, comic_id: &str) -> Option<i64> {
+    if cover_url.is_empty() { return None; }
+
+    // Check cache
+    let cache_key = picacg_cover_cache_key(comic_id);
+    if let Some(id) = get_cached_cover_asset_id(comic_id) {
+        return Some(id);
+    }
+
+    // Determine extension from URL
+    let url_lower = cover_url.to_ascii_lowercase();
+    let ext = if url_lower.ends_with(".png") { "png" }
+              else if url_lower.ends_with(".gif") { "gif" }
+              else if url_lower.ends_with(".webp") { "webp" }
+              else { "jpg" };
+
+    let guest_path = format!("/plugin/picacg_cover_{comic_id}.{ext}");
+    match download_and_install_asset(cover_url, &guest_path, &format!("cover.{ext}"), guess_content_type(ext)) {
+        Ok(asset_id) => {
+            let _ = HostBridge::task_kv_set(&cache_key, json!(asset_id));
+            Some(asset_id)
+        }
+        Err(e) => {
+            HostBridge::log(2, &format!("picacgsource cover asset failed for {comic_id}: {e}"));
+            None
+        }
+    }
+}
+
+fn run_source_cover_asset(input: &PluginInput) -> Value {
+    let comic_id = extract_remote_id(&input.params);
+    if comic_id.is_empty() {
+        return output_err("remote_id is required for cover_asset");
+    }
+    let cover_ref = input.params.get("cover_ref").and_then(Value::as_str).unwrap_or("");
+    if cover_ref.is_empty() {
+        return output_err("cover_ref is required for cover_asset");
+    }
+    match ensure_cover_asset(cover_ref, &comic_id) {
+        Some(asset_id) => output_ok_data(json!({"asset_id": asset_id})),
+        None => output_err("failed to create cover asset"),
+    }
+}
+
+fn picacg_cover_cache_key(comic_id: &str) -> String {
+    format!("picacg_cover_{comic_id}")
+}
+
+fn picacg_page_cache_key(comic_id: &str, page: u64) -> String {
+    format!("picacg_page_{comic_id}_{page}")
+}
+
+fn get_cached_cover_asset_id(comic_id: &str) -> Option<i64> {
+    let cache_key = picacg_cover_cache_key(comic_id);
+    match HostBridge::task_kv_get(&cache_key) {
+        Ok(Some(cached)) => cached.as_i64().filter(|id| *id > 0),
+        _ => None,
+    }
+}
+
+fn get_cached_page_asset_id(comic_id: &str, page: u64) -> i64 {
+    let cache_key = picacg_page_cache_key(comic_id, page);
+    match HostBridge::task_kv_get(&cache_key) {
+        Ok(Some(cached)) => cached.as_i64().filter(|id| *id > 0).unwrap_or(0),
+        _ => 0,
+    }
+}
+
+fn cache_page_asset_id(comic_id: &str, page: u64, asset_id: i64) {
+    if asset_id > 0 {
+        let cache_key = picacg_page_cache_key(comic_id, page);
+        let _ = HostBridge::task_kv_set(&cache_key, json!(asset_id));
+    }
+}
+
+fn get_first_ep_order(comic_id: &str, auth: &PicacgAuthData) -> Result<i64, String> {
+    let path = format!("comics/{comic_id}/eps?page=1");
+    let (status, text) = picacg_get(&path, auth)?;
+    if status != 200 {
+        return Err(format!("HTTP {status}"));
+    }
+    let parsed: Value = serde_json::from_str(&text)
+        .map_err(|e| format!("Failed to parse eps response: {e}"))?;
+    let docs = parsed.get("data")
+        .and_then(|d| d.get("eps"))
+        .and_then(|e| e.get("docs"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if let Some(first) = docs.first() {
+        let order = first.get("order").and_then(|v| v.as_i64()).unwrap_or(1);
+        Ok(order)
+    } else {
+        Err("No episodes found".to_string())
+    }
+}
+
+fn fetch_reader_pages(comic_id: &str, ep_order: i64, auth: &PicacgAuthData) -> Result<Vec<Value>, String> {
+    let mut pages = Vec::new();
+    let mut page = 1u32;
+    loop {
+        let path = format!("comics/{comic_id}/order/{ep_order}/pages?page={page}");
+        let (status, text) = picacg_get(&path, auth)?;
+        if status != 200 {
+            return Err(format!("Failed to fetch pages page {page}: HTTP {status}"));
+        }
+        let parsed: Value = serde_json::from_str(&text)
+            .map_err(|e| format!("Failed to parse pages response: {e}"))?;
+        let docs = parsed.get("data")
+            .and_then(|d| d.get("pages"))
+            .and_then(|p| p.get("docs"))
+            .and_then(Value::as_array)
+            .unwrap_or(&Vec::new()).clone();
+        let total_pages = parsed.get("data")
+            .and_then(|d| d.get("pages"))
+            .and_then(|p| p.get("pages"))
+            .and_then(|p| p.as_u64()).unwrap_or(1) as u32;
+
+        for doc in docs {
+            if let Some(page_obj) = build_reader_page(&doc) {
+                pages.push(page_obj);
+            }
+        }
+
+        if page >= total_pages { break; }
+        page += 1;
+    }
+    Ok(pages)
+}
+
+fn build_reader_page(page_doc: &Value) -> Option<Value> {
+    let media = page_doc.get("media")?;
+    let file_server = media.get("fileServer").and_then(Value::as_str)?;
+    let path = media.get("path").and_then(Value::as_str)?;
+    let server = file_server.trim_end_matches('/');
+    let p = path.trim_start_matches('/');
+    let url = format!("{server}/static/{p}");
+    let filename = p.rsplit('/').next().unwrap_or("image.jpg").to_string();
+    Some(json!({
+        "path": filename,
+        "url": url,
+        "type": "image"
+    }))
+}
+
 fn extract_remote_id(params: &Value) -> String {
     params.get("remote_id")
         .and_then(Value::as_str)
         .or_else(|| params.get("__target_id").and_then(Value::as_str))
         .unwrap_or("")
         .to_string()
+}
+
+fn run_source_filters(_input: &PluginInput) -> Value {
+    output_ok_data(json!({
+        "filters": [
+            {
+                "key": "category",
+                "label": "分类",
+                "type": "select",
+                "options": [
+                    { "label": "全部", "value": "" },
+                    { "label": "猜你喜欢", "value": "recommend" },
+                    { "label": "最新", "value": "latest" },
+                    { "label": "排行榜", "value": "ranking" },
+                    { "label": "已完结", "value": "finished" }
+                ]
+            },
+            {
+                "key": "sort",
+                "label": "排序",
+                "type": "select",
+                "options": [
+                    { "label": "最新", "value": "date" },
+                    { "label": "人气", "value": "popular" },
+                    { "label": "评分", "value": "rating" },
+                    { "label": "收藏", "value": "favorite" }
+                ]
+            }
+        ]
+    }))
 }
 
 fn output_err(message: &str) -> Value {
@@ -1014,6 +1362,10 @@ pub extern "C" fn lanlu_plugin_run(input_ptr: i32, input_len: i32) -> i32 {
         "source_search" => run_source_search(&input),
         "source_detail" => run_source_detail(&input),
         "source_download" => run_source_download(&input),
+        "source_reader" => run_source_reader(&input),
+        "source_filters" => run_source_filters(&input),
+        "source_page_asset" => run_source_page_asset(&input),
+        "source_cover_asset" => run_source_cover_asset(&input),
         _ => output_err(&format!("unknown source action: {}", input.action)),
     };
 
@@ -1049,14 +1401,16 @@ fn plugin_info_json() -> Value {
         "namespace": "picacgsource",
         "pre": ["picacglogin"],
         "author": "Lanlu",
-        "version": "0.1.0",
+        "version": "0.2.0",
         "description": "Browse and search Picacg (哔咔漫画) online galleries for Lanlu.",
         "parameters": [],
         "permissions": [
             "log.write",
             "progress.report",
             "tcp.connect",
-            "task_kv.read"
+            "task_kv.read",
+            "task_kv.write",
+            "asset.install_from_file"
         ]
     })
 }

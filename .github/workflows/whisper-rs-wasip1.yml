@@ -1,0 +1,23 @@
+name: CI whisper-rs (wasip1)
+
+on:
+  push:
+    paths:
+      - 'whisper-rs/**'
+      - '.github/workflows/whisper-rs-wasip1.yml'
+      - '.github/workflows/_build-wasip1.yml'
+  pull_request:
+    paths:
+      - 'whisper-rs/**'
+      - '.github/workflows/whisper-rs-wasip1.yml'
+      - '.github/workflows/_build-wasip1.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    uses: ./.github/workflows/_build-wasip1.yml
+    with:
+      plugin: whisper-rs

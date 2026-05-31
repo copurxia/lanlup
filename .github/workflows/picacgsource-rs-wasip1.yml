@@ -1,0 +1,23 @@
+name: CI picacgsource-rs (wasip1)
+
+on:
+  push:
+    paths:
+      - 'picacgsource-rs/**'
+      - '.github/workflows/picacgsource-rs-wasip1.yml'
+      - '.github/workflows/_build-wasip1.yml'
+  pull_request:
+    paths:
+      - 'picacgsource-rs/**'
+      - '.github/workflows/picacgsource-rs-wasip1.yml'
+      - '.github/workflows/_build-wasip1.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    uses: ./.github/workflows/_build-wasip1.yml
+    with:
+      plugin: picacgsource-rs

@@ -5,6 +5,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::alloc::{alloc, dealloc, Layout};
 use std::cell::RefCell;
+use std::fs;
 use std::io::{self, Read, Write};
 use std::slice;
 use std::sync::Arc;
@@ -124,6 +125,10 @@ impl HostBridge {
         if !found { return Ok(None); }
         Ok(response.get("value").cloned())
     }
+    fn task_kv_set(key: &str, value: Value) -> Result<(), String> {
+        Self::call("task_kv.set", json!({ "key": key, "value": value }))?;
+        Ok(())
+    }
 }
 
 #[no_mangle]
@@ -174,6 +179,10 @@ pub extern "C" fn lanlu_plugin_run(input_ptr: i32, input_len: i32) -> i32 {
         "source_search" => run_source_search(&input),
         "source_detail" => run_source_detail(&input),
         "source_download" => run_source_download(&input),
+        "source_reader" => run_source_reader(&input),
+        "source_filters" => run_source_filters(&input),
+        "source_page_asset" => run_source_page_asset(&input),
+        "source_cover_asset" => run_source_cover_asset(&input),
         _ => output_err(&format!("unknown source action: {}", input.action)),
     };
 
@@ -216,7 +225,9 @@ fn plugin_info_json() -> Value {
             "log.write",
             "progress.report",
             "tcp.connect",
-            "task_kv.read"
+            "task_kv.read",
+            "task_kv.write",
+            "asset.install_from_file"
         ]
     })
 }
@@ -302,20 +313,41 @@ fn run_source_detail(input: &PluginInput) -> Value {
     if status != 200 { return output_err(&format!("Detail returned status {status}")); }
 
     let detail = parse_detail_html(&html, &comic_id, &auth);
+    let children: Vec<Value> = detail.chapters.iter().map(|ch| {
+        let ch_id = ch.get("id").and_then(Value::as_str).unwrap_or("0");
+        let ch_title = ch.get("title").and_then(Value::as_str).unwrap_or("");
+        let ch_remote_id = format!("{}_{}", comic_id, ch_id);
+        json!({
+            "kind": "archive",
+            "source_namespace": "bzsource",
+            "remote_id": ch_remote_id,
+            "title": ch_title,
+            "subtitle": "",
+            "cover": detail.cover.clone(),
+            "cover_asset_id": ensure_cover_asset(&detail.cover, &comic_id),
+            "tags": [],
+            "downloadable": true,
+            "readable": true,
+            "parent_remote_id": comic_id,
+            "reader": {
+                "reader_action": "source_reader",
+                "download_action": "source_download",
+            },
+        })
+    }).collect();
     HostBridge::progress(100, "详情加载完成");
     output_ok_data(json!({
-        "id": comic_id,
+        "kind": "tankoubon",
+        "source_namespace": "bzsource",
+        "remote_id": comic_id,
         "title": detail.title,
         "description": detail.description,
         "cover": detail.cover,
+        "cover_asset_id": ensure_cover_asset(&detail.cover, &comic_id),
         "tags": detail.tags,
-        "chapters": detail.chapters,
-        "archives": [{
-            "id": comic_id,
-            "title": detail.title,
-            "filename": format!("baozi-{comic_id}.zip"),
-            "size": 0
-        }],
+        "downloadable": true,
+        "readable": true,
+        "children": children,
     }))
 }
 
@@ -342,6 +374,226 @@ fn run_source_download(input: &PluginInput) -> Value {
     output_ok_data(json!({ "images": images }))
 }
 
+fn run_source_reader(input: &PluginInput) -> Value {
+    let auth = match load_bz_auth() {
+        Ok(v) => v,
+        Err(e) => return output_err(&e),
+    };
+    let remote_id = extract_remote_id(&input.params);
+    if remote_id.is_empty() { return output_err("remote_id is required for reader"); }
+    let (comic_id, chapter_id) = match remote_id.split_once('_') {
+        Some((c, ch)) => (c.to_string(), ch.to_string()),
+        None => return output_err("invalid remote_id format, expected comic_id_chapter_id"),
+    };
+
+    let app_url = format!("https://appcn.baozimh.com/baozimhapp/comic/chapter/{comic_id}/0_{chapter_id}.html");
+    HostBridge::log(1, &format!("bzsource reader GET {app_url}"));
+
+    let (status, html) = match http_get_with_retry(&app_url, &build_headers(&auth), MAX_HTTP_RETRIES) {
+        Ok(v) => v,
+        Err(e) => return output_err(&format!("Chapter fetch failed: {e}")),
+    };
+    if status != 200 { return output_err(&format!("Chapter returned status {status}")); }
+
+    let image_urls = parse_chapter_images(&html, &auth);
+    if image_urls.is_empty() {
+        return output_err("No images found in chapter");
+    }
+
+    let mut pages = Vec::with_capacity(image_urls.len());
+    for (idx, image_url) in image_urls.iter().enumerate() {
+        pages.push(json!({
+            "asset_ref": image_url,
+            "type": "image"
+        }));
+    }
+
+    HostBridge::progress(100, "阅读器加载完成");
+    output_ok_data(json!({ "pages": pages }))
+}
+
+fn run_source_page_asset(input: &PluginInput) -> Value {
+    let remote_id = extract_remote_id(&input.params);
+    if remote_id.is_empty() {
+        return output_err("remote_id is required for page_asset");
+    }
+
+    let page = input.params.get("page").and_then(|v| match v {
+        Value::Number(n) => n.as_u64(),
+        Value::String(s) => s.parse::<u64>().ok(),
+        _ => None,
+    }).unwrap_or(0);
+    if page == 0 {
+        return output_err("page is required for page_asset");
+    }
+
+    let asset_ref = input.params.get("asset_ref").and_then(Value::as_str).unwrap_or("");
+    if asset_ref.is_empty() {
+        return output_err("asset_ref is required for page_asset");
+    }
+
+    let cached_asset_id = get_cached_page_asset_id(&remote_id, page);
+    if cached_asset_id > 0 {
+        return output_ok_data(json!({"asset_id": cached_asset_id}));
+    }
+
+    let (comic_id, _chapter_id) = match remote_id.split_once('_') {
+        Some((c, ch)) => (c.to_string(), ch.to_string()),
+        None => return output_err("invalid remote_id format, expected comic_id_chapter_id"),
+    };
+
+    let auth = match load_bz_auth() {
+        Ok(v) => v,
+        Err(e) => return output_err(&e),
+    };
+
+    // Build headers with Referer for CDN
+    let referer_url = format!("https://www.baozimh.com/comic/{comic_id}");
+    let mut img_headers = build_headers(&auth);
+    img_headers.push(("Referer".to_string(), referer_url));
+
+    let ext = asset_ref.rsplit('.').next().unwrap_or("jpg").to_ascii_lowercase();
+    let guest_path = format!("/plugin/bz_page_asset_{remote_id}_{page}.{ext}");
+
+    let response = match http_get(asset_ref, &img_headers) {
+        Ok(resp) => resp,
+        Err(e) => return output_err(&format!("下载第 {page} 页失败: {e}")),
+    };
+
+    if let Err(e) = fs::write(&guest_path, &response.body) {
+        return output_err(&format!("写入第 {page} 页文件失败: {e}"));
+    }
+
+    match HostBridge::call(
+        "asset.install_from_file",
+        json!({
+            "guest_path": &guest_path,
+            "original_filename": &format!("{page}.{ext}"),
+            "content_type": guess_content_type(&ext),
+        }),
+    ) {
+        Ok(resp) => {
+            let asset_id = resp.get("asset_id").and_then(Value::as_i64).unwrap_or(0);
+            if asset_id <= 0 {
+                return output_err(&format!("注册第 {page} 页资产失败: asset_id 无效"));
+            }
+            cache_page_asset_id(&remote_id, page, asset_id);
+            output_ok_data(json!({"asset_id": asset_id}))
+        }
+        Err(e) => output_err(&format!("注册第 {page} 页资产失败: {e}")),
+    }
+}
+
+fn guess_content_type(ext: &str) -> &'static str {
+    match ext {
+        "jpg" | "jpeg" => "image/jpeg",
+        "png" => "image/png",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        _ => "application/octet-stream",
+    }
+}
+
+/// Download an image and register it as a system asset via HostBridge
+fn download_and_install_asset(
+    url: &str,
+    guest_path: &str,
+    original_filename: &str,
+    content_type: &str,
+    referer: Option<&str>,
+) -> Result<i64, String> {
+    let mut headers = Vec::new();
+    if let Some(r) = referer {
+        headers.push(("Referer".to_string(), r.to_string()));
+    }
+    let response = http_get(url, &headers)?;
+    fs::write(guest_path, &response.body).map_err(|e| format!("write failed: {e}"))?;
+    let resp = HostBridge::call("asset.install_from_file", json!({
+        "guest_path": guest_path,
+        "original_filename": original_filename,
+        "content_type": content_type,
+    }))?;
+    resp.get("asset_id").and_then(Value::as_i64).ok_or_else(|| "no asset_id in response".to_string())
+}
+
+/// Ensure cover asset exists for a comic, using task_kv cache
+/// Returns Some(asset_id) on success, None on failure or empty url
+fn ensure_cover_asset(cover_url: &str, comic_id: &str) -> Option<i64> {
+    if cover_url.is_empty() { return None; }
+
+    // Check cache
+    let cache_key = bz_cover_cache_key(comic_id);
+    if let Some(id) = get_cached_cover_asset_id(comic_id) {
+        return Some(id);
+    }
+
+    // Determine extension from URL
+    let url_lower = cover_url.to_ascii_lowercase();
+    let ext = if url_lower.ends_with(".png") { "png" }
+              else if url_lower.ends_with(".gif") { "gif" }
+              else if url_lower.ends_with(".webp") { "webp" }
+              else { "jpg" };
+
+    let guest_path = format!("/plugin/bz_cover_{comic_id}.{ext}");
+    match download_and_install_asset(cover_url, &guest_path, &format!("cover.{ext}"), guess_content_type(ext), None) {
+        Ok(asset_id) => {
+            let _ = HostBridge::task_kv_set(&cache_key, json!(asset_id));
+            Some(asset_id)
+        }
+        Err(e) => {
+            HostBridge::log(2, &format!("bzsource cover asset failed for {comic_id}: {e}"));
+            None
+        }
+    }
+}
+
+fn run_source_cover_asset(input: &PluginInput) -> Value {
+    let comic_id = extract_remote_id(&input.params);
+    if comic_id.is_empty() {
+        return output_err("remote_id is required for cover_asset");
+    }
+    let cover_ref = input.params.get("cover_ref").and_then(Value::as_str).unwrap_or("");
+    if cover_ref.is_empty() {
+        return output_err("cover_ref is required for cover_asset");
+    }
+    match ensure_cover_asset(cover_ref, &comic_id) {
+        Some(asset_id) => output_ok_data(json!({"asset_id": asset_id})),
+        None => output_err("failed to create cover asset"),
+    }
+}
+
+fn bz_cover_cache_key(comic_id: &str) -> String {
+    format!("bz_cover_{comic_id}")
+}
+
+fn bz_page_cache_key(remote_id: &str, page: u64) -> String {
+    format!("bz_page_{remote_id}_{page}")
+}
+
+fn get_cached_cover_asset_id(comic_id: &str) -> Option<i64> {
+    let cache_key = bz_cover_cache_key(comic_id);
+    match HostBridge::task_kv_get(&cache_key) {
+        Ok(Some(cached)) => cached.as_i64().filter(|id| *id > 0),
+        _ => None,
+    }
+}
+
+fn get_cached_page_asset_id(remote_id: &str, page: u64) -> i64 {
+    let cache_key = bz_page_cache_key(remote_id, page);
+    match HostBridge::task_kv_get(&cache_key) {
+        Ok(Some(cached)) => cached.as_i64().filter(|id| *id > 0).unwrap_or(0),
+        _ => 0,
+    }
+}
+
+fn cache_page_asset_id(remote_id: &str, page: u64, asset_id: i64) {
+    if asset_id > 0 {
+        let cache_key = bz_page_cache_key(remote_id, page);
+        let _ = HostBridge::task_kv_set(&cache_key, json!(asset_id));
+    }
+}
+
 fn extract_remote_id(params: &Value) -> String {
     params.get("remote_id").and_then(Value::as_str)
         .or_else(|| params.get("__target_id").and_then(Value::as_str))
@@ -362,12 +614,16 @@ fn map_comic_list_items(parsed: &Value, auth: &BzAuthData) -> Vec<Value> {
                 .map(|arr| arr.iter().filter_map(|t| t.as_str()).map(|s| s.to_string()).collect::<Vec<_>>())
                 .unwrap_or_default();
             json!({
-                "id": id,
+                "kind": "tankoubon",
+                "source_namespace": "bzsource",
+                "remote_id": id,
                 "title": title,
                 "subtitle": author,
                 "cover": cover_url,
+                "cover_asset_id": get_cached_cover_asset_id(&id),
                 "tags": tags,
-                "source": "baozi"
+                "downloadable": true,
+                "readable": true,
             })
         }).collect()
 }
@@ -393,12 +649,16 @@ fn parse_search_html(html: &str, auth: &BzAuthData) -> Vec<Value> {
             }
             if !id.is_empty() && !title.is_empty() {
                 items.push(json!({
-                    "id": id,
+                    "kind": "tankoubon",
+                    "source_namespace": "bzsource",
+                    "remote_id": id,
                     "title": title,
                     "subtitle": "",
                     "cover": cover,
+                    "cover_asset_id": get_cached_cover_asset_id(&id),
                     "tags": tags,
-                    "source": "baozi"
+                    "downloadable": true,
+                    "readable": true,
                 }));
             }
         }
@@ -541,6 +801,17 @@ fn transform_image_url(raw: &str, auth: &BzAuthData) -> String {
     raw.to_string()
 }
 
+fn extract_filename(url: &str, idx: usize) -> String {
+    if let Ok(parsed) = Url::parse(url) {
+        if let Some(seg) = parsed.path_segments().and_then(|mut s| s.next_back()) {
+            if !seg.is_empty() {
+                return seg.to_string();
+            }
+        }
+    }
+    format!("page_{}.jpg", idx + 1)
+}
+
 fn strip_tags(input: &str) -> String {
     let re = Regex::new(r"<[^>]+>").unwrap_or_else(|_| Regex::new("").unwrap());
     re.replace_all(input, " ").to_string().split_whitespace().collect::<Vec<_>>().join(" ")
@@ -554,6 +825,50 @@ fn extract_attr(html: &str, attr: &str) -> Option<String> {
 fn extract_tag_text(html: &str, tag: &str) -> Option<String> {
     let re = Regex::new(&format!(r#"<{}[^>]*>(.*?)</{}>"#, tag, tag)).ok()?;
     re.captures(html)?.get(1).map(|m| strip_tags(m.as_str())).filter(|s| !s.is_empty())
+}
+
+fn run_source_filters(_input: &PluginInput) -> Value {
+    output_ok_data(json!({
+        "filters": [
+            {
+                "key": "category",
+                "label": "分类",
+                "type": "select",
+                "options": [
+                    { "label": "全部", "value": "" },
+                    { "label": "热血", "value": "hotblood" },
+                    { "label": "恋爱", "value": "romance" },
+                    { "label": "玄幻", "value": "fantasy" },
+                    { "label": "悬疑", "value": "suspense" },
+                    { "label": "搞笑", "value": "comedy" },
+                    { "label": "校园", "value": "school" },
+                    { "label": "恐怖", "value": "horror" },
+                    { "label": "科幻", "value": "sci-fi" },
+                    { "label": "都市", "value": "urban" }
+                ]
+            },
+            {
+                "key": "language",
+                "label": "语言",
+                "type": "tabs",
+                "options": [
+                    { "label": "简体", "value": "cn" },
+                    { "label": "繁体", "value": "tw" }
+                ]
+            },
+            {
+                "key": "sort",
+                "label": "排序",
+                "type": "select",
+                "options": [
+                    { "label": "最新", "value": "date" },
+                    { "label": "人气", "value": "popular" },
+                    { "label": "评分", "value": "rating" },
+                    { "label": "更新", "value": "update" }
+                ]
+            }
+        ]
+    }))
 }
 
 fn output_err(message: &str) -> Value {
