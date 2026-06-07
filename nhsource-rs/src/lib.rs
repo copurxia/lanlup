@@ -616,20 +616,16 @@ fn run_source_reader(input: &PluginInput) -> Value {
 
     for (idx, path) in page_paths.iter().enumerate() {
         let page_num = idx + 1;
-        let filename = path.trim().trim_end_matches('/').rsplit('/').next().unwrap_or_default().trim();
-        let page_filename = if filename.is_empty() { format!("{page_num}.jpg") } else { filename.to_string() };
         let cached_asset_id = get_cached_page_asset_id(&gallery_id, page_num as u64);
         if cached_asset_id > 0 {
             pages.push(json!({
-                "path": page_filename,
+                "path": path,
                 "asset_id": cached_asset_id,
-                "asset_ref": path,
                 "type": "image"
             }));
         } else {
             pages.push(json!({
-                "path": page_filename,
-                "asset_ref": path,
+                "path": path,
                 "type": "image"
             }));
         }
@@ -645,18 +641,18 @@ fn run_source_page_asset(input: &PluginInput) -> Value {
         return output_err("remote_id (gallery_id) is required for page_asset");
     }
 
+    let asset_path = input.params.get("path").and_then(Value::as_str).unwrap_or("").trim();
+    if asset_path.is_empty() {
+        return output_err("path is required for page_asset");
+    }
+
     let page = input.params.get("page").and_then(|v| match v {
         Value::Number(n) => n.as_u64(),
         Value::String(s) => s.parse::<u64>().ok(),
         _ => None,
-    }).unwrap_or(0);
+    }).unwrap_or_else(|| parse_page_number_from_path(asset_path));
     if page == 0 {
-        return output_err("page is required for page_asset");
-    }
-
-    let asset_ref = input.params.get("asset_ref").and_then(Value::as_str).unwrap_or("");
-    if asset_ref.is_empty() {
-        return output_err("asset_ref is required for page_asset");
+        return output_err("page hint or numeric path filename is required for page_asset");
     }
 
     let cached_asset_id = get_cached_page_asset_id(&gallery_id, page);
@@ -679,9 +675,9 @@ fn run_source_page_asset(input: &PluginInput) -> Value {
 
     let gallery_id_i64 = gallery_id.parse::<i64>().unwrap_or(0);
     let server = pick_image_server(&image_servers, gallery_id_i64, page as usize);
-    let image_url = format!("{}/{}", server.trim_end_matches('/'), asset_ref.trim_start_matches('/'));
+    let image_url = format!("{}/{}", server.trim_end_matches('/'), asset_path.trim_start_matches('/'));
 
-    let ext = asset_ref.rsplit('.').next().unwrap_or("jpg").to_ascii_lowercase();
+    let ext = asset_path.rsplit('.').next().unwrap_or("jpg").to_ascii_lowercase();
     let guest_path = format!("/plugin/{gallery_id}_{page}.{ext}");
 
     let gallery_url = format!("https://nhentai.net/g/{gallery_id}/");
@@ -859,6 +855,16 @@ fn parse_gallery_page_paths(gallery: &Value) -> Vec<String> {
     }
 
     page_paths
+}
+
+fn parse_page_number_from_path(path: &str) -> u64 {
+    let filename = path.trim().trim_end_matches('/').rsplit('/').next().unwrap_or_default();
+    let stem = filename.split('.').next().unwrap_or_default();
+    stem.chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect::<String>()
+        .parse::<u64>()
+        .unwrap_or(0)
 }
 
 fn fetch_image_servers(auth: &NhAuthData) -> Result<Vec<String>, String> {
