@@ -640,11 +640,11 @@ fn run_source_reader(input: &PluginInput) -> Value {
         return output_err("no image pages found");
     }
 
-    // Lazy mode: return asset_ref (image page URL) for each page;
-    // actual download deferred to source_page_asset
-    let pages: Vec<Value> = image_page_urls.iter().map(|url| {
+    // Lazy mode: return path (page number + image page URL); actual download deferred to source_page_asset.
+    let pages: Vec<Value> = image_page_urls.iter().enumerate().map(|(idx, url)| {
+        let page_num = idx + 1;
         json!({
-            "asset_ref": url,
+            "path": format!("{page_num}|{url}"),
             "type": "image"
         })
     }).collect();
@@ -663,18 +663,19 @@ fn run_source_page_asset(input: &PluginInput) -> Value {
         None => return output_err(&format!("invalid gallery id: {remote_id}")),
     };
 
+    let asset_path = input.params.get("path").and_then(Value::as_str).unwrap_or("").trim();
+    if asset_path.is_empty() {
+        return output_err("path is required for page_asset");
+    }
+    let (path_page, image_page_url) = split_page_asset_path(asset_path);
+
     let page = input.params.get("page").and_then(|v| match v {
         Value::Number(n) => n.as_u64(),
         Value::String(s) => s.parse::<u64>().ok(),
         _ => None,
-    }).unwrap_or(0);
+    }).unwrap_or(path_page);
     if page == 0 {
-        return output_err("page is required for page_asset");
-    }
-
-    let asset_ref = input.params.get("asset_ref").and_then(Value::as_str).unwrap_or("");
-    if asset_ref.is_empty() {
-        return output_err("asset_ref is required for page_asset");
+        return output_err("page hint or path prefix is required for page_asset");
     }
 
     let gid_str = gid.to_string();
@@ -687,7 +688,7 @@ fn run_source_page_asset(input: &PluginInput) -> Value {
     let cookies = build_eh_login_cookies(&auth);
 
     // Fetch the image page to extract actual image URL
-    let img_url = match fetch_image_url(asset_ref, &cookies) {
+    let img_url = match fetch_image_url(&image_page_url, &cookies) {
         Ok(url) => url,
         Err(e) => return output_err(&format!("failed to fetch image page: {e}")),
     };
@@ -697,7 +698,7 @@ fn run_source_page_asset(input: &PluginInput) -> Value {
 
     // Download image bytes with referer
     let image_response = match http_request_bytes_follow_redirects_with_headers(
-        "GET", &img_url, None, Some(asset_ref), &cookies, &[],
+        "GET", &img_url, None, Some(&image_page_url), &cookies, &[],
     ) {
         Ok(resp) => resp,
         Err(e) => return output_err(&format!("failed to download image: {e}")),
@@ -1509,6 +1510,14 @@ fn build_cookie_header(url: &str, cookies: &[LoginCookie]) -> String {
         pairs.push(format!("{name}={value}"));
     }
     pairs.join("; ")
+}
+
+fn split_page_asset_path(path: &str) -> (u64, String) {
+    if let Some((page_raw, asset_url)) = path.split_once('|') {
+        let page = page_raw.trim().parse::<u64>().unwrap_or(0);
+        return (page, asset_url.trim().to_string());
+    }
+    (0, path.trim().to_string())
 }
 
 #[cfg(not(target_arch = "wasm32"))]

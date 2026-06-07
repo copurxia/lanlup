@@ -1008,12 +1008,12 @@ fn run_source_reader(input: &PluginInput) -> Value {
         return output_err("No pages found");
     }
 
-    // Lazy mode: return asset_ref instead of downloading images eagerly
+    // Lazy mode: return path (page number + image URL) instead of downloading images eagerly.
     let pages: Vec<Value> = pages_meta.iter().enumerate().map(|(idx, page_meta)| {
         let page_num = idx + 1;
         let img_url = page_meta.get("url").and_then(Value::as_str).unwrap_or("");
         json!({
-            "asset_ref": img_url,
+            "path": format!("{page_num}|{img_url}"),
             "type": "image",
             "page": page_num,
         })
@@ -1029,18 +1029,19 @@ fn run_source_page_asset(input: &PluginInput) -> Value {
         return output_err("remote_id (comic_id) is required for page_asset");
     }
 
+    let asset_path = input.params.get("path").and_then(Value::as_str).unwrap_or("").trim();
+    if asset_path.is_empty() {
+        return output_err("path is required for page_asset");
+    }
+    let (path_page, image_url) = split_page_asset_path(asset_path);
+
     let page = input.params.get("page").and_then(|v| match v {
         Value::Number(n) => n.as_u64(),
         Value::String(s) => s.parse::<u64>().ok(),
         _ => None,
-    }).unwrap_or(0);
+    }).unwrap_or(path_page);
     if page == 0 {
-        return output_err("page is required for page_asset");
-    }
-
-    let asset_ref = input.params.get("asset_ref").and_then(Value::as_str).unwrap_or("");
-    if asset_ref.is_empty() {
-        return output_err("asset_ref is required for page_asset");
+        return output_err("page hint or path prefix is required for page_asset");
     }
 
     let cached_asset_id = get_cached_page_asset_id(&comic_id, page);
@@ -1054,8 +1055,8 @@ fn run_source_page_asset(input: &PluginInput) -> Value {
         Err(e) => return output_err(&e),
     };
 
-    // Download image from the asset_ref URL
-    let response = match http_get_with_retry(asset_ref, &[], MAX_HTTP_RETRIES) {
+    // Download image from the path URL
+    let response = match http_get_with_retry(&image_url, &[], MAX_HTTP_RETRIES) {
         Ok(resp) => resp,
         Err(e) => return output_err(&format!("下载第 {page} 页失败: {e}")),
     };
@@ -1065,7 +1066,7 @@ fn run_source_page_asset(input: &PluginInput) -> Value {
     }
 
     // Determine extension from URL
-    let url_lower = asset_ref.to_ascii_lowercase();
+    let url_lower = image_url.to_ascii_lowercase();
     let ext = if url_lower.ends_with(".png") { "png" }
               else if url_lower.ends_with(".gif") { "gif" }
               else if url_lower.ends_with(".webp") { "webp" }
@@ -1173,6 +1174,14 @@ fn picacg_cover_cache_key(comic_id: &str) -> String {
 
 fn picacg_page_cache_key(comic_id: &str, page: u64) -> String {
     format!("picacg_page_{comic_id}_{page}")
+}
+
+fn split_page_asset_path(path: &str) -> (u64, String) {
+    if let Some((page_raw, asset_url)) = path.split_once('|') {
+        let page = page_raw.trim().parse::<u64>().unwrap_or(0);
+        return (page, asset_url.trim().to_string());
+    }
+    (0, path.trim().to_string())
 }
 
 fn get_cached_cover_asset_id(comic_id: &str) -> Option<i64> {

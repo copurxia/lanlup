@@ -402,8 +402,9 @@ fn run_source_reader(input: &PluginInput) -> Value {
 
     let mut pages = Vec::with_capacity(image_urls.len());
     for (idx, image_url) in image_urls.iter().enumerate() {
+        let page_num = idx + 1;
         pages.push(json!({
-            "asset_ref": image_url,
+            "path": format!("{page_num}|{image_url}"),
             "type": "image"
         }));
     }
@@ -418,18 +419,19 @@ fn run_source_page_asset(input: &PluginInput) -> Value {
         return output_err("remote_id is required for page_asset");
     }
 
+    let asset_path = input.params.get("path").and_then(Value::as_str).unwrap_or("").trim();
+    if asset_path.is_empty() {
+        return output_err("path is required for page_asset");
+    }
+    let (path_page, image_url) = split_page_asset_path(asset_path);
+
     let page = input.params.get("page").and_then(|v| match v {
         Value::Number(n) => n.as_u64(),
         Value::String(s) => s.parse::<u64>().ok(),
         _ => None,
-    }).unwrap_or(0);
+    }).unwrap_or(path_page);
     if page == 0 {
-        return output_err("page is required for page_asset");
-    }
-
-    let asset_ref = input.params.get("asset_ref").and_then(Value::as_str).unwrap_or("");
-    if asset_ref.is_empty() {
-        return output_err("asset_ref is required for page_asset");
+        return output_err("page hint or path prefix is required for page_asset");
     }
 
     let cached_asset_id = get_cached_page_asset_id(&remote_id, page);
@@ -452,10 +454,10 @@ fn run_source_page_asset(input: &PluginInput) -> Value {
     let mut img_headers = build_headers(&auth);
     img_headers.push(("Referer".to_string(), referer_url));
 
-    let ext = asset_ref.rsplit('.').next().unwrap_or("jpg").to_ascii_lowercase();
+    let ext = image_url.rsplit('.').next().unwrap_or("jpg").to_ascii_lowercase();
     let guest_path = format!("/plugin/bz_page_asset_{remote_id}_{page}.{ext}");
 
-    let response = match http_get(asset_ref, &img_headers) {
+    let response = match http_get(&image_url, &img_headers) {
         Ok(resp) => resp,
         Err(e) => return output_err(&format!("下载第 {page} 页失败: {e}")),
     };
@@ -1154,6 +1156,14 @@ fn parse_http(raw: &[u8]) -> Result<HttpResponse, String> {
         rest.to_vec()
     };
     Ok(HttpResponse { status, headers, body })
+}
+
+fn split_page_asset_path(path: &str) -> (u64, String) {
+    if let Some((page_raw, asset_url)) = path.split_once('|') {
+        let page = page_raw.trim().parse::<u64>().unwrap_or(0);
+        return (page, asset_url.trim().to_string());
+    }
+    (0, path.trim().to_string())
 }
 
 fn decode_chunked(input: &[u8]) -> Result<Vec<u8>, String> {

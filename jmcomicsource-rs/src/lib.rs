@@ -792,7 +792,7 @@ fn run_source_reader(input: &PluginInput) -> Value {
 
     let total_images = images.len();
 
-    // Lazy mode: return asset_ref (image URL) for each page without downloading
+    // Lazy mode: return path (page number + image URL) without downloading.
     let mut pages = Vec::new();
     for (idx, img_name_val) in images.iter().enumerate() {
         let img_name = img_name_val.as_str().unwrap_or("");
@@ -803,7 +803,7 @@ fn run_source_reader(input: &PluginInput) -> Value {
         HostBridge::progress(50, &format!("解析第 {page_num}/{total_images} 页..."));
         let img_url = format!("{}/media/photos/{}/{}", image_base, ep_id, img_name);
         pages.push(json!({
-            "asset_ref": img_url,
+            "path": format!("{page_num}|{img_url}"),
             "type": "image",
             "page": page_num,
         }));
@@ -821,17 +821,19 @@ fn run_source_page_asset(input: &PluginInput) -> Value {
     if remote_id.is_empty() {
         return output_err("remote_id is required for page_asset");
     }
+    let asset_path = input.params.get("path").and_then(Value::as_str).unwrap_or("").trim();
+    if asset_path.is_empty() {
+        return output_err("path is required for page_asset");
+    }
+    let (path_page, image_url) = split_page_asset_path(asset_path);
+
     let page = input.params.get("page").and_then(|v| match v {
         Value::Number(n) => n.as_u64(),
         Value::String(s) => s.parse::<u64>().ok(),
         _ => None,
-    }).unwrap_or(0);
+    }).unwrap_or(path_page);
     if page == 0 {
-        return output_err("page is required for page_asset");
-    }
-    let asset_ref = input.params.get("asset_ref").and_then(Value::as_str).unwrap_or("");
-    if asset_ref.is_empty() {
-        return output_err("asset_ref is required for page_asset");
+        return output_err("page hint or path prefix is required for page_asset");
     }
 
     let cached_asset_id = get_cached_page_asset_id(&remote_id, page);
@@ -846,10 +848,10 @@ fn run_source_page_asset(input: &PluginInput) -> Value {
     let bypass_url = resolve_bypass_url(&input.params, &auth);
 
     let ep_id = remote_id.as_str();
-    let ext = asset_ref.rsplit('.').next().unwrap_or("jpg").to_ascii_lowercase();
+    let ext = image_url.rsplit('.').next().unwrap_or("jpg").to_ascii_lowercase();
     let guest_path = format!("/plugin/jm_{ep_id}_{page}.{ext}");
 
-    let response = match http_get(asset_ref, None, "image/*", &[], &bypass_url) {
+    let response = match http_get(&image_url, None, "image/*", &[], &bypass_url) {
         Ok(resp) => resp,
         Err(e) => return output_err(&format!("下载第 {page} 页失败: {e}")),
     };
@@ -1881,6 +1883,14 @@ fn is_redirect_status(status: u16) -> bool {
 
 fn is_retryable_status(status: u16) -> bool {
     matches!(status, 408 | 425 | 500 | 502 | 503 | 504)
+}
+
+fn split_page_asset_path(path: &str) -> (u64, String) {
+    if let Some((page_raw, asset_url)) = path.split_once('|') {
+        let page = page_raw.trim().parse::<u64>().unwrap_or(0);
+        return (page, asset_url.trim().to_string());
+    }
+    (0, path.trim().to_string())
 }
 
 #[cfg(not(target_arch = "wasm32"))]
