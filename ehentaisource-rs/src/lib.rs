@@ -5,7 +5,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::alloc::{alloc, dealloc, Layout};
 use std::cell::RefCell;
-use std::fs;
 use std::io::{self, Read, Write};
 use std::slice;
 use std::sync::Arc;
@@ -21,7 +20,6 @@ use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 
 const USER_AGENT: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
-const EH_API_URL: &str = "https://api.e-hentai.org/api.php";
 const DEFAULT_TIMEOUT_MS: i32 = 30_000;
 const MAX_REDIRECTS: usize = 5;
 const AUTH_DATA_KEY: &str = "__lanlu.phase.ehlogin.data";
@@ -153,11 +151,6 @@ impl HostBridge {
         let found = response.get("found").and_then(Value::as_bool).unwrap_or(false);
         if !found { return Ok(None); }
         Ok(response.get("value").cloned())
-    }
-
-    fn task_kv_set(key: &str, value: Value) -> Result<(), String> {
-        Self::call("task_kv.set", json!({ "key": key, "value": value }))?;
-        Ok(())
     }
 }
 
@@ -298,12 +291,7 @@ pub extern "C" fn lanlu_plugin_run(input_ptr: i32, input_len: i32) -> i32 {
     let result = match input.action.as_str() {
         "source_home" => run_source_home(&input),
         "source_search" => run_source_search(&input),
-        "source_detail" => run_source_detail(&input),
-        "source_download" => run_source_download(&input),
-        "source_reader" => run_source_reader(&input),
         "source_filters" => run_source_filters(&input),
-        "source_page_asset" => run_source_page_asset(&input),
-        "source_cover_asset" => run_source_cover_asset(&input),
         _ => output_err(&format!("unknown source action: {}", input.action)),
     };
 
@@ -347,8 +335,7 @@ fn plugin_info_json() -> Value {
             "progress.report",
             "tcp.connect",
             "task_kv.read",
-            "task_kv.write",
-            "asset.install_from_file"
+            "task_kv.write"
         ]
     })
 }
@@ -453,11 +440,14 @@ fn load_eh_auth() -> Result<EhAuthData, String> {
 fn build_eh_login_cookies(auth: &EhAuthData) -> Vec<LoginCookie> {
     let member_id = auth.ipb_member_id.trim();
     let pass_hash = auth.ipb_pass_hash.trim();
-    if member_id.is_empty() || pass_hash.is_empty() { return Vec::new(); }
     let mut cookies = Vec::new();
     for domain in ["e-hentai.org", "exhentai.org"] {
-        cookies.push(LoginCookie { name: "ipb_member_id".to_string(), value: member_id.to_string(), domain: domain.to_string(), path: "/".to_string() });
-        cookies.push(LoginCookie { name: "ipb_pass_hash".to_string(), value: pass_hash.to_string(), domain: domain.to_string(), path: "/".to_string() });
+        // EH/ExHentai 需要 nw=1 才能跳过警告/熊猫页面；无登录态时也需要它。
+        cookies.push(LoginCookie { name: "nw".to_string(), value: "1".to_string(), domain: domain.to_string(), path: "/".to_string() });
+        if !member_id.is_empty() && !pass_hash.is_empty() {
+            cookies.push(LoginCookie { name: "ipb_member_id".to_string(), value: member_id.to_string(), domain: domain.to_string(), path: "/".to_string() });
+            cookies.push(LoginCookie { name: "ipb_pass_hash".to_string(), value: pass_hash.to_string(), domain: domain.to_string(), path: "/".to_string() });
+        }
         if !auth.star.trim().is_empty() {
             cookies.push(LoginCookie { name: "star".to_string(), value: auth.star.trim().to_string(), domain: domain.to_string(), path: "/".to_string() });
         }
@@ -530,506 +520,17 @@ fn run_source_search(input: &PluginInput) -> Value {
     }))
 }
 
-fn run_source_detail(input: &PluginInput) -> Value {
-    HostBridge::progress(10, "Loading detail...");
-    let remote_id = extract_remote_id(&input.params);
-    if remote_id.is_empty() {
-        return output_err("remote_id is required for detail");
-    }
-    let (gid, token, domain) = match parse_gallery_url_full(&remote_id) {
-        Some(v) => v,
-        None => return output_err(&format!("invalid gallery id: {remote_id}")),
-    };
-    let auth = match load_eh_auth() { Ok(v) => v, Err(e) => return output_err(&e) };
-    let cookies = build_eh_login_cookies(&auth);
-
-    let mut detail = match fetch_gallery_detail(&gid, &token, &cookies) {
-        Ok(v) => v,
-        Err(e) => return output_err(&format!("detail fetch failed: {e}")),
-    };
-    let gallery_url = format!("{domain}/g/{gid}/{token}/");
-    if let Value::Object(ref mut map) = detail {
-        map.insert("id".to_string(), Value::String(gallery_url));
-    }
-
-    HostBridge::progress(100, "Detail loaded");
-    output_ok_data(detail)
-}
-
-fn run_source_download(input: &PluginInput) -> Value {
-    let remote_id = extract_remote_id(&input.params);
-    if remote_id.is_empty() {
-        return output_err("remote_id is required for download");
-    }
-    let (gid, token, domain) = match parse_gallery_url_full(&remote_id) {
-        Some(v) => v,
-        None => return output_err(&format!("invalid gallery id: {remote_id}")),
-    };
-    let gallery_url = format!("{domain}/g/{gid}/{token}/");
-    HostBridge::log(1, &format!("ehentaisource enqueue download: {gallery_url}"));
-    output_ok_data(json!({
-        "gallery_url": gallery_url,
-        "gallery_id": gid,
-    }))
-}
-
-fn run_source_reader(input: &PluginInput) -> Value {
-    HostBridge::progress(5, "Loading reader...");
-    let remote_id = extract_remote_id(&input.params);
-    if remote_id.is_empty() {
-        return output_err("remote_id is required for reader");
-    }
-    let (gid, token, domain) = match parse_gallery_url_full(&remote_id) {
-        Some(v) => v,
-        None => return output_err(&format!("invalid gallery id: {remote_id}")),
-    };
-    let auth = match load_eh_auth() { Ok(v) => v, Err(e) => return output_err(&e) };
-    let cookies = build_eh_login_cookies(&auth);
-
-    // Collect image page URLs from gallery pages (metadata only, no image downloads)
-    let mut image_page_urls: Vec<String> = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    const MAX_PAGES: usize = 200;
-
-    let mut thumb_page = 0;
-    loop {
-        let gallery_url = if thumb_page == 0 {
-            format!("{domain}/g/{gid}/{token}/")
-        } else {
-            format!("{domain}/g/{gid}/{token}/?p={thumb_page}")
-        };
-
-        let response = match http_request_text("GET", &gallery_url, None, None, &cookies, &[]) {
-            Ok(v) => v,
-            Err(e) => {
-                HostBridge::log(2, &format!("gallery page fetch failed: {e}"));
-                break;
-            }
-        };
-        if response.status >= 400 {
-            HostBridge::log(2, &format!("gallery page HTTP {}", response.status));
-            break;
-        }
-
-        let links = parse_image_page_links(&response.text, &gid, &domain);
-        if links.is_empty() {
-            break;
-        }
-
-        let mut new_found = false;
-        for url in links {
-            if seen.insert(url.clone()) {
-                image_page_urls.push(url);
-                new_found = true;
-                if image_page_urls.len() >= MAX_PAGES {
-                    break;
-                }
-            }
-        }
-
-        if !new_found || image_page_urls.len() >= MAX_PAGES {
-            break;
-        }
-        thumb_page += 1;
-        if thumb_page > 20 {
-            break;
-        }
-    }
-
-    if image_page_urls.is_empty() {
-        return output_err("no image pages found");
-    }
-
-    // Lazy mode: return path (page number + image page URL); actual download deferred to source_page_asset.
-    let pages: Vec<Value> = image_page_urls.iter().enumerate().map(|(idx, url)| {
-        let page_num = idx + 1;
-        json!({
-            "path": format!("{page_num}|{url}"),
-            "type": "image"
-        })
-    }).collect();
-
-    HostBridge::progress(100, "Reader complete");
-    output_ok_data(json!({ "pages": pages }))
-}
-
-fn run_source_page_asset(input: &PluginInput) -> Value {
-    let remote_id = extract_remote_id(&input.params);
-    if remote_id.is_empty() {
-        return output_err("remote_id is required for page_asset");
-    }
-    let (gid, token, domain) = match parse_gallery_url_full(&remote_id) {
-        Some(v) => v,
-        None => return output_err(&format!("invalid gallery id: {remote_id}")),
-    };
-
-    let asset_path = input.params.get("path").and_then(Value::as_str).unwrap_or("").trim();
-    if asset_path.is_empty() {
-        return output_err("path is required for page_asset");
-    }
-    let (path_page, image_page_url) = split_page_asset_path(asset_path);
-
-    let page = input.params.get("page").and_then(|v| match v {
-        Value::Number(n) => n.as_u64(),
-        Value::String(s) => s.parse::<u64>().ok(),
-        _ => None,
-    }).unwrap_or(path_page);
-    if page == 0 {
-        return output_err("page hint or path prefix is required for page_asset");
-    }
-
-    let gid_str = gid.to_string();
-    let cached_asset_id = get_cached_page_asset_id(&gid_str, page);
-    if cached_asset_id > 0 {
-        return output_ok_data(json!({"asset_id": cached_asset_id}));
-    }
-
-    let auth = match load_eh_auth() { Ok(v) => v, Err(e) => return output_err(&e) };
-    let cookies = build_eh_login_cookies(&auth);
-
-    // Fetch the image page to extract actual image URL
-    let img_url = match fetch_image_url(&image_page_url, &cookies) {
-        Ok(url) => url,
-        Err(e) => return output_err(&format!("failed to fetch image page: {e}")),
-    };
-    if img_url.is_empty() {
-        return output_err("image URL not found");
-    }
-
-    // Download image bytes with referer
-    let image_response = match http_request_bytes_follow_redirects_with_headers(
-        "GET", &img_url, None, Some(&image_page_url), &cookies, &[],
-    ) {
-        Ok(resp) => resp,
-        Err(e) => return output_err(&format!("failed to download image: {e}")),
-    };
-    if image_response.status >= 400 {
-        return output_err(&format!("image download HTTP {}", image_response.status));
-    }
-
-    let ext = "jpg";
-    let guest_path = format!("/plugin/eh_{gid_str}_{page}.{ext}");
-    if let Err(e) = fs::write(&guest_path, &image_response.body) {
-        return output_err(&format!("failed to write image file: {e}"));
-    }
-
-    match HostBridge::call(
-        "asset.install_from_file",
-        json!({
-            "guest_path": &guest_path,
-            "original_filename": &format!("{page}.{ext}"),
-            "content_type": guess_content_type(ext),
-        }),
-    ) {
-        Ok(resp) => {
-            let asset_id = resp.get("asset_id").and_then(Value::as_i64).unwrap_or(0);
-            if asset_id <= 0 {
-                return output_err("asset.install_from_file returned invalid asset_id");
-            }
-            cache_page_asset_id(&gid_str, page, asset_id);
-            output_ok_data(json!({"asset_id": asset_id}))
-        }
-        Err(e) => output_err(&format!("asset.install_from_file failed: {e}")),
-    }
-}
-
-fn guess_content_type(ext: &str) -> &'static str {
-    match ext {
-        "jpg" | "jpeg" => "image/jpeg",
-        "png" => "image/png",
-        "gif" => "image/gif",
-        "webp" => "image/webp",
-        "bmp" => "image/bmp",
-        _ => "application/octet-stream",
-    }
-}
-
-fn run_source_cover_asset(input: &PluginInput) -> Value {
-    let remote_id = extract_remote_id(&input.params);
-    if remote_id.is_empty() {
-        return output_err("remote_id is required for cover_asset");
-    }
-    let cover_ref = input.params.get("cover_ref").and_then(Value::as_str).unwrap_or("");
-    if cover_ref.is_empty() {
-        return output_err("cover_ref is required for cover_asset");
-    }
-    let gallery_id = parse_gallery_url_full(&remote_id).map(|(gid, _, _)| gid).unwrap_or(remote_id);
-    match ensure_cover_asset(cover_ref, &gallery_id) {
-        Some(asset_id) => output_ok_data(json!({"asset_id": asset_id})),
-        None => output_err("failed to create cover asset"),
-    }
-}
-
-/// Download an image and register it as a system asset via HostBridge
-fn download_and_install_asset(
-    url: &str,
-    guest_path: &str,
-    original_filename: &str,
-    content_type: &str,
-    referer: Option<&str>,
-) -> Result<i64, String> {
-    let auth = match load_eh_auth() {
-        Ok(v) => v,
-        Err(_) => EhAuthData::default(),
-    };
-    let cookies = build_eh_login_cookies(&auth);
-    let response = http_request_bytes_follow_redirects_with_headers(
-        "GET", url, None, referer, &cookies, &[],
-    ).map_err(|e| format!("download failed: {e}"))?;
-    if response.status >= 400 {
-        return Err(format!("download HTTP {}", response.status));
-    }
-    fs::write(guest_path, &response.body).map_err(|e| format!("write failed: {e}"))?;
-    let resp = HostBridge::call("asset.install_from_file", json!({
-        "guest_path": guest_path,
-        "original_filename": original_filename,
-        "content_type": content_type,
-    }))?;
-    resp.get("asset_id").and_then(Value::as_i64).ok_or_else(|| "no asset_id in response".to_string())
-}
-
-/// Ensure cover asset exists, using task_kv cache
-fn ensure_cover_asset(cover_url: &str, gallery_id: &str) -> Option<i64> {
-    if cover_url.is_empty() { return None; }
-
-    // Check cache
-    let cache_key = ehentai_cover_cache_key(gallery_id);
-    if let Some(id) = get_cached_cover_asset_id(gallery_id) {
-        return Some(id);
-    }
-
-    // Determine extension from URL
-    let url_lower = cover_url.to_ascii_lowercase();
-    let ext = if url_lower.ends_with(".png") { "png" }
-              else if url_lower.ends_with(".gif") { "gif" }
-              else if url_lower.ends_with(".webp") { "webp" }
-              else { "jpg" };
-
-    let guest_path = format!("/plugin/eh_cover_{gallery_id}.{ext}");
-    match download_and_install_asset(cover_url, &guest_path, &format!("cover.{ext}"), guess_content_type(ext), None) {
-        Ok(asset_id) => {
-            let _ = HostBridge::task_kv_set(&cache_key, json!(asset_id));
-            Some(asset_id)
-        }
-        Err(e) => {
-            HostBridge::log(2, &format!("ehentai cover asset failed for {gallery_id}: {e}"));
-            None
-        }
-    }
-}
-
-fn ehentai_cover_cache_key(gallery_id: &str) -> String {
-    format!("ehentai_cover_{gallery_id}")
-}
-
-fn ehentai_page_cache_key(gallery_id: &str, page: u64) -> String {
-    format!("ehentai_page_{gallery_id}_{page}")
-}
-
-fn get_cached_cover_asset_id(gallery_id: &str) -> Option<i64> {
-    let cache_key = ehentai_cover_cache_key(gallery_id);
-    match HostBridge::task_kv_get(&cache_key) {
-        Ok(Some(cached)) => cached.as_i64().filter(|id| *id > 0),
-        _ => None,
-    }
-}
-
-fn get_cached_page_asset_id(gallery_id: &str, page: u64) -> i64 {
-    let cache_key = ehentai_page_cache_key(gallery_id, page);
-    match HostBridge::task_kv_get(&cache_key) {
-        Ok(Some(cached)) => cached.as_i64().filter(|id| *id > 0).unwrap_or(0),
-        _ => 0,
-    }
-}
-
-fn cache_page_asset_id(gallery_id: &str, page: u64, asset_id: i64) {
-    if asset_id > 0 {
-        let cache_key = ehentai_page_cache_key(gallery_id, page);
-        let _ = HostBridge::task_kv_set(&cache_key, json!(asset_id));
-    }
-}
-
-fn parse_image_page_links(html: &str, gid: &str, domain: &str) -> Vec<String> {
-    let mut urls = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    let pattern = format!(r#"href=["']([^"']*/s/[0-9a-fA-F]+/{}-\d+/?)["']"#, gid);
-    let re = regex(&pattern);
-    for caps in re.captures_iter(html) {
-        let raw = caps.get(1).unwrap().as_str();
-        let url = if raw.starts_with("http://") || raw.starts_with("https://") {
-            raw.to_string()
-        } else if raw.starts_with('/') {
-            format!("{domain}{raw}")
-        } else {
-            format!("{domain}/{raw}")
-        };
-        if seen.insert(url.clone()) {
-            urls.push(url);
-        }
-    }
-    urls
-}
-
-fn fetch_image_url(image_page_url: &str, cookies: &[LoginCookie]) -> Result<String, String> {
-    let response = http_request_text("GET", image_page_url, None, None, cookies, &[])?;
-    if response.status >= 400 {
-        return Err(format!("image page HTTP {}", response.status));
-    }
-    let tag_re = regex(r#"(?is)<img\b[^>]*?\bid=["']img["'][^>]*?>"#);
-    if let Some(tag_cap) = tag_re.captures(&response.text) {
-        let tag = tag_cap.get(0).unwrap().as_str();
-        let src_re = regex(r#"src=["']([^"']+)["']"#);
-        if let Some(src_cap) = src_re.captures(tag) {
-            let src = src_cap.get(1).unwrap().as_str();
-            if src.starts_with("http://") || src.starts_with("https://") {
-                return Ok(src.to_string());
-            }
-            let base = Url::parse(image_page_url).map_err(|e| e.to_string())?;
-            let resolved = base.join(src).map_err(|e| e.to_string())?;
-            return Ok(resolved.to_string());
-        }
-    }
-    Err("image URL not found".to_string())
-}
-
-fn extract_remote_id(params: &Value) -> String {
-    params.get("remote_id")
-        .and_then(Value::as_str)
-        .or_else(|| params.get("__target_id").and_then(Value::as_str))
-        .unwrap_or("")
-        .to_string()
-}
-
-fn parse_gallery_url_full(url: &str) -> Option<(String, String, String)> {
-    let re = regex(r#"^(https?://(?:e-hentai|exhentai)\.org)/g/(\d+)/([0-9A-Za-z]+)/?$"#);
-    if let Some(caps) = re.captures(url) {
-        return Some((caps[2].to_string(), caps[3].to_string(), caps[1].to_string()));
-    }
-    let re2 = regex(r#"^(\d+)/([0-9A-Za-z]+)$"#);
-    if let Some(caps) = re2.captures(url) {
-        return Some((caps[1].to_string(), caps[2].to_string(), "https://e-hentai.org".to_string()));
-    }
-    None
-}
-
 fn eh_item_to_json(item: EhListItem) -> Value {
     json!({
         "kind": "archive",
         "source_namespace": "ehentaisource",
-        "remote_id": item.url,
+        "remote_id": format!("{}/{}", item.gid, item.token),
         "title": item.title,
         "subtitle": "",
         "cover": item.cover,
-        "cover_asset_id": get_cached_cover_asset_id(&item.gid),
         "tags": [],
         "page_count": item.pages,
-        "downloadable": true,
-        "readable": true,
-        "reader": {
-            "page_count": item.pages,
-            "reader_action": "source_reader",
-            "download_action": "source_download",
-        },
     })
-}
-
-fn fetch_gallery_detail(gid: &str, token: &str, cookies: &[LoginCookie]) -> Result<Value, String> {
-    let gid_val: i64 = gid.parse().map_err(|_| "invalid gid".to_string())?;
-    let body = json!({
-        "method": "gdata",
-        "gidlist": [[gid_val, token]],
-        "namespace": 1,
-    }).to_string();
-
-    let response = http_request_text("POST", EH_API_URL, Some(&body), None, cookies, &[("Content-Type".to_string(), "application/json".to_string())])?;
-    if response.status >= 400 {
-        return Err(format!("detail API HTTP {}", response.status));
-    }
-
-    let parsed: Value = serde_json::from_str(&response.text).map_err(|e| e.to_string())?;
-    if let Some(error) = parsed.get("error").and_then(value_to_string) {
-        if !error.trim().is_empty() { return Err(error); }
-    }
-
-    let data = parsed.get("gmetadata")
-        .and_then(Value::as_array)
-        .and_then(|arr| arr.first())
-        .ok_or_else(|| "no metadata returned".to_string())?;
-
-    let title = data.get("title").and_then(value_to_string).unwrap_or_default();
-    let title_jpn = data.get("title_jpn").and_then(value_to_string).unwrap_or_default();
-    let category = data.get("category").and_then(value_to_string).unwrap_or_default();
-    let uploader = data.get("uploader").and_then(value_to_string).unwrap_or_default();
-    let posted = data.get("posted").and_then(value_to_string).unwrap_or_default();
-    let filecount = data.get("filecount").and_then(value_to_string).unwrap_or("0".to_string());
-    let rating = data.get("rating").and_then(|v| v.as_f64()).unwrap_or(0.0);
-    let thumb = data.get("thumb").and_then(value_to_string).unwrap_or_default();
-    let filesize = data.get("filesize").and_then(value_to_string).unwrap_or_default();
-
-    let mut tags: Vec<String> = data.get("tags")
-        .and_then(Value::as_array)
-        .map(|arr| arr.iter().filter_map(value_to_string).collect())
-        .unwrap_or_default();
-    if !category.is_empty() {
-        tags.push(format!("category:{}", category.to_ascii_lowercase()));
-    }
-    if !uploader.is_empty() {
-        tags.push(format!("uploader:{}", uploader));
-    }
-
-    let mut description = String::new();
-    if !title_jpn.is_empty() && title_jpn != title {
-        description.push_str(&title_jpn);
-    }
-    if !category.is_empty() {
-        if !description.is_empty() { description.push('\n'); }
-        description.push_str(&format!("Category: {}", category));
-    }
-    if !uploader.is_empty() {
-        if !description.is_empty() { description.push('\n'); }
-        description.push_str(&format!("Uploader: {}", uploader));
-    }
-    if !posted.is_empty() {
-        if !description.is_empty() { description.push('\n'); }
-        description.push_str(&format!("Posted: {}", posted));
-    }
-    if !filecount.is_empty() && filecount != "0" {
-        if !description.is_empty() { description.push('\n'); }
-        description.push_str(&format!("Pages: {}", filecount));
-    }
-    if !filesize.is_empty() {
-        if !description.is_empty() { description.push('\n'); }
-        description.push_str(&format!("Size: {}", filesize));
-    }
-    if rating > 0.0 {
-        if !description.is_empty() { description.push('\n'); }
-        description.push_str(&format!("Rating: {:.2}", rating));
-    }
-
-    let cover = normalize_cover_url(&thumb, "https://e-hentai.org/");
-    let display_title = if title.is_empty() { "Untitled".to_string() } else { html_unescape(&title) };
-
-    let num_pages = filecount.parse::<u64>().unwrap_or(0);
-    let cover_asset_id = ensure_cover_asset(&cover, gid);
-
-    Ok(json!({
-        "kind": "archive",
-        "source_namespace": "ehentaisource",
-        "remote_id": gid,
-        "title": display_title,
-        "description": description,
-        "cover": cover,
-        "cover_asset_id": cover_asset_id,
-        "tags": tags,
-        "page_count": num_pages,
-        "downloadable": true,
-        "readable": true,
-        "reader": {
-            "page_count": num_pages,
-            "reader_action": "source_reader",
-            "download_action": "source_download",
-        },
-    }))
 }
 
 fn parse_eh_list_html(html: &str, domain: &str) -> Vec<EhListItem> {
@@ -1187,15 +688,6 @@ fn html_unescape(text: &str) -> String {
         .replace("&quot;", "\"")
         .replace("&#39;", "'")
         .replace("&apos;", "'")
-}
-
-fn value_to_string(value: &Value) -> Option<String> {
-    match value {
-        Value::String(s) => Some(s.clone()),
-        Value::Number(n) => Some(n.to_string()),
-        Value::Bool(b) => Some(if *b { "true".to_string() } else { "false".to_string() }),
-        _ => None,
-    }
 }
 
 fn regex(pattern: &str) -> Regex {
@@ -1510,14 +1002,6 @@ fn build_cookie_header(url: &str, cookies: &[LoginCookie]) -> String {
         pairs.push(format!("{name}={value}"));
     }
     pairs.join("; ")
-}
-
-fn split_page_asset_path(path: &str) -> (u64, String) {
-    if let Some((page_raw, asset_url)) = path.split_once('|') {
-        let page = page_raw.trim().parse::<u64>().unwrap_or(0);
-        return (page, asset_url.trim().to_string());
-    }
-    (0, path.trim().to_string())
 }
 
 #[cfg(not(target_arch = "wasm32"))]

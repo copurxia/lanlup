@@ -4,12 +4,12 @@ use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::alloc::{alloc, dealloc, Layout};
-use std::sync::Arc;
 use std::cell::RefCell;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::slice;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use url::Url;
 use webpki_roots::TLS_SERVER_ROOTS;
@@ -89,8 +89,16 @@ struct DownloadProgressState {
 
 #[derive(Debug, Deserialize)]
 struct PluginInput {
+    #[serde(default)]
+    action: String,
     #[serde(rename = "pluginType", default)]
     plugin_type: String,
+    #[serde(rename = "targetType", default)]
+    target_type: String,
+    #[serde(rename = "targetId", default)]
+    target_id: String,
+    #[serde(default)]
+    path: String,
     #[serde(default)]
     params: Value,
     #[serde(default)]
@@ -192,6 +200,10 @@ impl HostBridge {
         Ok(response.get("value").cloned())
     }
 
+    fn task_kv_set(key: &str, value: Value) -> Result<(), String> {
+        Self::call("task_kv.set", json!({ "key": key, "value": value }))?;
+        Ok(())
+    }
 }
 
 #[no_mangle]
@@ -240,7 +252,12 @@ pub extern "C" fn lanlu_plugin_run(input_ptr: i32, input_len: i32) -> i32 {
     };
 
     let _ = &input.plugin_type;
-    let result = run_download(&input);
+    let action = input.action.trim();
+    let result = match action {
+        "resolve_page_asset" => resolve_page_asset(&input),
+        "download_archive" => download_archive(&input),
+        _ => run_download(&input),
+    };
     match serde_json::to_vec(&result) {
         Ok(bytes) => STATE.with(|state| {
             let mut state = state.borrow_mut();
@@ -294,11 +311,97 @@ fn run_download(input: &PluginInput) -> Value {
     } else {
         "https://e-hentai.org"
     };
+    let plugin_dir = resolve_plugin_dir(&input.plugin_dir, "ehdl");
+    perform_archive_download(
+        gid,
+        token,
+        domain,
+        forceresampled,
+        &plugin_dir,
+        &login_cookies,
+    )
+}
+
+/// download_archive action（targetType=source）：从 targetId 解析 remoteId（{gid}/{token} 格式），
+/// 复用整本下载流程。
+fn download_archive(input: &PluginInput) -> Value {
+    let target_id = input.target_id.trim();
+    let remote_id = match extract_remote_id_from_source_id(target_id) {
+        Some(v) if !v.is_empty() => v,
+        _ => return output_err(&format!("invalid sourceId: {target_id}")),
+    };
+
+    // 优先匹配 {gid}/{token} 格式
+    let path_reg = Regex::new(r"^(\d+)/([0-9A-Za-z]+)/?$").expect("valid regex");
+    if let Some(caps) = path_reg.captures(&remote_id) {
+        let gid = caps.get(1).map(|m| m.as_str()).unwrap_or_default();
+        let token = caps.get(2).map(|m| m.as_str()).unwrap_or_default();
+        let domain = "https://e-hentai.org";
+        let auth = match load_eh_auth() {
+            Ok(v) => v,
+            Err(e) => return output_err(&e),
+        };
+        let login_cookies = build_eh_login_cookies(&auth);
+        let forceresampled = read_forceresampled(&input.params);
+        let plugin_dir = resolve_plugin_dir(&input.plugin_dir, "ehdl");
+        return perform_archive_download(
+            gid,
+            token,
+            domain,
+            forceresampled,
+            &plugin_dir,
+            &login_cookies,
+        );
+    }
+
+    // 兼容旧的完整 URL 格式
+    let url_reg = Regex::new(r"^https?://e(-|x)hentai\.org/g/([0-9]+)/([0-9A-Za-z]+)/?.*$")
+        .expect("valid regex");
+    if let Some(caps) = url_reg.captures(&remote_id) {
+        let domain_prefix = caps.get(1).map(|m| m.as_str()).unwrap_or_default();
+        let gid = caps.get(2).map(|m| m.as_str()).unwrap_or_default();
+        let token = caps.get(3).map(|m| m.as_str()).unwrap_or_default();
+        let domain = if domain_prefix == "x" {
+            "https://exhentai.org"
+        } else {
+            "https://e-hentai.org"
+        };
+        let auth = match load_eh_auth() {
+            Ok(v) => v,
+            Err(e) => return output_err(&e),
+        };
+        let login_cookies = build_eh_login_cookies(&auth);
+        let forceresampled = read_forceresampled(&input.params);
+        let plugin_dir = resolve_plugin_dir(&input.plugin_dir, "ehdl");
+        return perform_archive_download(
+            gid,
+            token,
+            domain,
+            forceresampled,
+            &plugin_dir,
+            &login_cookies,
+        );
+    }
+
+    output_err(&format!(
+        "cannot parse remote_id (expected gid/token or full URL): {remote_id}"
+    ))
+}
+
+/// 整本下载核心流程：archiver.php → 下载链接 → 下载 ZIP。供 run_download / download_archive 复用。
+fn perform_archive_download(
+    gid: &str,
+    token: &str,
+    domain: &str,
+    forceresampled: bool,
+    plugin_dir: &str,
+    login_cookies: &[LoginCookie],
+) -> Value {
     let archiver_url = format!("{domain}/archiver.php?gid={gid}&token={token}");
     HostBridge::log(1, &format!("resolved gallery gid={gid} token={token}"));
 
     HostBridge::progress(15, "Checking archiver page...");
-    let check = match http_request_text("GET", &archiver_url, None, None, &login_cookies) {
+    let check = match http_request_text("GET", &archiver_url, None, None, login_cookies) {
         Ok(v) => v,
         Err(e) => return output_err(&format!("Archiver check failed: {e}")),
     };
@@ -327,7 +430,7 @@ fn run_download(input: &PluginInput) -> Value {
         &archiver_url,
         Some(&body),
         Some(&archiver_url),
-        &login_cookies,
+        login_cookies,
     ) {
         Ok(v) => v,
         Err(e) => return output_err(&format!("Download URL generation failed: {e}")),
@@ -370,14 +473,13 @@ fn run_download(input: &PluginInput) -> Value {
         token,
         if forceresampled { "res" } else { "org" }
     );
-    let plugin_dir = resolve_plugin_dir(&input.plugin_dir, "ehdl");
-    let title_hint = extract_gallery_title_hint(&check.1)
-        .or_else(|| extract_gallery_title_hint(&req.1));
+    let title_hint =
+        extract_gallery_title_hint(&check.1).or_else(|| extract_gallery_title_hint(&req.1));
     let (final_relative_path, final_filename) = match download_archive_direct(
         &final_url,
         domain,
-        &login_cookies,
-        &plugin_dir,
+        login_cookies,
+        plugin_dir,
         title_hint.as_deref(),
         &file_name_hint,
     ) {
@@ -400,7 +502,9 @@ fn run_download(input: &PluginInput) -> Value {
 
 fn load_eh_auth() -> Result<EhAuthData, String> {
     let Some(value) = HostBridge::task_kv_get(AUTH_DATA_KEY)? else {
-        return Err("Missing E-Hentai auth data in task KV. Ensure ehlogin ran as a pre hook.".to_string());
+        return Err(
+            "Missing E-Hentai auth data in task KV. Ensure ehlogin ran as a pre hook.".to_string(),
+        );
     };
     serde_json::from_value(value).map_err(|e| format!("Invalid E-Hentai auth data in task KV: {e}"))
 }
@@ -408,24 +512,30 @@ fn load_eh_auth() -> Result<EhAuthData, String> {
 fn build_eh_login_cookies(auth: &EhAuthData) -> Vec<LoginCookie> {
     let member_id = auth.ipb_member_id.trim();
     let pass_hash = auth.ipb_pass_hash.trim();
-    if member_id.is_empty() || pass_hash.is_empty() {
-        return Vec::new();
-    }
 
     let mut cookies = Vec::new();
     for domain in ["e-hentai.org", "exhentai.org"] {
+        // EH/ExHentai 需要 nw=1 才能跳过警告/熊猫页面；无登录态时也需要它。
         cookies.push(LoginCookie {
-            name: "ipb_member_id".to_string(),
-            value: member_id.to_string(),
+            name: "nw".to_string(),
+            value: "1".to_string(),
             domain: domain.to_string(),
             path: "/".to_string(),
         });
-        cookies.push(LoginCookie {
-            name: "ipb_pass_hash".to_string(),
-            value: pass_hash.to_string(),
-            domain: domain.to_string(),
-            path: "/".to_string(),
-        });
+        if !member_id.is_empty() && !pass_hash.is_empty() {
+            cookies.push(LoginCookie {
+                name: "ipb_member_id".to_string(),
+                value: member_id.to_string(),
+                domain: domain.to_string(),
+                path: "/".to_string(),
+            });
+            cookies.push(LoginCookie {
+                name: "ipb_pass_hash".to_string(),
+                value: pass_hash.to_string(),
+                domain: domain.to_string(),
+                path: "/".to_string(),
+            });
+        }
         if !auth.star.trim().is_empty() {
             cookies.push(LoginCookie {
                 name: "star".to_string(),
@@ -480,7 +590,11 @@ fn build_cookie_header(url: &str, cookies: &[LoginCookie]) -> String {
             continue;
         }
         let domain = c.domain.trim().trim_start_matches('.').to_ascii_lowercase();
-        if !domain.is_empty() && !host.is_empty() && host != domain && !host.ends_with(&format!(".{domain}")) {
+        if !domain.is_empty()
+            && !host.is_empty()
+            && host != domain
+            && !host.ends_with(&format!(".{domain}"))
+        {
             continue;
         }
         pairs.push(format!("{name}={value}"));
@@ -653,7 +767,8 @@ fn http_request_bytes_follow_redirects_with_headers(
         };
         let base = Url::parse(&current_url).map_err(|e| e.to_string())?;
         let resolved = base.join(location).map_err(|e| e.to_string())?;
-        if resp.status == 303 || ((resp.status == 301 || resp.status == 302) && current_method == "POST")
+        if resp.status == 303
+            || ((resp.status == 301 || resp.status == 302) && current_method == "POST")
         {
             current_method = "GET".to_string();
             current_body = None;
@@ -725,7 +840,8 @@ fn http_request_once(
 fn connect_http_stream(scheme: &str, host: &str, port: u16) -> Result<HttpStream, String> {
     let tcp = if scheme.eq_ignore_ascii_case("https") {
         if let Some((proxy_host, proxy_port)) = resolve_proxy_for_scheme(scheme) {
-            let mut proxy_stream = HostTcpStream::connect(&proxy_host, proxy_port, DEFAULT_TIMEOUT_MS)?;
+            let mut proxy_stream =
+                HostTcpStream::connect(&proxy_host, proxy_port, DEFAULT_TIMEOUT_MS)?;
             establish_proxy_connect_tunnel(&mut proxy_stream, host, port)?;
             proxy_stream
         } else {
@@ -740,9 +856,10 @@ fn connect_http_stream(scheme: &str, host: &str, port: u16) -> Result<HttpStream
         let config = ClientConfig::builder()
             .with_root_certificates(roots)
             .with_no_client_auth();
-        let server_name =
-            ServerName::try_from(host.to_string()).map_err(|_| format!("invalid dns name: {host}"))?;
-        let conn = ClientConnection::new(Arc::new(config), server_name).map_err(|e| e.to_string())?;
+        let server_name = ServerName::try_from(host.to_string())
+            .map_err(|_| format!("invalid dns name: {host}"))?;
+        let conn =
+            ClientConnection::new(Arc::new(config), server_name).map_err(|e| e.to_string())?;
         Ok(HttpStream::Tls(Box::new(StreamOwned::new(conn, tcp))))
     } else if scheme.eq_ignore_ascii_case("http") {
         Ok(HttpStream::Plain(tcp))
@@ -965,7 +1082,11 @@ fn read_response_body(
     Ok(out)
 }
 
-fn read_stream_chunk(stream: &mut HttpStream, buf: &mut [u8], allow_tls_eof: bool) -> Result<usize, String> {
+fn read_stream_chunk(
+    stream: &mut HttpStream,
+    buf: &mut [u8],
+    allow_tls_eof: bool,
+) -> Result<usize, String> {
     match stream.read(buf) {
         Ok(n) => Ok(n),
         Err(e) => {
@@ -1142,8 +1263,8 @@ fn resolve_archive_filename(
     title_hint: Option<&str>,
     fallback_hint: &str,
 ) -> String {
-    if let Some(v) = header_value(headers, "Content-Disposition")
-        .and_then(parse_content_disposition_filename)
+    if let Some(v) =
+        header_value(headers, "Content-Disposition").and_then(parse_content_disposition_filename)
     {
         let safe = sanitize_filename_for_fs(&v);
         if !safe.is_empty() {
@@ -1218,14 +1339,11 @@ fn percent_decode_lossy(input: &str) -> String {
 }
 
 fn sanitize_filename_for_fs(input: &str) -> String {
-    let leaf = input
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or(input)
-        .trim();
+    let leaf = input.rsplit(['/', '\\']).next().unwrap_or(input).trim();
     let mut out = String::with_capacity(leaf.len());
     for ch in leaf.chars() {
-        let bad = matches!(ch, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') || ch.is_control();
+        let bad =
+            matches!(ch, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') || ch.is_control();
         if bad {
             out.push('_');
         } else {
@@ -1261,7 +1379,10 @@ fn download_archive_direct(
             extra_headers.push(("Range".to_string(), format!("bytes={downloaded}-")));
             HostBridge::log(
                 1,
-                &format!("archive resume attempt={} range=bytes={downloaded}-", attempt + 1),
+                &format!(
+                    "archive resume attempt={} range=bytes={downloaded}-",
+                    attempt + 1
+                ),
             );
         } else {
             HostBridge::log(1, &format!("archive request attempt={}", attempt + 1));
@@ -1404,8 +1525,8 @@ fn report_download_network_progress(read_in_current_response: u64, response_tota
         } else {
             30
         };
-        let should_emit = percent > st.last_percent
-            || global_read.saturating_sub(st.last_bytes) >= 1024 * 1024;
+        let should_emit =
+            percent > st.last_percent || global_read.saturating_sub(st.last_bytes) >= 1024 * 1024;
         if !should_emit {
             return;
         }
@@ -1437,11 +1558,299 @@ fn output_err(message: &str) -> Value {
     })
 }
 
+/// resolve_page_asset action（targetType=source，直连执行）：
+/// path = "{gid}/{token}/{page}"，定位单页图片并注册为 asset，返回 asset_id。
+fn resolve_page_asset(input: &PluginInput) -> Value {
+    let path = input.path.trim();
+    if path.is_empty() {
+        return output_err("path is required for resolve_page_asset");
+    }
+    // path 自包含 gid/token/page，避免依赖 targetId 解析。
+    let parts: Vec<&str> = path.split('/').collect();
+    if parts.len() < 3 {
+        return output_err(&format!("invalid path (expected gid/token/page): {path}"));
+    }
+    let gid = parts[0];
+    let token = parts[1];
+    let page: u64 = match parts[2].parse() {
+        Ok(n) => n,
+        Err(_) => return output_err(&format!("invalid page number in path: {path}")),
+    };
+    if page == 0 {
+        return output_err("page number must be >= 1");
+    }
+
+    HostBridge::progress(10, "加载登录态...");
+    let auth = match load_eh_auth() {
+        Ok(v) => v,
+        Err(e) => return output_err(&e),
+    };
+    let login_cookies = build_eh_login_cookies(&auth);
+    let domain = if !auth.igneous.trim().is_empty() || !auth.star.trim().is_empty() {
+        "https://exhentai.org"
+    } else {
+        "https://e-hentai.org"
+    };
+
+    // 缓存 showpage 列表，避免每页都重抓 gallery HTML。
+    let cache_key = format!("ehdl_showpages_{gid}_{token}");
+    let showpages: Vec<String> = match HostBridge::task_kv_get(&cache_key) {
+        Ok(Some(cached)) => {
+            let arr = cached.as_array();
+            if arr.map(|a| !a.is_empty()).unwrap_or(false) {
+                arr.map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default()
+            } else {
+                Vec::new()
+            }
+        }
+        _ => Vec::new(),
+    };
+    let showpages = if !showpages.is_empty() {
+        showpages
+    } else {
+        HostBridge::progress(30, "抓取画廊页面...");
+        let gallery_url = format!("{domain}/g/{gid}/{token}");
+        let fetched = match fetch_gallery_showpages(&gallery_url, gid, &login_cookies) {
+            Ok(v) => v,
+            Err(e) => return output_err(&format!("fetch gallery showpages failed: {e}")),
+        };
+        let _ = HostBridge::task_kv_set(&cache_key, json!(fetched));
+        fetched
+    };
+    if showpages.is_empty() {
+        return output_err("no page links found in gallery");
+    }
+    let idx = (page - 1) as usize;
+    if idx >= showpages.len() {
+        return output_err(&format!(
+            "page {page} out of range ({} pages)",
+            showpages.len()
+        ));
+    }
+    let showpage_url = &showpages[idx];
+
+    HostBridge::progress(60, "解析图片地址...");
+    let image_url = match fetch_image_url(showpage_url, &login_cookies) {
+        Ok(v) => v,
+        Err(e) => return output_err(&format!("resolve image url failed: {e}")),
+    };
+
+    HostBridge::progress(80, "下载并注册资源...");
+    let ext = guess_ext_from_url(&image_url);
+    let guest_path = format!("/plugin/ehdl_page_{gid}_{token}_{page}.{ext}");
+    let original_filename = format!("ehdl_page_{gid}_{token}_{page}.{ext}");
+    let content_type = guess_content_type(&ext);
+
+    let resp = match http_request_bytes_follow_redirects_with_headers(
+        "GET",
+        &image_url,
+        None,
+        Some(showpage_url),
+        &login_cookies,
+        &[],
+    ) {
+        Ok(v) => v,
+        Err(e) => return output_err(&format!("download image failed: {e}")),
+    };
+    if resp.status >= 400 {
+        return output_err(&format!("download image HTTP {}", resp.status));
+    }
+    if let Err(e) = validate_downloaded_page_image(&resp) {
+        return output_err(&format!("downloaded page is not a valid image: {e}"));
+    }
+    if let Err(e) = fs::write(&guest_path, &resp.body) {
+        return output_err(&format!("write image failed: {e}"));
+    }
+    let install = match HostBridge::call(
+        "asset.install_from_file",
+        json!({
+            "guest_path": guest_path,
+            "original_filename": original_filename,
+            "content_type": content_type,
+        }),
+    ) {
+        Ok(v) => v,
+        Err(e) => return output_err(&format!("asset.install_from_file failed: {e}")),
+    };
+    let asset_id = install.get("asset_id").and_then(Value::as_i64).unwrap_or(0);
+    if asset_id <= 0 {
+        return output_err("asset.install_from_file returned no asset_id");
+    }
+
+    HostBridge::progress(100, "单页资源解析完成");
+    json!({ "success": true, "data": { "asset_id": asset_id } })
+}
+
+/// 从 sourceId（source:ehentaisource:{remoteId}）提取 remoteId（gallery URL）。
+fn extract_remote_id_from_source_id(source_id: &str) -> Option<String> {
+    let normalized = source_id.trim();
+    let prefix = "source:ehentaisource:";
+    let rest = normalized.strip_prefix(prefix)?;
+    if rest.is_empty() {
+        return None;
+    }
+    Some(rest.to_string())
+}
+
+/// 抓取 gallery 页面 HTML，解析 /s/{hash}/{gid}-{N} showpage 链接列表。
+fn fetch_gallery_showpages(
+    gallery_page_url: &str,
+    gid: &str,
+    cookies: &[LoginCookie],
+) -> Result<Vec<String>, String> {
+    let (status, html) = http_request_text("GET", gallery_page_url, None, None, cookies)?;
+    if status >= 400 {
+        return Err(format!("gallery page HTTP {status}"));
+    }
+    let domain = Url::parse(gallery_page_url)
+        .ok()
+        .and_then(|u| {
+            let host = u.host_str()?;
+            if u.scheme().is_empty() {
+                None
+            } else {
+                Some(format!("{}://{}", u.scheme(), host))
+            }
+        })
+        .unwrap_or_else(|| "https://e-hentai.org".to_string());
+    Ok(parse_image_page_links(&html, gid, &domain))
+}
+
+/// 从 gallery HTML 中提取 /s/{hash}/{gid}-{N} showpage 链接。
+fn parse_image_page_links(html: &str, gid: &str, domain: &str) -> Vec<String> {
+    let mut urls = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let pattern = format!(r#"href=["']([^"']*/s/[0-9a-fA-F]+/{}-\d+/?)["']"#, gid);
+    let re = Regex::new(&pattern).expect("valid regex");
+    for caps in re.captures_iter(html) {
+        let raw = caps.get(1).unwrap().as_str();
+        let url = if raw.starts_with("http://") || raw.starts_with("https://") {
+            raw.to_string()
+        } else if raw.starts_with('/') {
+            format!("{domain}{raw}")
+        } else {
+            format!("{domain}/{raw}")
+        };
+        if seen.insert(url.clone()) {
+            urls.push(url);
+        }
+    }
+    urls
+}
+
+/// 从 showpage URL 解析真实图片地址（<img id="img" src="...">）。
+fn fetch_image_url(image_page_url: &str, cookies: &[LoginCookie]) -> Result<String, String> {
+    let (status, html) = http_request_text("GET", image_page_url, None, None, cookies)?;
+    if status >= 400 {
+        return Err(format!("image page HTTP {status}"));
+    }
+    let tag_re = Regex::new(r#"(?is)<img\b[^>]*?\bid=["']img["'][^>]*?>"#).expect("valid regex");
+    if let Some(tag_cap) = tag_re.captures(&html) {
+        let tag = tag_cap.get(0).unwrap().as_str();
+        let src_re = Regex::new(r#"src=["']([^"']+)["']"#).expect("valid regex");
+        if let Some(src_cap) = src_re.captures(tag) {
+            let src = src_cap.get(1).unwrap().as_str();
+            if src.starts_with("http://") || src.starts_with("https://") {
+                return Ok(src.to_string());
+            }
+            let base = Url::parse(image_page_url).map_err(|e| e.to_string())?;
+            let resolved = base.join(src).map_err(|e| e.to_string())?;
+            return Ok(resolved.to_string());
+        }
+    }
+    Err("image URL not found".to_string())
+}
+
+/// 从 URL 推断图片扩展名。
+fn guess_ext_from_url(url: &str) -> &'static str {
+    let lower = url.to_ascii_lowercase();
+    if lower.contains(".png") {
+        "png"
+    } else if lower.contains(".gif") {
+        "gif"
+    } else if lower.contains(".webp") {
+        "webp"
+    } else {
+        "jpg"
+    }
+}
+
+fn validate_downloaded_page_image(resp: &HttpResponse) -> Result<(), String> {
+    let len = resp.body.len();
+    let content_type = header_value(&resp.headers, "Content-Type")
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if !content_type.is_empty() && !content_type.starts_with("image/") {
+        return Err(format!(
+            "unexpected Content-Type '{}' ({} bytes, preview: {})",
+            content_type,
+            len,
+            response_preview(&resp.body)
+        ));
+    }
+    if len < 256 {
+        return Err(format!(
+            "response too small ({} bytes, Content-Type '{}', preview: {})",
+            len,
+            if content_type.is_empty() {
+                "unknown"
+            } else {
+                content_type.as_str()
+            },
+            response_preview(&resp.body)
+        ));
+    }
+    if !looks_like_supported_image(&resp.body) {
+        return Err(format!(
+            "unrecognized image signature ({} bytes, Content-Type '{}', preview: {})",
+            len,
+            if content_type.is_empty() {
+                "unknown"
+            } else {
+                content_type.as_str()
+            },
+            response_preview(&resp.body)
+        ));
+    }
+    Ok(())
+}
+
+fn looks_like_supported_image(bytes: &[u8]) -> bool {
+    bytes.starts_with(&[0xFF, 0xD8, 0xFF])
+        || bytes.starts_with(b"\x89PNG\r\n\x1A\n")
+        || bytes.starts_with(b"GIF87a")
+        || bytes.starts_with(b"GIF89a")
+        || (bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP")
+        || (bytes.len() >= 12 && &bytes[4..8] == b"ftyp" && &bytes[8..12] == b"avif")
+}
+
+fn response_preview(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(&bytes[..bytes.len().min(120)])
+        .replace('\r', "\\r")
+        .replace('\n', "\\n")
+}
+
+/// 从扩展名推断 content-type。
+fn guess_content_type(ext: &str) -> &'static str {
+    match ext.to_ascii_lowercase().as_str() {
+        "png" => "image/png",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        _ => "image/jpeg",
+    }
+}
+
 fn plugin_info_json() -> Value {
     json!({
         "name": "E*Hentai Downloader (Rust)",
         "type": "download",
         "namespace": "ehdl",
+        "source_id_regex": "^source:ehentaisource:.*$",
         "pre": ["ehlogin"],
         "author": "Lanlu",
         "version": "0.1.0",
@@ -1459,7 +1868,9 @@ fn plugin_info_json() -> Value {
             "log.write",
             "progress.report",
             "tcp.connect",
-            "task_kv.read"
+            "task_kv.read",
+            "task_kv.write",
+            "asset.install_from_file"
         ]
     })
 }

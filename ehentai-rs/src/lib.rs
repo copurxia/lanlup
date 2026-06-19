@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::alloc::{alloc, dealloc, Layout};
 use std::cell::RefCell;
+use std::fs;
 use std::io::{self, Read, Write};
 use std::slice;
 use std::sync::Arc;
@@ -89,6 +90,8 @@ struct PluginState {
 
 #[derive(Debug, Deserialize)]
 struct PluginInput {
+    #[serde(default)]
+    action: String,
     #[serde(rename = "pluginType", default)]
     plugin_type: String,
     #[serde(rename = "targetType", default)]
@@ -287,6 +290,29 @@ impl HostBridge {
         Ok(response.get("value").cloned())
     }
 
+    fn task_kv_set(key: &str, value: Value) -> Result<(), String> {
+        Self::call("task_kv.set", json!({ "key": key, "value": value }))?;
+        Ok(())
+    }
+
+    fn install_asset(
+        guest_path: &str,
+        original_filename: &str,
+        content_type: &str,
+    ) -> Result<i64, String> {
+        let resp = Self::call(
+            "asset.install_from_file",
+            json!({
+                "guest_path": guest_path,
+                "original_filename": original_filename,
+                "content_type": content_type,
+            }),
+        )?;
+        resp.get("asset_id")
+            .and_then(Value::as_i64)
+            .ok_or_else(|| "no asset_id in response".to_string())
+    }
+
     fn http_fetch(
         method: &str,
         url: &str,
@@ -408,7 +434,13 @@ pub extern "C" fn lanlu_plugin_run(input_ptr: i32, input_len: i32) -> i32 {
         Err(err) => return set_error_and_zero(format!("invalid plugin input: {err}")),
     };
 
-    let payload = build_result_payload(input);
+    let payload = if input.action.trim() == "resolve_metadata"
+        && normalize_target_type(&input.target_type, &input.params) == "source"
+    {
+        resolve_source_metadata(&input)
+    } else {
+        build_result_payload(input)
+    };
     let result = match serde_json::to_vec(&payload) {
         Ok(bytes) => bytes,
         Err(err) => return set_error_and_zero(format!("failed to encode result: {err}")),
@@ -436,11 +468,305 @@ pub extern "C" fn lanlu_plugin_last_error_len() -> i32 {
     STATE.with(|state| state.borrow().error.len() as i32)
 }
 
+/// 解析 source 元数据：从 sourceId（source:ehentaisource:{galleryUrl}）解析 gid/token，
+/// 调用 EH API 获取 title/tags/cover，抓取 gallery 页面枚举 showpage 链接作为 page children。
+fn resolve_source_metadata(input: &PluginInput) -> Value {
+    HostBridge::progress(5, "解析 sourceId...");
+    let settings = settings_from_params(&input.params);
+    let target_id = if input.target_id.trim().is_empty() {
+        param_string(&input.params, "__target_id")
+    } else {
+        input.target_id.trim().to_string()
+    };
+
+    // targetId 形如 source:ehentaisource:{remoteId}，remoteId 为完整 gallery URL。
+    let gallery_url = match extract_remote_id_from_source_id(&target_id) {
+        Some(v) if !v.is_empty() => v,
+        _ => return json!({ "success": false, "error": format!("invalid sourceId: {target_id}") }),
+    };
+    let gallery = match parse_oneshot_gallery(&gallery_url) {
+        Some(g) => g,
+        None => return json!({ "success": false, "error": format!("cannot parse gallery url: {gallery_url}") }),
+    };
+
+    HostBridge::progress(20, "加载登录态...");
+    let login_cookies = match load_eh_auth() {
+        Ok(auth) => build_eh_login_cookies(&auth),
+        Err(error) => return json!({ "success": false, "error": error }),
+    };
+
+    HostBridge::progress(40, "获取画廊元数据...");
+    let gdata = match fetch_gallery_gdata(&gallery.gid, &gallery.token) {
+        Ok(v) => v,
+        Err(error) => return json!({ "success": false, "error": error }),
+    };
+
+    let title = gdata.get("title").and_then(value_to_string).unwrap_or_default();
+    let title_jpn = gdata.get("title_jpn").and_then(value_to_string).unwrap_or_default();
+    let category = gdata.get("category").and_then(value_to_string).unwrap_or_default();
+    let uploader = gdata.get("uploader").and_then(value_to_string).unwrap_or_default();
+    let posted = gdata.get("posted").and_then(value_to_string).unwrap_or_default();
+    let filecount = gdata.get("filecount").and_then(value_to_string).unwrap_or("0".to_string());
+    let thumb = gdata.get("thumb").and_then(value_to_string).unwrap_or_default();
+    let filesize = gdata.get("filesize").and_then(value_to_string).unwrap_or_default();
+    let rating = gdata.get("rating").and_then(|v| v.as_f64()).unwrap_or(0.0);
+
+    let mut tags: Vec<String> = gdata
+        .get("tags")
+        .and_then(Value::as_array)
+        .map(|arr| arr.iter().filter_map(value_to_string).filter(|v| !v.trim().is_empty()).collect())
+        .unwrap_or_default();
+    if !category.is_empty() {
+        tags.push(format!("category:{}", category.to_ascii_lowercase()));
+    }
+    if !uploader.is_empty() {
+        tags.push(format!("uploader:{}", uploader));
+    }
+
+    let mut description = String::new();
+    let display_title_raw = if settings.jpntitle && !title_jpn.is_empty() {
+        title_jpn.as_str()
+    } else {
+        title.as_str()
+    };
+    let display_title = if display_title_raw.trim().is_empty() {
+        "Untitled".to_string()
+    } else {
+        html_unescape(display_title_raw.trim())
+    };
+    if !title_jpn.is_empty() && title_jpn != title {
+        description.push_str(&html_unescape(&title_jpn));
+    }
+    if !category.is_empty() {
+        if !description.is_empty() { description.push('\n'); }
+        description.push_str(&format!("Category: {}", category));
+    }
+    if !uploader.is_empty() {
+        if !description.is_empty() { description.push('\n'); }
+        description.push_str(&format!("Uploader: {}", uploader));
+    }
+    if !posted.is_empty() {
+        if !description.is_empty() { description.push('\n'); }
+        description.push_str(&format!("Posted: {}", posted));
+    }
+    if !filecount.is_empty() && filecount != "0" {
+        if !description.is_empty() { description.push('\n'); }
+        description.push_str(&format!("Pages: {}", filecount));
+    }
+    if !filesize.is_empty() {
+        if !description.is_empty() { description.push('\n'); }
+        description.push_str(&format!("Size: {}", filesize));
+    }
+    if rating > 0.0 {
+        if !description.is_empty() { description.push('\n'); }
+        description.push_str(&format!("Rating: {:.2}", rating));
+    }
+
+    let cover = normalize_cover_url(&thumb, "https://e-hentai.org/");
+
+    // 封面：下载并注册为 asset，产出 cover_asset_id（前端按 asset_id 取封面）。
+    // 带 task_kv 缓存，避免每次 resolve_metadata 都重下封面。
+    let cover_asset_id = resolve_cover_asset(&cover, &gallery.gid, &login_cookies);
+
+    // 枚举页面：抓取 gallery HTML，解析 /s/{hash}/{gid}-{N} showpage 链接。
+    HostBridge::progress(70, "枚举页面...");
+    let domain = if settings.enablepanda { "https://exhentai.org" } else { "https://e-hentai.org" };
+    let gallery_page_url = format!("{domain}/g/{}/{}", gallery.gid, gallery.token);
+    let page_count = filecount.parse::<u64>().unwrap_or(0);
+    let children = match fetch_gallery_html_showpages(&gallery_page_url, &gallery.gid, &login_cookies) {
+        Ok(showpages) => {
+            // 优先用 HTML showpage 数量；回退到 API filecount。
+            let count = if showpages.is_empty() { page_count } else { showpages.len() as u64 };
+            let mut arr = Vec::with_capacity(count as usize);
+            for n in 1..=count {
+                let path = format!("{}/{}/{n}", gallery.gid, gallery.token);
+                arr.push(json!({
+                    "entity_type": "page",
+                    "entity_id": format!("source:ehentaisource:{}#page:{n}", gallery_url),
+                    "title": "",
+                    "sort_order": n,
+                    "path": path,
+                    "media_type": "image",
+                }));
+            }
+            arr
+        }
+        Err(error) => {
+            // showpage 抓取失败时回退到 filecount 派生 page children（path 仍自包含 gid/token/page）。
+            HostBridge::log(2, &format!("ehentai showpage fetch failed, fallback to filecount: {error}"));
+            let mut arr = Vec::with_capacity(page_count as usize);
+            for n in 1..=page_count {
+                let path = format!("{}/{}/{n}", gallery.gid, gallery.token);
+                arr.push(json!({
+                    "entity_type": "page",
+                    "entity_id": format!("source:ehentaisource:{}#page:{n}", gallery_url),
+                    "title": "",
+                    "sort_order": n,
+                    "path": path,
+                    "media_type": "image",
+                }));
+            }
+            arr
+        }
+    };
+
+    HostBridge::progress(100, "元数据获取完成");
+    let mut data = json!({
+        "title": display_title,
+        "description": description,
+        "cover": cover,
+        "tags": tags,
+        "children": children,
+    });
+    if cover_asset_id > 0 {
+        data["cover_asset_id"] = json!(cover_asset_id);
+    }
+    json!({
+        "success": true,
+        "data": data,
+    })
+}
+
+/// 下载封面并注册为 asset，返回 cover_asset_id（0 表示失败）。
+/// 带 task_kv 缓存（按 gallery id），避免每次 resolve_metadata 都重下封面。
+fn resolve_cover_asset(cover_url: &str, gallery_id: &str, cookies: &[LoginCookie]) -> i64 {
+    if cover_url.trim().is_empty() {
+        return 0;
+    }
+
+    let cache_key = format!("ehentai_cover_{gallery_id}");
+    if let Ok(Some(cached)) = HostBridge::task_kv_get(&cache_key) {
+        if let Some(id) = cached.as_i64() {
+            if id > 0 {
+                return id;
+            }
+        }
+    }
+
+    let ext = if cover_url.to_ascii_lowercase().ends_with(".png") { "png" }
+        else if cover_url.to_ascii_lowercase().ends_with(".gif") { "gif" }
+        else if cover_url.to_ascii_lowercase().ends_with(".webp") { "webp" }
+        else { "jpg" };
+    let content_type = match ext {
+        "png" => "image/png",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        _ => "image/jpeg",
+    };
+    let guest_path = format!("/plugin/ehentai_cover_{gallery_id}.{ext}");
+    let original_filename = format!("cover_{gallery_id}.{ext}");
+
+    let resp = match http_request_bytes_follow_redirects("GET", cover_url, None, None, cookies, &[]) {
+        Ok(v) => v,
+        Err(e) => {
+            HostBridge::log(2, &format!("ehentai cover download failed for {gallery_id}: {e}"));
+            return 0;
+        }
+    };
+    if resp.status >= 400 {
+        HostBridge::log(2, &format!("ehentai cover HTTP {} for {gallery_id}", resp.status));
+        return 0;
+    }
+    if let Err(e) = fs::write(&guest_path, &resp.body) {
+        HostBridge::log(2, &format!("ehentai cover write failed for {gallery_id}: {e}"));
+        return 0;
+    }
+    match HostBridge::install_asset(&guest_path, &original_filename, content_type) {
+        Ok(asset_id) => {
+            let _ = HostBridge::task_kv_set(&cache_key, json!(asset_id));
+            asset_id
+        }
+        Err(e) => {
+            HostBridge::log(2, &format!("ehentai cover install failed for {gallery_id}: {e}"));
+            0
+        }
+    }
+}
+
+/// 从 sourceId（source:ehentaisource:{remoteId}）提取 remoteId（gallery URL）。
+fn extract_remote_id_from_source_id(source_id: &str) -> Option<String> {
+    let normalized = source_id.trim();
+    let prefix = "source:ehentaisource:";
+    let rest = normalized.strip_prefix(prefix)?;
+    if rest.is_empty() { return None; }
+    Some(rest.to_string())
+}
+
+/// 调用 EH gdata API 获取单个画廊的原始 gmetadata JSON。
+fn fetch_gallery_gdata(gid: &str, token: &str) -> Result<Value, String> {
+    let gid_value = gid.parse::<i64>().map_err(|_| "invalid gid".to_string())?;
+    let body = json!({
+        "method": "gdata",
+        "gidlist": [[gid_value, token]],
+        "namespace": 1,
+    })
+    .to_string();
+    let auth = load_eh_auth()?;
+    let cookies = build_eh_login_cookies(&auth);
+    let response = HostBridge::http_fetch("POST", EH_API_URL, Some(body), &cookies, &[("Content-Type", "application/json".to_string())])?;
+    if !is_http_success(&response) {
+        return Err(format!("gdata API HTTP {}", response.status));
+    }
+    let parsed: Value = serde_json::from_str(&response.text).map_err(|e| e.to_string())?;
+    if let Some(error) = parsed.get("error").and_then(value_to_string) {
+        if !error.trim().is_empty() { return Err(error); }
+    }
+    parsed
+        .get("gmetadata")
+        .and_then(Value::as_array)
+        .and_then(|arr| arr.first())
+        .cloned()
+        .ok_or_else(|| "no gmetadata returned".to_string())
+}
+
+/// 抓取 gallery 页面 HTML，解析 /s/{hash}/{gid}-{N} showpage 链接列表。
+fn fetch_gallery_html_showpages(
+    gallery_page_url: &str,
+    gid: &str,
+    cookies: &[LoginCookie],
+) -> Result<Vec<String>, String> {
+    let response = HostBridge::http_fetch("GET", gallery_page_url, None, cookies, &[])?;
+    if !is_http_success(&response) {
+        return Err(format!("gallery page HTTP {}", response.status));
+    }
+    let domain = Url::parse(gallery_page_url)
+        .ok()
+        .and_then(|u| {
+            let host = u.host_str()?;
+            if u.scheme().is_empty() { None } else { Some(format!("{}://{}", u.scheme(), host)) }
+        })
+        .unwrap_or_else(|| "https://e-hentai.org".to_string());
+    Ok(parse_image_page_links(&response.text, gid, &domain))
+}
+
+/// 从 gallery HTML 中提取 /s/{hash}/{gid}-{N} showpage 链接。
+fn parse_image_page_links(html: &str, gid: &str, domain: &str) -> Vec<String> {
+    let mut urls = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let pattern = format!(r#"href=["']([^"']*/s/[0-9a-fA-F]+/{}-\d+/?)["']"#, gid);
+    let re = regex(&pattern);
+    for caps in re.captures_iter(html) {
+        let raw = caps.get(1).unwrap().as_str();
+        let url = if raw.starts_with("http://") || raw.starts_with("https://") {
+            raw.to_string()
+        } else if raw.starts_with('/') {
+            format!("{domain}{raw}")
+        } else {
+            format!("{domain}/{raw}")
+        };
+        if seen.insert(url.clone()) {
+            urls.push(url);
+        }
+    }
+    urls
+}
+
 fn plugin_info_json() -> Value {
     json!({
         "name": "E-Hentai",
         "type": "metadata",
         "namespace": "ehentai",
+        "source_id_regex": "^source:ehentaisource:.*$",
         "pre": ["ehlogin"],
         "author": "Difegue and others",
         "version": "2.6",
@@ -469,7 +795,9 @@ fn plugin_info_json() -> Value {
             "tcp.connect",
             "log.write",
             "progress.report",
-            "task_kv.read"
+            "task_kv.read",
+            "task_kv.write",
+            "asset.install_from_file"
         ],
         "icon": "https://e-hentai.org/favicon.ico",
         "update_url": "https://git.copur.xyz/copur/lanlup/raw/branch/master/Metadata/EHentai.ts"
@@ -522,24 +850,30 @@ fn load_eh_auth() -> Result<EhAuthData, String> {
 fn build_eh_login_cookies(auth: &EhAuthData) -> Vec<LoginCookie> {
     let member_id = auth.ipb_member_id.trim();
     let pass_hash = auth.ipb_pass_hash.trim();
-    if member_id.is_empty() || pass_hash.is_empty() {
-        return Vec::new();
-    }
 
     let mut cookies = Vec::new();
     for domain in ["e-hentai.org", "exhentai.org"] {
+        // EH/ExHentai 需要 nw=1 才能跳过警告/熊猫页面；无登录态时也需要它。
         cookies.push(LoginCookie {
-            name: "ipb_member_id".to_string(),
-            value: member_id.to_string(),
+            name: "nw".to_string(),
+            value: "1".to_string(),
             domain: domain.to_string(),
             path: "/".to_string(),
         });
-        cookies.push(LoginCookie {
-            name: "ipb_pass_hash".to_string(),
-            value: pass_hash.to_string(),
-            domain: domain.to_string(),
-            path: "/".to_string(),
-        });
+        if !member_id.is_empty() && !pass_hash.is_empty() {
+            cookies.push(LoginCookie {
+                name: "ipb_member_id".to_string(),
+                value: member_id.to_string(),
+                domain: domain.to_string(),
+                path: "/".to_string(),
+            });
+            cookies.push(LoginCookie {
+                name: "ipb_pass_hash".to_string(),
+                value: pass_hash.to_string(),
+                domain: domain.to_string(),
+                path: "/".to_string(),
+            });
+        }
         if !auth.star.trim().is_empty() {
             cookies.push(LoginCookie {
                 name: "star".to_string(),
@@ -1830,15 +2164,27 @@ fn tags_array_from_csv(csv: &str) -> Value {
 }
 
 fn parse_oneshot_gallery(raw: &str) -> Option<GalleryMatch> {
-    let captures = regex(r"/g/(\d+)/([0-9A-Za-z]+)/?")
-        .captures(raw)
-        .or_else(|| regex(r"/g/(\d+)/([0-9A-Za-z]+)/?").captures(raw.trim()))?;
-    let gid = captures.get(1)?.as_str();
-    let token = captures.get(2)?.as_str();
-    Some(GalleryMatch {
-        gid: gid.to_string(),
-        token: token.to_string(),
-    })
+    // 支持三种格式：完整 URL、/g/{gid}/{token}/ 路径、{gid}/{token}
+    if let Some(caps) = regex(r"/g/(\d+)/([0-9A-Za-z]+)/?")
+        .captures(raw) {
+        let gid = caps.get(1)?.as_str();
+        let token = caps.get(2)?.as_str();
+        return Some(GalleryMatch {
+            gid: gid.to_string(),
+            token: token.to_string(),
+        });
+    }
+    // 直接 {gid}/{token} 格式（不带 /g/ 前缀）
+    if let Some(caps) = regex(r"^(\d+)/([0-9A-Za-z]+)/?$")
+        .captures(raw.trim()) {
+        let gid = caps.get(1)?.as_str();
+        let token = caps.get(2)?.as_str();
+        return Some(GalleryMatch {
+            gid: gid.to_string(),
+            token: token.to_string(),
+        });
+    }
+    None
 }
 
 fn parse_source_gallery(existing_tags: &str) -> Option<GalleryMatch> {
