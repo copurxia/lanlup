@@ -100,6 +100,14 @@ struct PluginInput {
     params: Value,
     #[serde(default)]
     metadata: Value,
+    #[serde(default)]
+    action: String,
+    #[serde(rename = "targetType", default)]
+    target_type: String,
+    #[serde(rename = "targetId", default)]
+    target_id: String,
+    #[serde(rename = "extraParams", default)]
+    extra_params: Value,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -318,7 +326,11 @@ pub extern "C" fn lanlu_plugin_run(input_ptr: i32, input_len: i32) -> i32 {
         Err(e) => return set_error_and_zero(format!("invalid plugin input: {e}")),
     };
 
-    let payload = build_result_payload(input);
+    let payload = if input.action.trim() == "resolve_cover" {
+        resolve_cover_action(&input)
+    } else {
+        build_result_payload(input)
+    };
     let output = match serde_json::to_vec(&payload) {
         Ok(v) => v,
         Err(e) => return set_error_and_zero(format!("failed to encode result: {e}")),
@@ -352,6 +364,7 @@ fn plugin_info_json() -> Value {
         "type": "metadata",
         "namespace": "jmcomicmeta",
         "pre": ["jmcomiclogin"],
+        "source_id_regex": "^source:jmcomicsource:.*$",
         "author": "Lanlu",
         "version": "0.2.1",
         "description": "Fetches JM Comic album metadata for Lanlu archives.",
@@ -365,10 +378,17 @@ fn plugin_info_json() -> Value {
             "net",
             "log.write",
             "progress.report",
-            "task_kv.read"
+            "task_kv.read",
+            "asset.install_from_file"
         ],
         "update_url": ""
     })
+}
+
+fn resolve_cover_action(input: &PluginInput) -> Value {
+    let asset_id = input.extra_params.get("asset_id").and_then(Value::as_i64).unwrap_or(0);
+    if asset_id <= 0 { return json!({"success": false, "error": "missing asset_id"}); }
+    json!({"success": false, "error": "resolve_cover not yet implemented"})
 }
 
 fn build_result_payload(input: PluginInput) -> Value {

@@ -203,6 +203,7 @@ fn plugin_info_json() -> Value {
         "type": "download",
         "namespace": "bzdl",
         "pre": ["bzlogin"],
+        "source_id_regex": "^source:bzsource:.*$",
         "author": "Lanlu",
         "version": "1.0.0",
         "description": "Downloads comic chapters from Baozi Manhua (包子漫画).",

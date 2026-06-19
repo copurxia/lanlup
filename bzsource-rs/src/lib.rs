@@ -177,12 +177,11 @@ pub extern "C" fn lanlu_plugin_run(input_ptr: i32, input_len: i32) -> i32 {
     let result = match input.action.as_str() {
         "source_home" => run_source_home(&input),
         "source_search" => run_source_search(&input),
-        "source_detail" => run_source_detail(&input),
-        "source_download" => run_source_download(&input),
-        "source_reader" => run_source_reader(&input),
         "source_filters" => run_source_filters(&input),
-        "source_page_asset" => run_source_page_asset(&input),
-        "source_cover_asset" => run_source_cover_asset(&input),
+        "source_detail" | "source_download" | "source_reader" | "source_page_asset" | "source_cover_asset" => {
+            // 已迁移到 bzmeta / bzdl 插件
+            output_err("this action has been moved to the Metadata or Download plugin")
+        }
         _ => output_err(&format!("unknown source action: {}", input.action)),
     };
 
@@ -226,8 +225,7 @@ fn plugin_info_json() -> Value {
             "progress.report",
             "tcp.connect",
             "task_kv.read",
-            "task_kv.write",
-            "asset.install_from_file"
+            "task_kv.write"
         ]
     })
 }

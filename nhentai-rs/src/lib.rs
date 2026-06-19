@@ -1282,6 +1282,7 @@ fn plugin_info_json() -> Value {
         "type": "download",
         "namespace": "nhentai",
         "pre": ["nhlogin"],
+        "source_id_regex": "^source:nhsource:.*$",
         "author": "Lanlu",
         "version": "0.2.0",
         "description": "Rust/WASM nhentai downloader using the nHentai API.",

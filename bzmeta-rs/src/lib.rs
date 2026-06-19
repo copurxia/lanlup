@@ -70,6 +70,14 @@ struct PluginInput {
     params: Value,
     #[serde(default)]
     metadata: Value,
+    #[serde(default)]
+    action: String,
+    #[serde(rename = "targetType", default)]
+    target_type: String,
+    #[serde(rename = "targetId", default)]
+    target_id: String,
+    #[serde(rename = "extraParams", default)]
+    extra_params: Value,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -181,7 +189,11 @@ pub extern "C" fn lanlu_plugin_run(input_ptr: i32, input_len: i32) -> i32 {
         Ok(v) => v,
         Err(e) => return set_error_and_zero(format!("invalid plugin input: {e}")),
     };
-    let payload = build_result_payload(input);
+    let payload = if input.action.trim() == "resolve_cover" {
+        resolve_cover_action(&input)
+    } else {
+        build_result_payload(input)
+    };
     let output = match serde_json::to_vec(&payload) {
         Ok(v) => v,
         Err(e) => return set_error_and_zero(format!("failed to encode result: {e}")),
@@ -214,6 +226,7 @@ fn plugin_info_json() -> Value {
         "type": "metadata",
         "namespace": "bzmeta",
         "pre": ["bzlogin"],
+        "source_id_regex": "^source:bzsource:.*$",
         "author": "Lanlu",
         "version": "1.0.0",
         "description": "Fetches metadata from Baozi Manhua (包子漫画).",
@@ -228,9 +241,16 @@ fn plugin_info_json() -> Value {
             "ui.select",
             "log.write",
             "progress.report",
-            "task_kv.read"
+            "task_kv.read",
+            "asset.install_from_file"
         ]
     })
+}
+
+fn resolve_cover_action(input: &PluginInput) -> Value {
+    let asset_id = input.extra_params.get("asset_id").and_then(Value::as_i64).unwrap_or(0);
+    if asset_id <= 0 { return json!({"success": false, "error": "missing asset_id"}); }
+    json!({"success": false, "error": "resolve_cover not yet implemented"})
 }
 
 fn build_result_payload(input: PluginInput) -> Value {

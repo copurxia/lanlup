@@ -3,6 +3,7 @@ use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
+use std::fs;
 use std::alloc::{alloc, dealloc, Layout};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -91,6 +92,14 @@ struct PluginInput {
     params: Value,
     #[serde(default)]
     metadata: Value,
+    #[serde(default)]
+    action: String,
+    #[serde(rename = "targetType", default)]
+    target_type: String,
+    #[serde(rename = "targetId", default)]
+    target_id: String,
+    #[serde(rename = "extraParams", default)]
+    extra_params: Value,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -257,7 +266,11 @@ pub extern "C" fn lanlu_plugin_run(input_ptr: i32, input_len: i32) -> i32 {
         Err(e) => return set_error_and_zero(format!("invalid plugin input: {e}")),
     };
 
-    let payload = build_result_payload(input);
+    let payload = if input.action.trim() == "resolve_cover" {
+        resolve_cover_action(&input)
+    } else {
+        build_result_payload(input)
+    };
     let output = match serde_json::to_vec(&payload) {
         Ok(v) => v,
         Err(e) => return set_error_and_zero(format!("failed to encode result: {e}")),
@@ -294,6 +307,7 @@ fn plugin_info_json() -> Value {
         "author": "Difegue and others (ported)",
         "version": "1.1",
         "description": "Searches nHentai for tags matching your archive.",
+        "source_id_regex": "^source:nhsource:.*$",
         "parameters": [
             {
                 "name": "additionaltags",
@@ -311,10 +325,85 @@ fn plugin_info_json() -> Value {
             "tcp.connect",
             "log.write",
             "progress.report",
-            "task_kv.read"
+            "task_kv.read",
+            "asset.install_from_file"
         ],
         "update_url": "https://git.copur.xyz/copur/lanlup/raw/branch/master/Metadata/NHentai.ts"
     })
+}
+
+fn resolve_cover_action(input: &PluginInput) -> Value {
+    let asset_id = input.extra_params.get("asset_id").and_then(Value::as_i64).unwrap_or(0);
+    if asset_id <= 0 {
+        return json!({"success": false, "error": "missing asset_id"});
+    }
+
+    let target_id = input.target_id.trim();
+    let gallery_id = if let Some(rest) = target_id.strip_prefix("source:nhsource:") {
+        rest.trim().to_string()
+    } else if !target_id.is_empty() {
+        target_id.to_string()
+    } else {
+        return json!({"success": false, "error": "missing sourceId"});
+    };
+    if gallery_id.is_empty() {
+        return json!({"success": false, "error": "empty gallery_id"});
+    }
+
+    let auth = match load_nh_auth().ok() {
+        Some(a) => a,
+        None => return json!({"success": false, "error": "missing nhlogin auth"}),
+    };
+    let cookie_header = build_cookie_header_for_nh(&auth);
+    let auth_header = build_api_key_authorization_for_nh(&auth);
+
+    let url = format!("https://nhentai.net/api/v2/galleries/{gallery_id}");
+    let mut headers = default_headers();
+    if !cookie_header.is_empty() { headers.push(("Cookie".to_string(), cookie_header)); }
+    if let Some(a) = auth_header.as_deref() { headers.push(("Authorization".to_string(), a.to_string())); }
+
+    let resp = match http_get_text_with_retry(&url, &headers, 4) {
+        Ok(r) => r,
+        Err(e) => return json!({"success": false, "error": format!("API error: {e}")}),
+    };
+    let gallery: Value = match serde_json::from_str(&resp.body_text) {
+        Ok(v) => v,
+        Err(e) => return json!({"success": false, "error": format!("JSON parse: {e}")}),
+    };
+
+    // NH cover: https://t.nhentai.net/galleries/{media_id}/thumb.{ext}
+    let cover_url = gallery.get("cover")
+        .and_then(|c| {
+            let media_id = c.get("media_id").and_then(Value::as_str).unwrap_or("");
+            let ext = gallery.get("images").and_then(|img| {
+                img.get("cover").and_then(|cv| cv.get("t").and_then(Value::as_str))
+                    .or_else(|| img.get("pages").and_then(|p| p.get(0)).and_then(|pg| pg.get("t").and_then(Value::as_str)))
+            }).unwrap_or("jpg");
+            if media_id.is_empty() { None } else { Some(format!("https://t.nhentai.net/galleries/{media_id}/thumb.{ext}")) }
+        })
+        .unwrap_or_default();
+    if cover_url.is_empty() {
+        return json!({"success": false, "error": "no cover URL found"});
+    }
+
+    let ext = if cover_url.contains(".png") { "png" } else if cover_url.contains(".gif") { "gif" } else { "jpg" };
+    let guest_path = format!("/plugin/nh_cover_{gallery_id}.{ext}");
+
+    let img_resp = match http_get_bytes(&cover_url, &headers) {
+        Ok(r) => r,
+        Err(e) => return json!({"success": false, "error": format!("cover download failed: {e}")}),
+    };
+    if img_resp.status >= 400 {
+        return json!({"success": false, "error": format!("cover HTTP {}", img_resp.status)});
+    }
+    if let Err(e) = fs::write(&guest_path, &img_resp.body) {
+        return json!({"success": false, "error": format!("write failed: {e}")});
+    }
+
+    match HostBridge::call("asset.install_into", json!({"asset_id": asset_id, "guest_path": guest_path})) {
+        Ok(_) => json!({"success": true}),
+        Err(e) => json!({"success": false, "error": format!("install_into failed: {e}")}),
+    }
 }
 
 fn build_result_payload(input: PluginInput) -> Value {
@@ -1367,6 +1456,41 @@ fn http_get_text(url: &str, headers: &[(String, String)]) -> Result<HttpTextResp
             headers: response_headers,
             body_text: String::from_utf8_lossy(&body).to_string(),
         });
+    }
+    Err(format!("too many redirects while requesting {url}"))
+}
+
+struct HttpBytesResponse {
+    status: u16,
+    body: Vec<u8>,
+}
+
+fn http_get_bytes(url: &str, headers: &[(String, String)]) -> Result<HttpBytesResponse, String> {
+    let mut current = url.to_string();
+    for _ in 0..=MAX_REDIRECTS {
+        let parsed = parse_url(&current)?;
+        if !parsed.scheme.eq_ignore_ascii_case("https") {
+            return Err(format!("unsupported URL scheme: {}", parsed.scheme));
+        }
+        let mut stream = connect_tls_stream(&parsed.host, parsed.port)?;
+        let mut req = String::new();
+        req.push_str(&format!("GET {} HTTP/1.1\r\n", parsed.path_and_query));
+        if parsed.port == 443 { req.push_str(&format!("Host: {}\r\n", parsed.host)); }
+        else { req.push_str(&format!("Host: {}:{}\r\n", parsed.host, parsed.port)); }
+        req.push_str("Accept: */*\r\n");
+        req.push_str("Accept-Encoding: identity\r\n");
+        req.push_str("Connection: close\r\n");
+        for (k, v) in headers { req.push_str(&format!("{k}: {v}\r\n")); }
+        req.push_str("\r\n");
+        stream.write_all(req.as_bytes()).and_then(|_| stream.flush()).map_err(|e| e.to_string())?;
+        let (status, response_headers, body) = read_http_response(&mut stream)?;
+        if matches!(status, 301 | 302 | 303 | 307 | 308) {
+            let location = header_value(&response_headers, "Location")
+                .ok_or_else(|| format!("redirect {} without Location", status))?;
+            current = resolve_redirect_url(&parsed, location)?;
+            continue;
+        }
+        return Ok(HttpBytesResponse { status, body });
     }
     Err(format!("too many redirects while requesting {url}"))
 }

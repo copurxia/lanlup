@@ -348,6 +348,7 @@ fn plugin_info_json() -> Value {
         "type": "download",
         "namespace": "jmcomicdl",
         "pre": ["jmcomiclogin"],
+        "source_id_regex": "^source:jmcomicsource:.*$",
         "author": "Lanlu",
         "version": "0.2.1",
         "description": "Downloads JM Comic albums as zip archives.",

@@ -983,6 +983,7 @@ fn plugin_info_json() -> Value {
         "type": "download",
         "namespace": "picacg",
         "pre": ["picacglogin"],
+        "source_id_regex": "^source:picacgsource:.*$",
         "author": "Lanlu",
         "version": "0.1.0",
         "description": "Rust/WASM Picacg downloader using the Picacg API.",

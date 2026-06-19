@@ -267,12 +267,10 @@ pub extern "C" fn lanlu_plugin_run(input_ptr: i32, input_len: i32) -> i32 {
     let result = match input.action.as_str() {
         "source_home" => run_source_home(&input),
         "source_search" => run_source_search(&input),
-        "source_detail" => run_source_detail(&input),
-        "source_download" => run_source_download(&input),
-        "source_reader" => run_source_reader(&input),
         "source_filters" => run_source_filters(&input),
-        "source_page_asset" => run_source_page_asset(&input),
-        "source_cover_asset" => run_source_cover_asset(&input),
+        "source_detail" | "source_download" | "source_reader" | "source_page_asset" | "source_cover_asset" => {
+            output_err("this action has been moved to the Metadata or Download plugin")
+        }
         _ => output_err(&format!("unknown source action: {}", input.action)),
     };
 
@@ -635,82 +633,9 @@ fn run_source_reader(input: &PluginInput) -> Value {
     output_ok_data(json!({ "pages": pages }))
 }
 
-fn run_source_page_asset(input: &PluginInput) -> Value {
-    let gallery_id = extract_remote_id(&input.params);
-    if gallery_id.is_empty() {
-        return output_err("remote_id (gallery_id) is required for page_asset");
-    }
-
-    let asset_path = input.params.get("path").and_then(Value::as_str).unwrap_or("").trim();
-    if asset_path.is_empty() {
-        return output_err("path is required for page_asset");
-    }
-
-    let page = input.params.get("page").and_then(|v| match v {
-        Value::Number(n) => n.as_u64(),
-        Value::String(s) => s.parse::<u64>().ok(),
-        _ => None,
-    }).unwrap_or_else(|| parse_page_number_from_path(asset_path));
-    if page == 0 {
-        return output_err("page hint or numeric path filename is required for page_asset");
-    }
-
-    let cached_asset_id = get_cached_page_asset_id(&gallery_id, page);
-    if cached_asset_id > 0 {
-        return output_ok_data(json!({"asset_id": cached_asset_id}));
-    }
-
-    let auth = match load_nh_auth() {
-        Ok(v) => v,
-        Err(_) => NhAuthData { mode: String::new(), api_key: String::new() },
-    };
-
-    let image_servers = match fetch_image_servers(&auth) {
-        Ok(v) => v,
-        Err(e) => {
-            HostBridge::log(1, &format!("nhsource CDN fallback: {e}"));
-            vec![DEFAULT_IMAGE_CDN.to_string()]
-        }
-    };
-
-    let gallery_id_i64 = gallery_id.parse::<i64>().unwrap_or(0);
-    let server = pick_image_server(&image_servers, gallery_id_i64, page as usize);
-    let image_url = format!("{}/{}", server.trim_end_matches('/'), asset_path.trim_start_matches('/'));
-
-    let ext = asset_path.rsplit('.').next().unwrap_or("jpg").to_ascii_lowercase();
-    let guest_path = format!("/plugin/{gallery_id}_{page}.{ext}");
-
-    let gallery_url = format!("https://nhentai.net/g/{gallery_id}/");
-    let referer = Some(gallery_url.as_str());
-    let response = match http_get_with_retry(
-        &image_url, referer, &[], "image/*", &[], MAX_HTTP_RETRIES,
-    ) {
-        Ok(resp) => resp,
-        Err(e) => return output_err(&format!("下载第 {page} 页失败: {e}")),
-    };
-
-    if let Err(e) = fs::write(&guest_path, &response.body) {
-        return output_err(&format!("写入第 {page} 页文件失败: {e}"));
-    }
-
-    match HostBridge::call(
-        "asset.install_from_file",
-        json!({
-            "guest_path": &guest_path,
-            "original_filename": &format!("{page}.{ext}"),
-            "content_type": guess_content_type(&ext),
-        }),
-    ) {
-        Ok(resp) => {
-            let asset_id = resp.get("asset_id").and_then(Value::as_i64).unwrap_or(0);
-            if asset_id <= 0 {
-                return output_err(&format!("注册第 {page} 页资产失败: asset_id 无效"));
-            }
-            cache_page_asset_id(&gallery_id, page, asset_id);
-            output_ok_data(json!({"asset_id": asset_id}))
-        }
-        Err(e) => output_err(&format!("注册第 {page} 页资产失败: {e}")),
-    }
+fn run_source_page_asset(_input: &PluginInput) -> Value {
+    // Dead code: this action has been moved to the Download plugin
+    output_err("this action has been moved to the Download plugin")
 }
 
 fn run_source_cover_asset(input: &PluginInput) -> Value {
@@ -740,21 +665,9 @@ fn guess_content_type(ext: &str) -> &'static str {
 }
 
 /// Download an image and register it as a system asset via HostBridge
-fn download_and_install_asset(
-    url: &str,
-    guest_path: &str,
-    original_filename: &str,
-    content_type: &str,
-    referer: Option<&str>,
-) -> Result<i64, String> {
-    let response = http_get_with_retry(url, referer, &[], "image/*", &[], MAX_HTTP_RETRIES)?;
-    fs::write(guest_path, &response.body).map_err(|e| format!("write failed: {e}"))?;
-    let resp = HostBridge::call("asset.install_from_file", json!({
-        "guest_path": guest_path,
-        "original_filename": original_filename,
-        "content_type": content_type,
-    }))?;
-    resp.get("asset_id").and_then(Value::as_i64).ok_or_else(|| "no asset_id in response".to_string())
+fn download_and_install_asset(_guest_path: &str, _original_filename: &str, _content_type: &str) -> Option<i64> {
+    // Dead code
+    None
 }
 
 fn page_asset_cache_key(gallery_id: &str, page: u64) -> String {
@@ -790,33 +703,9 @@ fn get_cached_cover_asset_id(gallery_id: &str) -> Option<i64> {
 
 /// Ensure cover asset exists for a gallery, using task_kv cache
 /// Returns Some(asset_id) on success, None on failure or empty url
-fn ensure_cover_asset(cover_url: &str, gallery_id: &str) -> Option<i64> {
-    if cover_url.is_empty() { return None; }
-
-    // Check cache
-    let cache_key = cover_asset_cache_key(gallery_id);
-    if let Some(id) = get_cached_cover_asset_id(gallery_id) {
-        return Some(id);
-    }
-
-    // Determine extension from URL
-    let url_lower = cover_url.to_ascii_lowercase();
-    let ext = if url_lower.ends_with(".png") { "png" }
-              else if url_lower.ends_with(".gif") { "gif" }
-              else if url_lower.ends_with(".webp") { "webp" }
-              else { "jpg" };
-
-    let guest_path = format!("/plugin/nh_cover_{gallery_id}.{ext}");
-    match download_and_install_asset(cover_url, &guest_path, &format!("cover.{ext}"), guess_content_type(ext), None) {
-        Ok(asset_id) => {
-            let _ = HostBridge::task_kv_set(&cache_key, json!(asset_id));
-            Some(asset_id)
-        }
-        Err(e) => {
-            HostBridge::log(2, &format!("nhsource cover asset failed for {gallery_id}: {e}"));
-            None
-        }
-    }
+fn ensure_cover_asset(_cover_url: &str, _gallery_id: &str) -> Option<i64> {
+    // Dead code
+    None
 }
 
 fn parse_gallery_page_paths(gallery: &Value) -> Vec<String> {
@@ -1351,7 +1240,6 @@ fn plugin_info_json() -> Value {
             "tcp.connect",
             "task_kv.read",
             "task_kv.write",
-            "asset.install_from_file"
         ]
     })
 }

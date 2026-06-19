@@ -104,6 +104,8 @@ struct PluginInput {
     params: Value,
     #[serde(default)]
     metadata: Value,
+    #[serde(rename = "extraParams", default)]
+    extra_params: Value,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -434,7 +436,9 @@ pub extern "C" fn lanlu_plugin_run(input_ptr: i32, input_len: i32) -> i32 {
         Err(err) => return set_error_and_zero(format!("invalid plugin input: {err}")),
     };
 
-    let payload = if input.action.trim() == "resolve_metadata"
+    let payload = if input.action.trim() == "resolve_cover" {
+        resolve_cover_action(&input)
+    } else if input.action.trim() == "resolve_metadata"
         && normalize_target_type(&input.target_type, &input.params) == "source"
     {
         resolve_source_metadata(&input)
@@ -466,6 +470,80 @@ pub extern "C" fn lanlu_plugin_last_error() -> i32 {
 #[no_mangle]
 pub extern "C" fn lanlu_plugin_last_error_len() -> i32 {
     STATE.with(|state| state.borrow().error.len() as i32)
+}
+
+/// resolve_cover action: 下载封面并安装到已分配的占位 asset 中。
+/// extraParams 包含 { "asset_id": 789 }
+fn resolve_cover_action(input: &PluginInput) -> Value {
+    let asset_id = input.extra_params.get("asset_id").and_then(Value::as_i64).unwrap_or(0);
+    if asset_id <= 0 {
+        return json!({"success": false, "error": "missing asset_id in extraParams"});
+    }
+
+    let target_id = if input.target_id.trim().is_empty() {
+        param_string(&input.params, "__target_id")
+    } else {
+        input.target_id.trim().to_string()
+    };
+
+    let gallery_url = match extract_remote_id_from_source_id(&target_id) {
+        Some(v) if !v.is_empty() => v,
+        _ => return json!({"success": false, "error": format!("invalid sourceId: {target_id}")}),
+    };
+    let gallery = match parse_oneshot_gallery(&gallery_url) {
+        Some(g) => g,
+        None => return json!({"success": false, "error": format!("cannot parse gallery url: {gallery_url}")}),
+    };
+
+    HostBridge::progress(10, "加载登录态...");
+    let login_cookies = match load_eh_auth() {
+        Ok(auth) => build_eh_login_cookies(&auth),
+        Err(error) => return json!({"success": false, "error": error}),
+    };
+
+    HostBridge::progress(30, "获取封面 URL...");
+    let gdata = match fetch_gallery_gdata(&gallery.gid, &gallery.token) {
+        Ok(v) => v,
+        Err(error) => return json!({"success": false, "error": error}),
+    };
+    let thumb = gdata.get("thumb").and_then(value_to_string).unwrap_or_default();
+    let cover = normalize_cover_url(&thumb, "https://e-hentai.org/");
+    if cover.trim().is_empty() {
+        return json!({"success": false, "error": "no cover URL found"});
+    }
+
+    HostBridge::progress(60, "下载封面...");
+    let ext = if cover.to_ascii_lowercase().ends_with(".png") { "png" }
+        else if cover.to_ascii_lowercase().ends_with(".gif") { "gif" }
+        else if cover.to_ascii_lowercase().ends_with(".webp") { "webp" }
+        else { "jpg" };
+    let content_type = match ext {
+        "png" => "image/png", "gif" => "image/gif", "webp" => "image/webp", _ => "image/jpeg",
+    };
+    let guest_path = format!("/plugin/ehentai_cover_{}_{}.{ext}", gallery.gid, gallery.token);
+
+    let resp = match http_request_bytes_follow_redirects("GET", &cover, None, None, &login_cookies, &[]) {
+        Ok(v) => v,
+        Err(e) => return json!({"success": false, "error": format!("cover download failed: {e}")}),
+    };
+    if resp.status >= 400 {
+        return json!({"success": false, "error": format!("cover HTTP {}", resp.status)});
+    }
+    if let Err(e) = fs::write(&guest_path, &resp.body) {
+        return json!({"success": false, "error": format!("cover write failed: {e}")});
+    }
+
+    HostBridge::progress(90, "安装封面...");
+    match HostBridge::call("asset.install_into", json!({
+        "asset_id": asset_id,
+        "guest_path": guest_path,
+    })) {
+        Ok(_) => {
+            HostBridge::progress(100, "封面安装完成");
+            json!({"success": true})
+        }
+        Err(e) => json!({"success": false, "error": format!("asset.install_into failed: {e}")}),
+    }
 }
 
 /// 解析 source 元数据：从 sourceId（source:ehentaisource:{galleryUrl}）解析 gid/token，
