@@ -98,6 +98,16 @@ struct PluginInput {
     url: String,
     #[serde(rename = "pluginDir", default)]
     plugin_dir: String,
+    #[serde(default)]
+    action: String,
+    #[serde(rename = "targetType", default)]
+    target_type: String,
+    #[serde(rename = "targetId", default)]
+    target_id: String,
+    #[serde(default)]
+    path: String,
+    #[serde(rename = "extraParams", default)]
+    extra_params: Value,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -261,6 +271,11 @@ impl HostBridge {
         }
         Ok(response.get("value").cloned())
     }
+
+    fn task_kv_set(key: &str, value: Value) -> Result<(), String> {
+        Self::call("task_kv.set", json!({ "key": key, "value": value }))?;
+        Ok(())
+    }
 }
 
 unsafe fn read_guest_bytes(ptr: i32, len: i32) -> &'static [u8] {
@@ -316,15 +331,27 @@ pub extern "C" fn lanlu_plugin_run(input_ptr: i32, input_len: i32) -> i32 {
         Err(e) => return set_error_and_zero(format!("invalid plugin input: {e}")),
     };
 
-    let result = run_download(&input);
-    match serde_json::to_vec(&result) {
-        Ok(bytes) => STATE.with(|state| {
-            let mut state = state.borrow_mut();
-            state.result = bytes;
-            state.result.as_ptr() as i32
-        }),
-        Err(e) => set_error_and_zero(format!("failed to encode output: {e}")),
-    }
+    let action = input.action.trim();
+    let result_bytes: Vec<u8> = match action {
+        "resolve_page_asset" => resolve_page_asset(&input),
+        "download_archive" => {
+            let val = download_archive_action(&input);
+            serde_json::to_vec(&val).unwrap_or_else(|e| {
+                serde_json::to_vec(&output_err(&format!("encode error: {e}"))).unwrap_or_default()
+            })
+        }
+        _ => {
+            let val = run_download(&input);
+            serde_json::to_vec(&val).unwrap_or_else(|e| {
+                serde_json::to_vec(&output_err(&format!("encode error: {e}"))).unwrap_or_default()
+            })
+        }
+    };
+    STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        state.result = result_bytes;
+        state.result.as_ptr() as i32
+    })
 }
 
 #[no_mangle]
@@ -357,7 +384,8 @@ fn plugin_info_json() -> Value {
             "log.write",
             "progress.report",
             "tcp.connect",
-            "task_kv.read"
+            "task_kv.read",
+            "task_kv.write"
         ],
         "url_regex": "^(\\d+|jm\\d+|https?://.*(jmapinodeudzn\\.net|cdnsha\\.org|cdnntr\\.cc|cdnaspa\\.cc|cdntwice\\.org)/album\\?id=\\d+)$",
         "update_url": ""
@@ -404,6 +432,203 @@ fn run_download(input: &PluginInput) -> Value {
             })
         }
         Err(e) => output_err(&format!("Download failed: {}", e)),
+    }
+}
+
+/// resolve_page_asset action（targetType=source，直连执行）：
+/// path = "{ep_id}/{page_num}"，直接返回图片二进制数据（零磁盘、零 asset）。
+fn resolve_page_asset(input: &PluginInput) -> Vec<u8> {
+    let path = input.path.trim();
+    if path.is_empty() {
+        return build_binary_response(&output_err("path is required for resolve_page_asset"), &[]);
+    }
+    let parts: Vec<&str> = path.split('/').collect();
+    if parts.len() < 2 {
+        return build_binary_response(
+            &output_err(&format!("invalid path (expected ep_id/page): {path}")),
+            &[],
+        );
+    }
+    let ep_id = parts[0];
+    let page: u64 = match parts[1].parse() {
+        Ok(n) => n,
+        Err(_) => {
+            return build_binary_response(
+                &output_err(&format!("invalid page number in path: {path}")),
+                &[],
+            )
+        }
+    };
+    if page == 0 {
+        return build_binary_response(&output_err("page number must be >= 1"), &[]);
+    }
+
+    HostBridge::progress(10, "加载登录态...");
+    let auth = match load_jm_auth() {
+        Ok(v) => v,
+        Err(e) => return build_binary_response(&output_err(&e), &[]),
+    };
+
+    let api_base = resolve_api_base(&input.params, &auth);
+    let bypass_url = resolve_bypass_url(&input.params, &auth);
+    let image_base = resolve_image_base(&api_base, &input.params, &auth, &bypass_url)
+        .unwrap_or_else(|e| {
+            HostBridge::log(1, &format!("jmcomicdl image base fallback: {}", e));
+            DEFAULT_IMAGE_BASE.to_string()
+        });
+
+    HostBridge::progress(30, &format!("获取章节 {} 图片列表...", ep_id));
+
+    // 缓存章节图片列表，避免每页都重抓
+    let cache_key = format!("jmcomicdl_chapter_images_{ep_id}");
+    let images: Vec<String> = match HostBridge::task_kv_get(&cache_key) {
+        Ok(Some(cached)) => {
+            cached.as_array().map(|arr| {
+                arr.iter().filter_map(|v| v.as_str().map(String::from)).collect()
+            }).unwrap_or_default()
+        }
+        _ => Vec::new(),
+    };
+    let images = if !images.is_empty() {
+        images
+    } else {
+        let chapter_time = current_timestamp();
+        let chapter_url = format!("{}/chapter?id={}", api_base, ep_id);
+        let chapter_headers = build_jm_headers(chapter_time);
+        let chapter_resp = match http_request_text("GET", &chapter_url, None, &chapter_headers, &bypass_url) {
+            Ok(v) => v,
+            Err(e) => return build_binary_response(&output_err(&format!("chapter fetch failed: {e}")), &[]),
+        };
+        if chapter_resp.status != 200 {
+            return build_binary_response(
+                &output_err(&format!("chapter fetch HTTP {}", chapter_resp.status)),
+                &[],
+            );
+        }
+        let body_text = String::from_utf8_lossy(&chapter_resp.body);
+        let json_resp: Value = match serde_json::from_str(&body_text) {
+            Ok(v) => v,
+            Err(e) => return build_binary_response(&output_err(&format!("parse error: {e}")), &[]),
+        };
+        let data_field = match json_resp.get("data").and_then(Value::as_str) {
+            Some(v) => v,
+            None => return build_binary_response(&output_err("missing chapter data field"), &[]),
+        };
+        let secret = format!("{}{}", chapter_time, JM_SECRET);
+        let decrypted = match jm_decrypt(data_field, &secret) {
+            Ok(v) => v,
+            Err(e) => return build_binary_response(&output_err(&format!("decrypt error: {e}")), &[]),
+        };
+        let chapter: Value = match serde_json::from_str(&decrypted) {
+            Ok(v) => v,
+            Err(e) => return build_binary_response(&output_err(&format!("parse chapter: {e}")), &[]),
+        };
+        let fetched: Vec<String> = chapter
+            .get("images")
+            .and_then(Value::as_array)
+            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .unwrap_or_default();
+        if fetched.is_empty() {
+            return build_binary_response(&output_err("no images in chapter"), &[]);
+        }
+        let _ = HostBridge::task_kv_set(&cache_key, json!(fetched));
+        fetched
+    };
+
+    let idx = (page - 1) as usize;
+    if idx >= images.len() {
+        return build_binary_response(
+            &output_err(&format!("page {page} out of range ({} pages)", images.len())),
+            &[],
+        );
+    }
+    let img_name = &images[idx];
+    let img_url = format!("{}/media/photos/{}/{}", image_base, ep_id, img_name);
+    let ext = guess_ext_from_url(img_name);
+    let content_type = guess_content_type(&ext);
+
+    HostBridge::progress(70, &format!("下载第 {} 页...", page));
+    let img_headers = build_img_headers();
+    let img_resp = match http_request_bytes("GET", &img_url, None, &img_headers, &bypass_url) {
+        Ok(v) => v,
+        Err(e) => return build_binary_response(&output_err(&format!("image download failed: {e}")), &[]),
+    };
+    if img_resp.status != 200 {
+        return build_binary_response(
+            &output_err(&format!("image download HTTP {}", img_resp.status)),
+            &[],
+        );
+    }
+
+    HostBridge::progress(100, "单页资源解析完成");
+    let success_json = json!({
+        "success": true,
+        "content_type": content_type
+    });
+    build_binary_response(&success_json, &img_resp.body)
+}
+
+/// download_archive action（targetType=source）：从 targetId 解析 remoteId，复用整本下载流程。
+fn download_archive_action(input: &PluginInput) -> Value {
+    let target_id = input.target_id.trim();
+    let album_id = match target_id.strip_prefix("source:jmcomicsource:") {
+        Some(id) if !id.is_empty() => id.to_string(),
+        _ => return output_err(&format!("invalid sourceId: {target_id}")),
+    };
+
+    let auth = match load_jm_auth() {
+        Ok(v) => v,
+        Err(e) => return output_err(&e),
+    };
+
+    let plugin_dir = resolve_plugin_dir(&input.plugin_dir, "jmcomicdl");
+    HostBridge::log(1, &format!("jmcomicdl download_archive album_id={}", album_id));
+
+    match download_album(&album_id, &auth, &plugin_dir, &input.params) {
+        Ok((relative_path, filename)) => {
+            HostBridge::progress(100, "下载完成");
+            json!({
+                "success": true,
+                "data": [{
+                    "plugin_relative_path": relative_path,
+                    "relative_path": relative_path,
+                    "filename": filename,
+                    "source": format!("source:jmcomicsource:{}", album_id),
+                    "archive_type": "archive"
+                }]
+            })
+        }
+        Err(e) => output_err(&format!("Download failed: {}", e)),
+    }
+}
+
+fn build_binary_response(json_val: &Value, binary: &[u8]) -> Vec<u8> {
+    let json_bytes = serde_json::to_vec(json_val).unwrap_or_else(|_| b"{}".to_vec());
+    let json_len = json_bytes.len() as u32;
+    let mut out = Vec::with_capacity(4 + json_bytes.len() + binary.len());
+    out.extend_from_slice(&json_len.to_le_bytes());
+    out.extend_from_slice(&json_bytes);
+    out.extend_from_slice(binary);
+    out
+}
+
+fn guess_ext_from_url(name: &str) -> String {
+    let name_lower = name.to_ascii_lowercase();
+    if let Some(dot) = name_lower.rfind('.') {
+        name_lower[dot + 1..].to_string()
+    } else {
+        String::new()
+    }
+}
+
+fn guess_content_type(ext: &str) -> &'static str {
+    match ext {
+        "jpg" | "jpeg" => "image/jpeg",
+        "png" => "image/png",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        _ => "application/octet-stream",
     }
 }
 

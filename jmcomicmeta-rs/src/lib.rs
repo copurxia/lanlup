@@ -328,6 +328,10 @@ pub extern "C" fn lanlu_plugin_run(input_ptr: i32, input_len: i32) -> i32 {
 
     let payload = if input.action.trim() == "resolve_cover" {
         resolve_cover_action(&input)
+    } else if input.action.trim() == "resolve_metadata"
+        && normalize_target_type(&input.target_type, &input.params) == "source"
+    {
+        resolve_source_metadata(&input)
     } else {
         build_result_payload(input)
     };
@@ -391,11 +395,137 @@ fn resolve_cover_action(input: &PluginInput) -> Value {
     json!({"success": false, "error": "resolve_cover not yet implemented"})
 }
 
+fn normalize_target_type(raw: &str, params: &Value) -> String {
+    let from_input = raw.trim().to_ascii_lowercase();
+    if !from_input.is_empty() {
+        return from_input;
+    }
+    params.get("__target_type")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase()
+}
+
+fn value_to_id_string(value: Option<&Value>) -> String {
+    match value {
+        Some(Value::Number(n)) => n.to_string(),
+        Some(Value::String(s)) => s.clone(),
+        _ => String::new(),
+    }
+}
+
 fn build_result_payload(input: PluginInput) -> Value {
     match execute_plugin(input) {
         Ok(v) => json!({"success": true, "data": v}),
         Err(e) => json!({"success": false, "error": e}),
     }
+}
+
+/// 解析 source 元数据：从 sourceId（source:jmcomicsource:{albumId}）解析专辑ID，
+/// 调 JM 专辑/章节 API 获取title/tags/cover，构建 archive 或 page children。
+fn resolve_source_metadata(input: &PluginInput) -> Value {
+    HostBridge::progress(5, "解析 sourceId...");
+
+    let auth = match load_jm_auth() {
+        Ok(v) => v,
+        Err(e) => return json!({"success": false, "error": e}),
+    };
+    let api_base = resolve_api_base(&input.params, &auth);
+    let bypass_url = resolve_bypass_url(&input.params, &auth);
+
+    let target_id = input.target_id.trim();
+    let album_id = match target_id.strip_prefix("source:jmcomicsource:") {
+        Some(id) if !id.is_empty() => id.to_string(),
+        _ => return json!({"success": false, "error": format!("invalid sourceId: {target_id}")}),
+    };
+
+    HostBridge::log(1, &format!("jmcomicmeta resolve_source_metadata id={}", album_id));
+    HostBridge::progress(30, &format!("获取专辑 {} 元数据...", album_id));
+
+    let fetch_cover_setting = read_bool_param(&input.params, "fetch_cover", true);
+    let image_base = match resolve_image_base(&api_base, &input.params, &auth, &bypass_url) {
+        Ok(v) => v,
+        Err(e) => {
+            HostBridge::log(1, &format!("image_base fallback: {}", e));
+            DEFAULT_IMAGE_BASE.to_string()
+        }
+    };
+
+    // 1. 尝试获取专辑数据
+    match fetch_album_json(&album_id, &api_base, &bypass_url) {
+        Ok(album) => {
+            let title = album.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+            let description = album.get("description").and_then(Value::as_str).unwrap_or("").to_string();
+            let tags = build_tags_from_album(&album);
+            let cover = if fetch_cover_setting {
+                format!("{}/media/albums/{}_3x4.jpg", image_base, album_id)
+            } else { String::new() };
+
+            // 检查是否有子章节 (series)
+            if let Some(series) = album.get("series").and_then(Value::as_array) {
+                if !series.is_empty() {
+                    // 多话专辑 → archive children
+                    let children: Vec<Value> = series.iter().enumerate().filter_map(|(idx, item)| {
+                        let ep_id = value_to_id_string(item.get("id"));
+                        if ep_id.is_empty() { return None; }
+                        let ep_name = item.get("name").and_then(Value::as_str).unwrap_or("").trim().to_string();
+                        let display_name = if ep_name.is_empty() {
+                            format!("第{}話", ep_id)
+                        } else { ep_name };
+                        Some(json!({
+                            "entity_type": "archive",
+                            "entity_id": format!("source:jmcomicsource:{}", ep_id),
+                            "title": display_name,
+                            "sort_order": (idx + 1) as i64,
+                        }))
+                    }).collect();
+
+                    let mut data = json!({
+                        "title": title,
+                        "description": description,
+                        "tags": tags,
+                        "children": children,
+                    });
+                    if !cover.is_empty() {
+                        data["cover"] = json!(cover);
+                    }
+                    HostBridge::progress(100, "元数据获取完成");
+                    return json!({"success": true, "data": data});
+                }
+            }
+            // 无 series 的单话专辑 → 继续向下获取 page children
+            HostBridge::log(1, "album has no series, fetching as single chapter");
+        }
+        Err(e) => {
+            HostBridge::log(1, &format!("album fetch failed, trying as chapter: {}", e));
+        }
+    }
+
+    // 2. 作为章节/单话获取页面
+    HostBridge::progress(50, &format!("获取章节 {} 页面...", album_id));
+    let image_names = match fetch_chapter_images(&album_id, &api_base, &bypass_url) {
+        Ok(v) => v,
+        Err(e) => return json!({"success": false, "error": e}),
+    };
+
+    let children: Vec<Value> = image_names.iter().enumerate().map(|(idx, _)| {
+        let page_num = idx + 1;
+        json!({
+            "entity_type": "page",
+            "entity_id": format!("source:jmcomicsource:{}#page:{}", album_id, page_num),
+            "title": "",
+            "sort_order": page_num as i64,
+            "path": format!("{}/{}", album_id, page_num),
+            "media_type": "image",
+        })
+    }).collect();
+
+    let data = json!({
+        "children": children,
+    });
+
+    HostBridge::progress(100, "元数据获取完成");
+    json!({"success": true, "data": data})
 }
 
 fn execute_plugin(input: PluginInput) -> Result<Value, String> {
@@ -631,6 +761,84 @@ fn fetch_album_metadata(
 
     let tags_csv = tags.join(", ");
     Ok((title, tags_csv, description, cover))
+}
+
+/// 获取专辑完整 JSON（用于 resolve_source_metadata）
+fn fetch_album_json(album_id: &str, api_base: &str, bypass_url: &str) -> Result<Value, String> {
+    let time = current_timestamp();
+    let url = format!("{}/album?id={}", api_base, album_id);
+    let headers = build_jm_headers(time);
+    let response = http_request_text("GET", &url, None, &headers, bypass_url)?;
+    if response.status != 200 {
+        return Err(format!("Album fetch failed: HTTP {}", response.status));
+    }
+    let body_text = String::from_utf8_lossy(&response.body);
+    let json_resp: Value = serde_json::from_str(&body_text).map_err(|e| e.to_string())?;
+    let data_field = json_resp.get("data").and_then(Value::as_str).ok_or("Missing data field")?;
+    let secret = format!("{}{}", time, JM_SECRET);
+    let decrypted = jm_decrypt(data_field, &secret)?;
+    let album: Value = serde_json::from_str(&decrypted).map_err(|e| e.to_string())?;
+    Ok(album)
+}
+
+/// 获取章节图片文件名列表（用于 resolve_source_metadata 的 page children）
+fn fetch_chapter_images(ep_id: &str, api_base: &str, bypass_url: &str) -> Result<Vec<String>, String> {
+    let time = current_timestamp();
+    let url = format!("{}/chapter?id={}", api_base, ep_id);
+    let headers = build_jm_headers(time);
+    let response = http_request_text("GET", &url, None, &headers, bypass_url)?;
+    if response.status != 200 {
+        return Err(format!("Chapter fetch failed: HTTP {}", response.status));
+    }
+    let body_text = String::from_utf8_lossy(&response.body);
+    let json_resp: Value = serde_json::from_str(&body_text).map_err(|e| e.to_string())?;
+    let data_field = json_resp.get("data").and_then(Value::as_str).ok_or("Missing data field")?;
+    let secret = format!("{}{}", time, JM_SECRET);
+    let decrypted = jm_decrypt(data_field, &secret)?;
+    let chapter: Value = serde_json::from_str(&decrypted).map_err(|e| e.to_string())?;
+    let images = chapter.get("images").and_then(Value::as_array)
+        .ok_or("Missing images array")?;
+    let result: Vec<String> = images.iter()
+        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+        .collect();
+    if result.is_empty() {
+        return Err("Empty images array".to_string());
+    }
+    Ok(result)
+}
+
+/// 从 album JSON 构建标签数组（统一 metadata 格式）
+fn build_tags_from_album(album: &Value) -> Value {
+    let mut tags = Vec::new();
+    if let Some(author_arr) = album.get("author").and_then(Value::as_array) {
+        for a in author_arr {
+            if let Some(s) = a.as_str() {
+                if !s.is_empty() {
+                    tags.push(Value::String(format!("author:{}", s)));
+                }
+            }
+        }
+    }
+    if let Some(tag_arr) = album.get("tags").and_then(Value::as_array) {
+        for t in tag_arr {
+            if let Some(s) = t.as_str() {
+                if !s.is_empty() {
+                    tags.push(Value::String(format!("tag:{}", s)));
+                }
+            }
+        }
+    }
+    if let Some(cat) = album.get("category").and_then(|c| c.get("title")).and_then(Value::as_str) {
+        if !cat.is_empty() {
+            tags.push(Value::String(format!("category:{}", cat)));
+        }
+    }
+    if let Some(sub_cat) = album.get("category_sub").and_then(|c| c.get("title")).and_then(Value::as_str) {
+        if !sub_cat.is_empty() {
+            tags.push(Value::String(format!("category:{}", sub_cat)));
+        }
+    }
+    Value::Array(tags)
 }
 
 fn current_timestamp() -> u64 {

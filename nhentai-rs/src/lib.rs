@@ -86,6 +86,16 @@ struct PluginInput {
     url: String,
     #[serde(rename = "pluginDir", default)]
     plugin_dir: String,
+    #[serde(default)]
+    action: String,
+    #[serde(rename = "targetType", default)]
+    target_type: String,
+    #[serde(rename = "targetId", default)]
+    target_id: String,
+    #[serde(default)]
+    path: String,
+    #[serde(rename = "extraParams", default)]
+    extra_params: Value,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -184,6 +194,11 @@ impl HostBridge {
             return Ok(None);
         }
         Ok(response.get("value").cloned())
+    }
+
+    fn task_kv_set(key: &str, value: Value) -> Result<(), String> {
+        Self::call("task_kv.set", json!({ "key": key, "value": value }))?;
+        Ok(())
     }
 }
 
@@ -305,15 +320,27 @@ pub extern "C" fn lanlu_plugin_run(input_ptr: i32, input_len: i32) -> i32 {
     };
     let _ = &input.plugin_type;
 
-    let result = run_download(&input);
-    match serde_json::to_vec(&result) {
-        Ok(bytes) => STATE.with(|state| {
-            let mut state = state.borrow_mut();
-            state.result = bytes;
-            state.result.as_ptr() as i32
-        }),
-        Err(e) => set_error_and_zero(format!("failed to encode output: {e}")),
-    }
+    let action = input.action.trim();
+    let result_bytes: Vec<u8> = match action {
+        "resolve_page_asset" => resolve_page_asset(&input),
+        "download_archive" => {
+            let val = download_archive_action(&input);
+            serde_json::to_vec(&val).unwrap_or_else(|e| {
+                serde_json::to_vec(&output_err(&format!("encode error: {e}"))).unwrap_or_default()
+            })
+        }
+        _ => {
+            let val = run_download(&input);
+            serde_json::to_vec(&val).unwrap_or_else(|e| {
+                serde_json::to_vec(&output_err(&format!("encode error: {e}"))).unwrap_or_default()
+            })
+        }
+    };
+    STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        state.result = result_bytes;
+        state.result.as_ptr() as i32
+    })
 }
 
 #[no_mangle]
@@ -464,6 +491,150 @@ fn run_download(input: &PluginInput) -> Value {
             "archive_type": "folder"
         }]
     })
+}
+
+/// resolve_page_asset action（targetType=source，直连执行）：
+/// path = "{gallery_id}/{page_num}"，直接返回图片二进制数据。
+fn resolve_page_asset(input: &PluginInput) -> Vec<u8> {
+    let path = input.path.trim();
+    if path.is_empty() {
+        return build_binary_response(&output_err("path is required"), &[]);
+    }
+    let parts: Vec<&str> = path.split('/').collect();
+    if parts.len() < 2 {
+        return build_binary_response(&output_err(&format!("invalid path: {path}")), &[]);
+    }
+    let gallery_id_str = parts[0];
+    let page_num: usize = match parts[1].parse() {
+        Ok(n) if n >= 1 => n,
+        _ => return build_binary_response(&output_err(&format!("invalid page: {path}")), &[]),
+    };
+    let gallery_id: i64 = match gallery_id_str.parse() {
+        Ok(v) => v,
+        Err(_) => return build_binary_response(&output_err(&format!("invalid gallery_id: {gallery_id_str}")), &[]),
+    };
+
+    let auth = match load_nh_auth() {
+        Ok(v) => v,
+        Err(e) => return build_binary_response(&output_err(&e), &[]),
+    };
+    let login_cookies = build_nh_login_cookies(&auth);
+    let auth_headers = build_nh_api_auth_headers(&auth);
+
+    // 缓存 gallery API 响应
+    let cache_key = format!("nhdl_gallery_{gallery_id}");
+    let page_path: String = match HostBridge::task_kv_get(&cache_key) {
+        Ok(Some(cached)) => {
+            cached.get("page_path").and_then(Value::as_str).unwrap_or("").to_string()
+        }
+        _ => String::new(),
+    };
+    let media_id: String;
+    let page_path = if !page_path.is_empty() {
+        page_path
+    } else {
+        let gallery_api_url = format!("https://nhentai.net/api/v2/galleries/{gallery_id}");
+        let resp = match http_get_with_retry(
+            &gallery_api_url,
+            Some("https://nhentai.net/"),
+            &login_cookies,
+            "application/json",
+            &auth_headers,
+            4,
+        ) {
+            Ok(r) => r,
+            Err(e) => return build_binary_response(&output_err(&format!("API error: {e}")), &[]),
+        };
+        if resp.status >= 400 {
+            return build_binary_response(&output_err(&format!("API HTTP {}", resp.status)), &[]);
+        }
+        let gallery: Value = match serde_json::from_slice(&resp.body) {
+            Ok(v) => v,
+            Err(e) => return build_binary_response(&output_err(&format!("JSON parse: {e}")), &[]),
+        };
+
+        media_id = gallery.get("media_id").and_then(Value::as_str).unwrap_or("").to_string();
+        if media_id.is_empty() {
+            return build_binary_response(&output_err("missing media_id"), &[]);
+        }
+
+        let ext = gallery.get("images")
+            .and_then(|imgs| imgs.get("pages"))
+            .and_then(|pages| pages.get(page_num.saturating_sub(1)))
+            .and_then(|page| page.get("t").and_then(Value::as_str))
+            .map(|t| match t {
+                "j" => "jpg", "p" => "png", "g" => "gif", "w" => "webp", _ => "jpg",
+            })
+            .unwrap_or("jpg");
+
+        let path_val = format!("galleries/{media_id}/{page_num}.{ext}");
+        let _ = HostBridge::task_kv_set(&cache_key, json!({"page_path": path_val}));
+        path_val
+    };
+
+    let image_url = format!("https://i.nhentai.net/{}", page_path.trim_start_matches('/'));
+    let img_headers = vec![
+        ("Referer".to_string(), "https://nhentai.net/".to_string()),
+        ("User-Agent".to_string(), USER_AGENT.to_string()),
+    ];
+
+    let img_resp = match http_get_with_retry(
+        &image_url,
+        Some("https://nhentai.net/"),
+        &[],
+        "image/webp,image/apng,image/*,*/*;q=0.8",
+        &img_headers,
+        3,
+    ) {
+        Ok(r) => r,
+        Err(e) => return build_binary_response(&output_err(&format!("image download: {e}")), &[]),
+    };
+    if img_resp.status != 200 {
+        return build_binary_response(&output_err(&format!("image HTTP {}", img_resp.status)), &[]);
+    }
+
+    let ext = page_path.rsplit('.').next().unwrap_or("jpg").to_string();
+    let content_type = match ext.as_str() {
+        "jpg" | "jpeg" => "image/jpeg",
+        "png" => "image/png",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        _ => "application/octet-stream",
+    };
+
+    HostBridge::progress(100, "单页资源解析完成");
+    build_binary_response(&json!({"success": true, "content_type": content_type}), &img_resp.body)
+}
+
+/// download_archive action：从 targetId 解析 gallery_id，复用整本下载流程。
+fn download_archive_action(input: &PluginInput) -> Value {
+    let target_id = input.target_id.trim();
+    let gallery_id = match target_id.strip_prefix("source:nhsource:") {
+        Some(id) if !id.is_empty() => id.to_string(),
+        _ => return output_err(&format!("invalid sourceId: {target_id}")),
+    };
+    let fake_url = format!("https://nhentai.net/g/{gallery_id}/");
+    let mut fake_input = PluginInput {
+        plugin_type: input.plugin_type.clone(),
+        url: fake_url,
+        plugin_dir: input.plugin_dir.clone(),
+        action: String::new(),
+        target_type: String::new(),
+        target_id: String::new(),
+        path: String::new(),
+        extra_params: Value::Null,
+    };
+    run_download(&fake_input)
+}
+
+fn build_binary_response(json_val: &Value, binary: &[u8]) -> Vec<u8> {
+    let json_bytes = serde_json::to_vec(json_val).unwrap_or_else(|_| b"{}".to_vec());
+    let json_len = json_bytes.len() as u32;
+    let mut out = Vec::with_capacity(4 + json_bytes.len() + binary.len());
+    out.extend_from_slice(&json_len.to_le_bytes());
+    out.extend_from_slice(&json_bytes);
+    out.extend_from_slice(binary);
+    out
 }
 
 fn load_nh_auth() -> Result<NhAuthData, String> {
@@ -1292,7 +1463,8 @@ fn plugin_info_json() -> Value {
             "log.write",
             "progress.report",
             "tcp.connect",
-            "task_kv.read"
+            "task_kv.read",
+            "task_kv.write"
         ]
     })
 }

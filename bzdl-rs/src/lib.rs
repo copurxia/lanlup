@@ -72,6 +72,16 @@ struct PluginInput {
     url: String,
     #[serde(rename = "pluginDir", default)]
     plugin_dir: String,
+    #[serde(default)]
+    action: String,
+    #[serde(rename = "targetType", default)]
+    target_type: String,
+    #[serde(rename = "targetId", default)]
+    target_id: String,
+    #[serde(default)]
+    path: String,
+    #[serde(rename = "extraParams", default)]
+    extra_params: Value,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -128,6 +138,11 @@ impl HostBridge {
         if !found { return Ok(None); }
         Ok(response.get("value").cloned())
     }
+
+    fn task_kv_set(key: &str, value: Value) -> Result<(), String> {
+        Self::call("task_kv.set", json!({ "key": key, "value": value }))?;
+        Ok(())
+    }
 }
 
 #[no_mangle]
@@ -170,16 +185,28 @@ pub extern "C" fn lanlu_plugin_run(input_ptr: i32, input_len: i32) -> i32 {
         Ok(v) => v,
         Err(e) => return set_error_and_zero(format!("invalid plugin input: {e}")),
     };
-    let _ = &input.plugin_type;
-    let result = run_download(&input);
-    match serde_json::to_vec(&result) {
-        Ok(bytes) => STATE.with(|state| {
-            let mut state = state.borrow_mut();
-            state.result = bytes;
-            state.result.as_ptr() as i32
-        }),
-        Err(e) => set_error_and_zero(format!("failed to encode output: {e}")),
-    }
+
+    let action = input.action.trim();
+    let result_bytes: Vec<u8> = match action {
+        "resolve_page_asset" => resolve_page_asset(&input),
+        "download_archive" => {
+            let val = download_archive_action(&input);
+            serde_json::to_vec(&val).unwrap_or_else(|e| {
+                serde_json::to_vec(&output_err(&format!("encode error: {e}"))).unwrap_or_default()
+            })
+        }
+        _ => {
+            let val = run_download(&input);
+            serde_json::to_vec(&val).unwrap_or_else(|e| {
+                serde_json::to_vec(&output_err(&format!("encode error: {e}"))).unwrap_or_default()
+            })
+        }
+    };
+    STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        state.result = result_bytes;
+        state.result.as_ptr() as i32
+    })
 }
 
 #[no_mangle]
@@ -221,7 +248,8 @@ fn plugin_info_json() -> Value {
             "progress.report",
             "tcp.connect",
             "fs.write",
-            "task_kv.read"
+            "task_kv.read",
+            "task_kv.write"
         ]
     })
 }
@@ -323,6 +351,192 @@ fn run_download(input: &PluginInput) -> Value {
             "archive_type": "folder"
         }]
     })
+}
+
+/// resolve_page_asset action（targetType=source，直连执行）：
+/// path = "{comicId}_{epId}/{page_num}"，直接返回图片二进制数据。
+fn resolve_page_asset(input: &PluginInput) -> Vec<u8> {
+    let path = input.path.trim();
+    if path.is_empty() {
+        return build_binary_response(&output_err("path is required for resolve_page_asset"), &[]);
+    }
+    let parts: Vec<&str> = path.split('/').collect();
+    if parts.len() < 2 {
+        return build_binary_response(&output_err(&format!("invalid path: {path}")), &[]);
+    }
+    let chapter_id = parts[0]; // comicId_epId
+    let page: u64 = match parts[1].parse() {
+        Ok(n) => n,
+        Err(_) => return build_binary_response(&output_err(&format!("invalid page: {path}")), &[]),
+    };
+    if page == 0 { return build_binary_response(&output_err("page must be >= 1"), &[]); }
+
+    HostBridge::progress(10, "加载登录态...");
+    let auth = match load_bz_auth() {
+        Ok(v) => v,
+        Err(e) => return build_binary_response(&output_err(&e), &[]),
+    };
+
+    // Split chapter_id into comic_id and ep_id
+    let id_parts: Vec<&str> = chapter_id.splitn(2, '_').collect();
+    if id_parts.len() < 2 {
+        return build_binary_response(&output_err(&format!("invalid chapter_id: {chapter_id}")), &[]);
+    }
+    let comic_id = id_parts[0];
+    let ep_id = id_parts[1];
+
+    let app_url = format!("https://appcn.baozimh.com/baozimhapp/comic/chapter/{comic_id}/0_{ep_id}.html");
+
+    HostBridge::progress(30, "获取章节图片列表...");
+    let cache_key = format!("bzdl_chapter_images_{chapter_id}");
+    let images: Vec<String> = match HostBridge::task_kv_get(&cache_key) {
+        Ok(Some(cached)) => {
+            cached.as_array().map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default()
+        }
+        _ => Vec::new(),
+    };
+    let images = if !images.is_empty() { images } else {
+        let fetched = match fetch_chapter_images(&app_url, &auth) {
+            Ok(v) => v,
+            Err(e) => return build_binary_response(&output_err(&e), &[]),
+        };
+        if fetched.is_empty() {
+            return build_binary_response(&output_err("no images in chapter"), &[]);
+        }
+        let _ = HostBridge::task_kv_set(&cache_key, json!(fetched));
+        fetched
+    };
+
+    let idx = (page - 1) as usize;
+    if idx >= images.len() {
+        return build_binary_response(&output_err(&format!("page {page} out of range ({})", images.len())), &[]);
+    }
+
+    let img_url = &images[idx];
+    let ext = guess_ext(img_url);
+    let content_type = if ext == "jpg" || ext == "jpeg" { "image/jpeg" }
+        else if ext == "png" { "image/png" }
+        else if ext == "webp" { "image/webp" }
+        else if ext == "gif" { "image/gif" }
+        else { "application/octet-stream" };
+
+    HostBridge::progress(70, &format!("下载第 {} 页...", page));
+    let img_headers = vec![
+        ("User-Agent".to_string(), USER_AGENT.to_string()),
+        ("Accept".to_string(), "image/webp,image/apng,image/*,*/*;q=0.8".to_string()),
+        ("Referer".to_string(), app_url.clone()),
+    ];
+    let resp = match http_get_bytes(&img_url, &img_headers) {
+        Ok(v) => v,
+        Err(e) => return build_binary_response(&output_err(&format!("image download: {e}")), &[]),
+    };
+    if resp.status != 200 {
+        return build_binary_response(&output_err(&format!("image HTTP {}", resp.status)), &[]);
+    }
+
+    HostBridge::progress(100, "单页资源解析完成");
+    let success_json = json!({"success": true, "content_type": content_type});
+    build_binary_response(&success_json, &resp.body)
+}
+
+/// download_archive action：从 targetId 解析 remoteId，复用整本下载流程。
+fn download_archive_action(input: &PluginInput) -> Value {
+    let target_id = input.target_id.trim();
+    let comic_id = match target_id.strip_prefix("source:bzsource:") {
+        Some(id) if !id.is_empty() => id.to_string(),
+        _ => return output_err(&format!("invalid sourceId: {target_id}")),
+    };
+
+    let auth = match load_bz_auth() {
+        Ok(v) => v,
+        Err(e) => return output_err(&e),
+    };
+
+    // 构造一个兼容 run_download 的 url
+    let fake_url = format!("{}/comic/{}", auth.base_url, comic_id);
+    let mut fake_input = PluginInput {
+        plugin_type: input.plugin_type.clone(),
+        params: input.params.clone(),
+        url: fake_url,
+        plugin_dir: input.plugin_dir.clone(),
+        action: String::new(),
+        target_type: String::new(),
+        target_id: String::new(),
+        path: String::new(),
+        extra_params: Value::Null,
+    };
+    run_download(&fake_input)
+}
+
+fn build_binary_response(json_val: &Value, binary: &[u8]) -> Vec<u8> {
+    let json_bytes = serde_json::to_vec(json_val).unwrap_or_else(|_| b"{}".to_vec());
+    let json_len = json_bytes.len() as u32;
+    let mut out = Vec::with_capacity(4 + json_bytes.len() + binary.len());
+    out.extend_from_slice(&json_len.to_le_bytes());
+    out.extend_from_slice(&json_bytes);
+    out.extend_from_slice(binary);
+    out
+}
+
+fn http_get_bytes(url: &str, extra_headers: &[(String, String)]) -> Result<HttpResponse, String> {
+    let mut last_err = String::new();
+    for attempt in 0..MAX_HTTP_RETRIES {
+        if attempt > 0 {
+            HostBridge::log(1, &format!("http_get_bytes retry {}/{}", attempt + 1, MAX_HTTP_RETRIES));
+        }
+        match http_get_once_raw(url, extra_headers) {
+            Ok(resp) => {
+                if resp.status == 429 {
+                    let delay = (1u64 << attempt).min(60);
+                    HostBridge::log(1, &format!("rate limited, retry in {delay}s"));
+                    std::thread::sleep(std::time::Duration::from_secs(delay));
+                    continue;
+                }
+                if resp.status >= 500 || resp.status == 408 || resp.status == 425 {
+                    last_err = format!("HTTP {}", resp.status);
+                    continue;
+                }
+                return Ok(resp);
+            }
+            Err(e) => {
+                last_err = e;
+                continue;
+            }
+        }
+    }
+    Err(last_err)
+}
+
+fn http_get_once_raw(url: &str, extra_headers: &[(String, String)]) -> Result<HttpResponse, String> {
+    let parsed = Url::parse(url).map_err(|e| format!("invalid url {url}: {e}"))?;
+    let scheme = parsed.scheme();
+    let host = parsed.host_str().ok_or("missing host")?;
+    let port = parsed.port_or_known_default().ok_or("missing port")?;
+    let mut path = parsed.path().to_string();
+    if path.is_empty() { path.push('/'); }
+    if let Some(q) = parsed.query() { path.push('?'); path.push_str(q); }
+
+    let mut req = format!("GET {path} HTTP/1.1\r\n");
+    req.push_str(&format!("Host: {host}\r\n"));
+    req.push_str(&format!("User-Agent: {USER_AGENT}\r\n"));
+    req.push_str("Accept: image/webp,image/apng,image/*,*/*;q=0.8\r\n");
+    req.push_str("Accept-Encoding: identity\r\n");
+    req.push_str("Connection: close\r\n");
+    for (k, v) in extra_headers {
+        req.push_str(&format!("{k}: {v}\r\n"));
+    }
+    req.push_str("\r\n");
+
+    use std::io::Read;
+    let stream = connect_stream(scheme, host, port)?;
+    let raw = if scheme == "https" {
+        read_https(stream, host, req.as_bytes(), &[])?
+    } else {
+        let mut s = stream;
+        write_all(&mut s, req.as_bytes())?;
+        read_all(&mut s)?
+    };
+    parse_http(&raw)
 }
 
 fn load_bz_auth() -> Result<BzAuthData, String> {

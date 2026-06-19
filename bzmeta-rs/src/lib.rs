@@ -191,6 +191,10 @@ pub extern "C" fn lanlu_plugin_run(input_ptr: i32, input_len: i32) -> i32 {
     };
     let payload = if input.action.trim() == "resolve_cover" {
         resolve_cover_action(&input)
+    } else if input.action.trim() == "resolve_metadata"
+        && normalize_target_type(&input.target_type, &input.params) == "source"
+    {
+        resolve_source_metadata(&input)
     } else {
         build_result_payload(input)
     };
@@ -251,6 +255,184 @@ fn resolve_cover_action(input: &PluginInput) -> Value {
     let asset_id = input.extra_params.get("asset_id").and_then(Value::as_i64).unwrap_or(0);
     if asset_id <= 0 { return json!({"success": false, "error": "missing asset_id"}); }
     json!({"success": false, "error": "resolve_cover not yet implemented"})
+}
+
+fn normalize_target_type(raw: &str, params: &Value) -> String {
+    let from_input = raw.trim().to_ascii_lowercase();
+    if !from_input.is_empty() { return from_input; }
+    params.get("__target_type").and_then(Value::as_str).unwrap_or("").to_ascii_lowercase()
+}
+
+fn value_to_id_string(value: Option<&Value>) -> String {
+    match value {
+        Some(Value::Number(n)) => n.to_string(),
+        Some(Value::String(s)) => s.clone(),
+        _ => String::new(),
+    }
+}
+
+/// 解析 source 元数据：从 sourceId（source:bzsource:{comicId} 或 source:bzsource:{comicId}_{epId}）解析
+/// 调 BZ HTML 页面获取漫画元数据/章节/页面。
+fn resolve_source_metadata(input: &PluginInput) -> Value {
+    HostBridge::progress(5, "解析 sourceId...");
+    let auth = match load_bz_auth() {
+        Ok(v) => v,
+        Err(e) => return json!({"success": false, "error": e}),
+    };
+
+    let target_id = input.target_id.trim();
+    let remote_id = match target_id.strip_prefix("source:bzsource:") {
+        Some(id) if !id.is_empty() => id.to_string(),
+        _ => return json!({"success": false, "error": format!("invalid sourceId: {target_id}")}),
+    };
+
+    HostBridge::log(1, &format!("bzmeta resolve_source_metadata id={}", remote_id));
+
+    // 检查是否是章节（comicId_epId 格式）
+    if let Some(underscore_pos) = remote_id.rfind('_') {
+        let ep_id = &remote_id[underscore_pos + 1..];
+        let comic_id = &remote_id[..underscore_pos];
+        if !ep_id.is_empty() && !comic_id.is_empty() {
+            // 章节模式 → 获取页面列表
+            HostBridge::progress(40, &format!("获取章节 {} 页面...", remote_id));
+            return match fetch_chapter_image_urls(&remote_id) {
+                Ok(image_count) => {
+                    let children: Vec<Value> = (1..=image_count).map(|page_num| {
+                        json!({
+                            "entity_type": "page",
+                            "entity_id": format!("source:bzsource:{}#page:{}", remote_id, page_num),
+                            "title": "",
+                            "sort_order": page_num as i64,
+                            "path": format!("{}/{}", remote_id, page_num),
+                            "media_type": "image",
+                        })
+                    }).collect();
+                    HostBridge::progress(100, "元数据获取完成");
+                    json!({"success": true, "data": json!({"children": children})})
+                }
+                Err(e) => json!({"success": false, "error": e}),
+            };
+        }
+    }
+
+    // 漫画模式 → 获取详情和章节列表
+    HostBridge::progress(30, &format!("获取漫画 {} 详情...", remote_id));
+    match fetch_comic_detail(&remote_id, &auth) {
+        Ok(detail) => {
+            let tags = metadata_tags_from_csv(&detail.tags);
+
+            // 解析章节
+            let comic_url = format!("{}/comic/{}", auth.base_url, remote_id);
+            let (status, html) = match http_get_text(&comic_url, &build_headers(&auth)) {
+                Ok(v) => v,
+                Err(e) => return json!({"success": false, "error": format!("fetch comic page: {e}")}),
+            };
+            if !(200..300).contains(&status) {
+                return json!({"success": false, "error": format!("comic page HTTP {status}")});
+            }
+            let chapters = parse_chapters_from_html(&html);
+            let children: Vec<Value> = chapters.iter().enumerate().map(|(idx, (ep_id, ch_title))| {
+                json!({
+                    "entity_type": "archive",
+                    "entity_id": format!("source:bzsource:{}_{}", remote_id, ep_id),
+                    "title": ch_title,
+                    "sort_order": (idx + 1) as i64,
+                })
+            }).collect();
+
+            let mut data = json!({
+                "title": detail.title,
+                "description": detail.description,
+                "tags": tags,
+                "children": children,
+            });
+            if !detail.cover.is_empty() {
+                data["cover"] = json!(detail.cover);
+            }
+            HostBridge::progress(100, "元数据获取完成");
+            json!({"success": true, "data": data})
+        }
+        Err(e) => json!({"success": false, "error": e}),
+    }
+}
+
+/// 从 BZ 章节 HTML 提取图片 URL 列表（用于确定 page 数量）
+fn fetch_chapter_image_urls(comic_chapter_id: &str) -> Result<usize, String> {
+    // comic_chapter_id = "{comic_id}_{ep_id}"
+    let parts: Vec<&str> = comic_chapter_id.splitn(2, '_').collect();
+    if parts.len() < 2 { return Err("invalid chapter id".to_string()); }
+    let comic_id = parts[0];
+    let ep_id = parts[1];
+
+    let app_url = format!("https://appcn.baozimh.com/baozimhapp/comic/chapter/{comic_id}/0_{ep_id}.html");
+    let headers = vec![
+        ("User-Agent".to_string(), USER_AGENT.to_string()),
+        ("Accept".to_string(), "text/html,*/*;q=0.8".to_string()),
+    ];
+    let (status, html) = http_get_text(&app_url, &headers)?;
+    if !(200..300).contains(&status) {
+        return Err(format!("chapter page HTTP {status}"));
+    }
+
+    // data-src then src pattern (same as bzsource)
+    let mut urls = Vec::new();
+    if let Ok(re) = Regex::new(r#"data-src=["']([^"']+)["']"#) {
+        for cap in re.captures_iter(&html) {
+            if let Some(url) = cap.get(1) {
+                let u = url.as_str().trim();
+                if !u.is_empty() { urls.push(u.to_string()); }
+            }
+        }
+    }
+    if urls.is_empty() {
+        if let Ok(re) = Regex::new(r#"<img[^>]*src=["']([^"']+)["']"#) {
+            for cap in re.captures_iter(&html) {
+                if let Some(url) = cap.get(1) {
+                    let u = url.as_str().trim();
+                    if !u.is_empty() && (u.starts_with("http://") || u.starts_with("https://")) {
+                        urls.push(u.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    if urls.is_empty() {
+        return Err("no images found in chapter".to_string());
+    }
+    Ok(urls.len())
+}
+
+/// 从漫画详情 HTML 解析章节列表（复用 bzsource 的解析模式）
+fn parse_chapters_from_html(html: &str) -> Vec<(String, String)> {
+    // Try primary regex pattern from bzsource
+    if let Ok(re) = Regex::new(r#"<a[^>]*href=["']?/chapter/[^"']*?/(\d+)_["']?[^>]*>.*?<span[^>]*>(.*?)</span>.*?</a>"#) {
+        let chapters: Vec<(String, String)> = re.captures_iter(html)
+            .filter_map(|cap| {
+                let ep_id = cap.get(1)?.as_str().to_string();
+                let title = strip_html_tags(cap.get(2).map(|m| m.as_str()).unwrap_or(""));
+                if ep_id.is_empty() { None } else { Some((ep_id, title)) }
+            })
+            .collect();
+        if !chapters.is_empty() { return chapters; }
+    }
+
+    // Fallback: parse #chapter-items div
+    let mut chapters = Vec::new();
+    if let Ok(re) = Regex::new(r#"<div[^>]*id=["']?chapter-items["']?[^>]*>(.*?)</div>"#) {
+        if let Some(caps) = re.captures(html) {
+            let block = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+            if let Ok(link_re) = Regex::new(r#"<a[^>]*>(.*?)</a>"#) {
+                for (idx, cap) in link_re.captures_iter(block).enumerate() {
+                    let title = strip_html_tags(cap.get(1).map(|m| m.as_str()).unwrap_or(""));
+                    if !title.is_empty() {
+                        chapters.push(((idx + 1).to_string(), title));
+                    }
+                }
+            }
+        }
+    }
+    chapters
 }
 
 fn build_result_payload(input: PluginInput) -> Value {

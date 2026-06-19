@@ -268,6 +268,10 @@ pub extern "C" fn lanlu_plugin_run(input_ptr: i32, input_len: i32) -> i32 {
 
     let payload = if input.action.trim() == "resolve_cover" {
         resolve_cover_action(&input)
+    } else if input.action.trim() == "resolve_metadata"
+        && normalize_target_type(&input.target_type, &input.params) == "source"
+    {
+        resolve_source_metadata(&input)
     } else {
         build_result_payload(input)
     };
@@ -404,6 +408,98 @@ fn resolve_cover_action(input: &PluginInput) -> Value {
         Ok(_) => json!({"success": true}),
         Err(e) => json!({"success": false, "error": format!("install_into failed: {e}")}),
     }
+}
+
+fn normalize_target_type(raw: &str, params: &Value) -> String {
+    let from_input = raw.trim().to_ascii_lowercase();
+    if !from_input.is_empty() { return from_input; }
+    params.get("__target_type").and_then(Value::as_str).unwrap_or("").to_ascii_lowercase()
+}
+
+/// 解析 source 元数据：从 sourceId（source:nhsource:{galleryId}）解析 galleryId，
+/// 调 NH API 获取 title/tags，枚举页面构建 page children。
+fn resolve_source_metadata(input: &PluginInput) -> Value {
+    HostBridge::progress(5, "解析 sourceId...");
+    let target_id = input.target_id.trim();
+    let gallery_id = match target_id.strip_prefix("source:nhsource:") {
+        Some(id) if !id.is_empty() => id.trim().to_string(),
+        _ => return json!({"success": false, "error": format!("invalid sourceId: {target_id}")}),
+    };
+
+    let auth = match load_nh_auth().ok() {
+        Some(a) => a,
+        None => return json!({"success": false, "error": "missing nhlogin auth"}),
+    };
+    let cookie_header = build_cookie_header_for_nh(&auth);
+    let auth_header = build_api_key_authorization_for_nh(&auth);
+
+    let url = format!("https://nhentai.net/api/v2/galleries/{gallery_id}");
+    let mut headers = default_headers();
+    if !cookie_header.is_empty() { headers.push(("Cookie".to_string(), cookie_header)); }
+    if let Some(a) = auth_header { headers.push(("Authorization".to_string(), a)); }
+
+    HostBridge::progress(30, &format!("获取画廊 {} 元数据...", gallery_id));
+    let resp = match http_get_text_with_retry(&url, &headers, 4) {
+        Ok(r) => r,
+        Err(e) => return json!({"success": false, "error": format!("API error: {e}")}),
+    };
+    if resp.status == 404 { return json!({"success": false, "error": "Gallery not found"}); }
+    if resp.status >= 400 { return json!({"success": false, "error": format!("API HTTP {}", resp.status)}); }
+
+    let gallery: Value = match serde_json::from_str(&resp.body_text) {
+        Ok(v) => v,
+        Err(e) => return json!({"success": false, "error": format!("JSON parse: {e}")}),
+    };
+
+    let title = pick_title_from_gallery_json(&gallery, &gallery_id);
+    let num_pages = gallery.get("num_pages").and_then(Value::as_i64).unwrap_or(0);
+
+    // 从 JSON 中提取 tags 作为 description 描述
+    let mut description = String::new();
+    if let Some(tags_arr) = gallery.get("tags").and_then(Value::as_array) {
+        let tag_names: Vec<String> = tags_arr.iter()
+            .filter_map(|t| t.get("name").and_then(Value::as_str).map(|s| s.to_string()))
+            .collect();
+        if !tag_names.is_empty() {
+            description = tag_names.join(", ");
+        }
+    }
+
+    // 构建 page children
+    let children: Vec<Value> = (1..=num_pages).map(|page_num| {
+        let path = format!("{}/{}", gallery_id, page_num);
+        json!({
+            "entity_type": "page",
+            "entity_id": format!("source:nhsource:{}#page:{}", gallery_id, page_num),
+            "title": "",
+            "sort_order": page_num,
+            "path": path,
+            "media_type": "image",
+        })
+    }).collect();
+
+    let mut data = json!({
+        "title": title,
+        "description": description,
+        "children": children,
+    });
+
+    // 解析封面 URL（复用 resolve_cover 的逻辑）
+    let cover = gallery.get("cover")
+        .and_then(|c| {
+            let media_id = c.get("media_id").and_then(Value::as_str).unwrap_or("");
+            let ext = gallery.get("images").and_then(|img| {
+                img.get("cover").and_then(|cv| cv.get("t").and_then(Value::as_str))
+                    .or_else(|| img.get("pages").and_then(|p| p.get(0)).and_then(|pg| pg.get("t").and_then(Value::as_str)))
+            }).unwrap_or("jpg");
+            if media_id.is_empty() { None } else { Some(format!("https://t.nhentai.net/galleries/{media_id}/thumb.{ext}")) }
+        }).unwrap_or_default();
+    if !cover.is_empty() {
+        data["cover"] = json!(cover);
+    }
+
+    HostBridge::progress(100, "元数据获取完成");
+    json!({"success": true, "data": data})
 }
 
 fn build_result_payload(input: PluginInput) -> Value {

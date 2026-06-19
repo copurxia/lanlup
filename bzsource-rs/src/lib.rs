@@ -848,15 +848,6 @@ fn run_source_filters(_input: &PluginInput) -> Value {
                 ]
             },
             {
-                "key": "language",
-                "label": "语言",
-                "type": "tabs",
-                "options": [
-                    { "label": "简体", "value": "cn" },
-                    { "label": "繁体", "value": "tw" }
-                ]
-            },
-            {
                 "key": "sort",
                 "label": "排序",
                 "type": "select",

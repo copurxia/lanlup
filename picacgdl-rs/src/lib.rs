@@ -74,6 +74,16 @@ struct PluginInput {
     url: String,
     #[serde(rename = "pluginDir", default)]
     plugin_dir: String,
+    #[serde(default)]
+    action: String,
+    #[serde(rename = "targetType", default)]
+    target_type: String,
+    #[serde(rename = "targetId", default)]
+    target_id: String,
+    #[serde(default)]
+    path: String,
+    #[serde(rename = "extraParams", default)]
+    extra_params: Value,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -129,6 +139,11 @@ impl HostBridge {
         let found = response.get("found").and_then(Value::as_bool).unwrap_or(false);
         if !found { return Ok(None); }
         Ok(response.get("value").cloned())
+    }
+
+    fn task_kv_set(key: &str, value: Value) -> Result<(), String> {
+        Self::call("task_kv.set", json!({"key": key, "value": value}))?;
+        Ok(())
     }
 }
 
@@ -829,15 +844,27 @@ pub extern "C" fn lanlu_plugin_run(input_ptr: i32, input_len: i32) -> i32 {
     };
     let _ = &input.plugin_type;
 
-    let result = run_download(&input);
-    match serde_json::to_vec(&result) {
-        Ok(bytes) => STATE.with(|state| {
-            let mut state = state.borrow_mut();
-            state.result = bytes;
-            state.result.as_ptr() as i32
-        }),
-        Err(e) => set_error_and_zero(format!("failed to encode output: {e}")),
-    }
+    let action = input.action.trim();
+    let result_bytes: Vec<u8> = match action {
+        "resolve_page_asset" => resolve_page_asset(&input),
+        "download_archive" => {
+            let val = download_archive_action(&input);
+            serde_json::to_vec(&val).unwrap_or_else(|e| {
+                serde_json::to_vec(&output_err(&format!("encode error: {e}"))).unwrap_or_default()
+            })
+        }
+        _ => {
+            let val = run_download(&input);
+            serde_json::to_vec(&val).unwrap_or_else(|e| {
+                serde_json::to_vec(&output_err(&format!("encode error: {e}"))).unwrap_or_default()
+            })
+        }
+    };
+    STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        state.result = result_bytes;
+        state.result.as_ptr() as i32
+    })
 }
 
 #[no_mangle]
@@ -973,6 +1000,127 @@ fn run_download(input: &PluginInput) -> Value {
     })
 }
 
+/// resolve_page_asset action：path = "{comic_id}/{page_num}"，下载图片返回二进制
+fn resolve_page_asset(input: &PluginInput) -> Vec<u8> {
+    let path = input.path.trim();
+    if path.is_empty() {
+        return build_binary_response(&output_err("path is required"), &[]);
+    }
+    let parts: Vec<&str> = path.split('/').collect();
+    if parts.len() < 2 {
+        return build_binary_response(&output_err(&format!("invalid path: {path}")), &[]);
+    }
+    let comic_id = parts[0];
+    let page_num: usize = match parts[1].parse() {
+        Ok(n) if n >= 1 => n,
+        _ => return build_binary_response(&output_err(&format!("invalid page: {path}")), &[]),
+    };
+
+    let auth = match load_picacg_auth() {
+        Ok(v) => v,
+        Err(e) => return build_binary_response(&output_err(&e), &[]),
+    };
+
+    // 获取第一话的页面列表
+    let eps_path = format!("comics/{comic_id}/eps?page=1");
+    let (status, eps_text) = match picacg_get(&eps_path, &auth) {
+        Ok(v) => v,
+        Err(e) => return build_binary_response(&output_err(&format!("eps: {e}")), &[]),
+    };
+    if status != 200 {
+        return build_binary_response(&output_err(&format!("eps HTTP {status}")), &[]);
+    }
+    let eps_parsed: Value = match serde_json::from_str(&eps_text) {
+        Ok(v) => v,
+        Err(e) => return build_binary_response(&output_err(&format!("eps JSON: {e}")), &[]),
+    };
+    let first_ep = eps_parsed.get("data").and_then(|d| d.get("eps"))
+        .and_then(|e| e.get("docs")).and_then(Value::as_array)
+        .and_then(|arr| arr.first()).cloned();
+
+    let ep_order = match first_ep {
+        Some(ref ep) => ep.get("order").and_then(Value::as_i64).unwrap_or(1),
+        None => 1i64,
+    };
+
+    // 获取指定页
+    let pages_path = format!("comics/{comic_id}/order/{ep_order}/pages?page={}", (page_num - 1) / 50 + 1);
+    let (p_status, p_text) = match picacg_get(&pages_path, &auth) {
+        Ok(v) => v,
+        Err(e) => return build_binary_response(&output_err(&format!("pages: {e}")), &[]),
+    };
+    if p_status != 200 {
+        return build_binary_response(&output_err(&format!("pages HTTP {p_status}")), &[]);
+    }
+    let p_parsed: Value = match serde_json::from_str(&p_text) {
+        Ok(v) => v,
+        Err(e) => return build_binary_response(&output_err(&format!("pages JSON: {e}")), &[]),
+    };
+    let docs = p_parsed.get("data").and_then(|d| d.get("pages"))
+        .and_then(|p| p.get("docs")).and_then(Value::as_array)
+        .cloned().unwrap_or_default();
+
+    let page_idx_in_doc = ((page_num - 1) % 50) as usize;
+    let page_doc = docs.get(page_idx_in_doc);
+    let image_url = match page_doc.and_then(|d| build_image_url(d)) {
+        Some(url) => url,
+        None => return build_binary_response(&output_err("failed to build image URL"), &[]),
+    };
+
+    let img_headers = vec![
+        ("Referer".to_string(), "https://picaapi.picacomic.com/".to_string()),
+        ("User-Agent".to_string(), USER_AGENT.to_string()),
+    ];
+    let img_resp = match http_get_with_retry(&image_url, &img_headers, 3) {
+        Ok(r) => r,
+        Err(e) => return build_binary_response(&output_err(&format!("image download: {e}")), &[]),
+    };
+    if img_resp.status != 200 {
+        return build_binary_response(&output_err(&format!("image HTTP {}", img_resp.status)), &[]);
+    }
+
+    let ext = image_url.rsplit('.').next().unwrap_or("jpg").to_string();
+    let content_type = match ext.as_str() {
+        "jpg" | "jpeg" => "image/jpeg",
+        "png" => "image/png",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        _ => "application/octet-stream",
+    };
+    build_binary_response(&json!({"success": true, "content_type": content_type}), &img_resp.body)
+}
+
+/// download_archive action：从 targetId 解析 comic_id，复用整本下载流程
+fn download_archive_action(input: &PluginInput) -> Value {
+    let target_id = input.target_id.trim();
+    let comic_id = match target_id.strip_prefix("source:picacgsource:") {
+        Some(id) if !id.is_empty() => id.to_string(),
+        _ => return output_err(&format!("invalid sourceId: {target_id}")),
+    };
+    let fake_url = format!("picacg://{comic_id}");
+    let fake_input = PluginInput {
+        plugin_type: input.plugin_type.clone(),
+        url: fake_url,
+        plugin_dir: input.plugin_dir.clone(),
+        action: String::new(),
+        target_type: String::new(),
+        target_id: String::new(),
+        path: String::new(),
+        extra_params: Value::Null,
+    };
+    run_download(&fake_input)
+}
+
+fn build_binary_response(json_val: &Value, binary: &[u8]) -> Vec<u8> {
+    let json_bytes = serde_json::to_vec(json_val).unwrap_or_else(|_| b"{}".to_vec());
+    let json_len = json_bytes.len() as u32;
+    let mut out = Vec::with_capacity(4 + json_bytes.len() + binary.len());
+    out.extend_from_slice(&json_len.to_le_bytes());
+    out.extend_from_slice(&json_bytes);
+    out.extend_from_slice(binary);
+    out
+}
+
 fn output_err(message: &str) -> Value {
     json!({"success": false, "error": message})
 }
@@ -993,7 +1141,8 @@ fn plugin_info_json() -> Value {
             "log.write",
             "progress.report",
             "tcp.connect",
-            "task_kv.read"
+            "task_kv.read",
+            "task_kv.write"
         ]
     })
 }

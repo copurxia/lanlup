@@ -850,6 +850,10 @@ pub extern "C" fn lanlu_plugin_run(input_ptr: i32, input_len: i32) -> i32 {
 
     let payload = if input.action.trim() == "resolve_cover" {
         resolve_cover_action(&input)
+    } else if input.action.trim() == "resolve_metadata"
+        && normalize_target_type(&input.target_type, &input.params) == "source"
+    {
+        resolve_source_metadata(&input)
     } else {
         build_result_payload(input)
     };
@@ -917,6 +921,131 @@ fn resolve_cover_action(input: &PluginInput) -> Value {
     let asset_id = input.extra_params.get("asset_id").and_then(Value::as_i64).unwrap_or(0);
     if asset_id <= 0 { return json!({"success": false, "error": "missing asset_id"}); }
     json!({"success": false, "error": "resolve_cover not yet implemented"})
+}
+
+fn normalize_target_type(raw: &str, params: &Value) -> String {
+    let from_input = raw.trim().to_ascii_lowercase();
+    if !from_input.is_empty() { return from_input; }
+    params.get("__target_type").and_then(Value::as_str).unwrap_or("").to_ascii_lowercase()
+}
+
+/// 解析 source 元数据：从 sourceId（source:picacgsource:{comic_id}）解析
+fn resolve_source_metadata(input: &PluginInput) -> Value {
+    HostBridge::progress(5, "解析 sourceId...");
+    let target_id = input.target_id.trim();
+    let comic_id = match target_id.strip_prefix("source:picacgsource:") {
+        Some(id) if !id.is_empty() => id.trim().to_string(),
+        _ => return json!({"success": false, "error": format!("invalid sourceId: {target_id}")}),
+    };
+
+    let auth = match load_picacg_auth() {
+        Ok(v) => v,
+        Err(e) => return json!({"success": false, "error": e}),
+    };
+
+    HostBridge::progress(30, &format!("获取漫画 {} 元数据...", comic_id));
+    let comic = match fetch_comic_metadata(&comic_id, &auth) {
+        Ok(v) => v,
+        Err(e) => return json!({"success": false, "error": e}),
+    };
+
+    let title = comic.get("title").and_then(Value::as_str).unwrap_or("").to_string();
+    let author = comic.get("author").and_then(Value::as_str).unwrap_or("").to_string();
+    let description = comic.get("description").and_then(Value::as_str).unwrap_or("").to_string();
+    let cover_path = comic.get("cover").and_then(|c| c.get("path")).and_then(Value::as_str).unwrap_or("").to_string();
+    let mut tags = Vec::new();
+    if let Some(cats) = comic.get("categories").and_then(Value::as_array) {
+        for c in cats {
+            if let Some(s) = c.as_str() {
+                tags.push(Value::String(format!("category:{s}")));
+            }
+        }
+    }
+    if !author.is_empty() { tags.push(Value::String(format!("author:{author}"))); }
+
+    // 获取章节列表
+    HostBridge::progress(50, "获取章节列表...");
+    let eps_path = format!("comics/{comic_id}/eps?page=1");
+    let (status, eps_text) = match picacg_get(&eps_path, &auth) {
+        Ok(v) => v,
+        Err(e) => return json!({"success": false, "error": format!("eps fetch: {e}")}),
+    };
+    if status != 200 {
+        return json!({"success": false, "error": format!("eps HTTP {status}")});
+    }
+
+    let parsed: Value = match serde_json::from_str(&eps_text) {
+        Ok(v) => v,
+        Err(e) => return json!({"success": false, "error": format!("eps JSON: {e}")}),
+    };
+    let eps = parsed.get("data").and_then(|d| d.get("eps")).and_then(|e| e.get("docs"))
+        .and_then(Value::as_array).cloned().unwrap_or_default();
+
+    let cover_url = if !cover_path.is_empty() {
+        format!("https://picaapi.picacomic.com{}", cover_path)
+    } else { String::new() };
+
+    if !eps.is_empty() {
+        // 有多话 → archive children
+        let children: Vec<Value> = eps.iter().enumerate().map(|(idx, e)| {
+            let ep_title = e.get("title").and_then(Value::as_str).unwrap_or("").to_string();
+            let ep_order = e.get("order").and_then(Value::as_i64).unwrap_or((idx + 1) as i64);
+            json!({
+                "entity_type": "archive",
+                "entity_id": format!("source:picacgsource:{}:ep{}", comic_id, ep_order),
+                "title": if ep_title.is_empty() { format!("第{}話", idx + 1) } else { ep_title },
+                "sort_order": ep_order,
+            })
+        }).collect();
+
+        let mut data = json!({
+            "title": title,
+            "description": description,
+            "tags": Value::Array(tags),
+            "children": children,
+        });
+        if !cover_url.is_empty() { data["cover"] = json!(cover_url); }
+        HostBridge::progress(100, "元数据获取完成");
+        json!({"success": true, "data": data})
+    } else {
+        // 无多话 → page children（comic 本身就是单话）
+        let pages_path = format!("comics/{comic_id}/order/1/pages?page=1");
+        let (p_status, p_text) = match picacg_get(&pages_path, &auth) {
+            Ok(v) => v,
+            Err(e) => return json!({"success": false, "error": format!("pages fetch: {e}")}),
+        };
+        if p_status != 200 {
+            return json!({"success": false, "error": format!("pages HTTP {p_status}")});
+        }
+        let p_parsed: Value = match serde_json::from_str(&p_text) {
+            Ok(v) => v,
+            Err(e) => return json!({"success": false, "error": format!("pages JSON: {e}")}),
+        };
+        let total_pages = p_parsed.get("data")
+            .and_then(|d| d.get("pages")).and_then(|p| p.get("pages"))
+            .and_then(Value::as_i64).unwrap_or(0);
+
+        let children: Vec<Value> = (1..=total_pages).map(|pn| {
+            json!({
+                "entity_type": "page",
+                "entity_id": format!("source:picacgsource:{}#page:{}", comic_id, pn),
+                "title": "",
+                "sort_order": pn,
+                "path": format!("{}/{}", comic_id, pn),
+                "media_type": "image",
+            })
+        }).collect();
+
+        let mut data = json!({
+            "title": title,
+            "description": description,
+            "tags": Value::Array(tags),
+            "children": children,
+        });
+        if !cover_url.is_empty() { data["cover"] = json!(cover_url); }
+        HostBridge::progress(100, "元数据获取完成");
+        json!({"success": true, "data": data})
+    }
 }
 
 fn build_result_payload(input: PluginInput) -> Value {
