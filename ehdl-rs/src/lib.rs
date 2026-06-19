@@ -253,19 +253,28 @@ pub extern "C" fn lanlu_plugin_run(input_ptr: i32, input_len: i32) -> i32 {
 
     let _ = &input.plugin_type;
     let action = input.action.trim();
-    let result = match action {
+    let result_bytes: Vec<u8> = match action {
+        // 新协议：直接返回二进制（4 字节 LE 头 + JSON + 图片数据）
         "resolve_page_asset" => resolve_page_asset(&input),
-        "download_archive" => download_archive(&input),
-        _ => run_download(&input),
+        // 旧协议：返回 JSON
+        "download_archive" => {
+            let val = download_archive(&input);
+            serde_json::to_vec(&val).unwrap_or_else(|e| {
+                output_err_bytes(&format!("failed to encode output: {e}"))
+            })
+        }
+        _ => {
+            let val = run_download(&input);
+            serde_json::to_vec(&val).unwrap_or_else(|e| {
+                output_err_bytes(&format!("failed to encode output: {e}"))
+            })
+        }
     };
-    match serde_json::to_vec(&result) {
-        Ok(bytes) => STATE.with(|state| {
-            let mut state = state.borrow_mut();
-            state.result = bytes;
-            state.result.as_ptr() as i32
-        }),
-        Err(e) => set_error_and_zero(format!("failed to encode output: {e}")),
-    }
+    STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        state.result = result_bytes;
+        state.result.as_ptr() as i32
+    })
 }
 
 #[no_mangle]
@@ -1558,32 +1567,57 @@ fn output_err(message: &str) -> Value {
     })
 }
 
+/// 返回错误 JSON 的原始字节（旧协议兼容）
+fn output_err_bytes(message: &str) -> Vec<u8> {
+    serde_json::to_vec(&output_err(message)).unwrap_or_else(|_| b"{}".to_vec())
+}
+
+/// 构建新协议响应：4 字节 LE json_len + JSON + 可选二进制。
+/// 即使 binary 为空也使用头部，确保 host 统一走新解析路径。
+fn build_binary_response(json_val: &Value, binary: &[u8]) -> Vec<u8> {
+    let json_bytes = serde_json::to_vec(json_val).unwrap_or_else(|_| b"{}".to_vec());
+    let json_len = json_bytes.len() as u32;
+    let mut out = Vec::with_capacity(4 + json_bytes.len() + binary.len());
+    out.extend_from_slice(&json_len.to_le_bytes());
+    out.extend_from_slice(&json_bytes);
+    out.extend_from_slice(binary);
+    out
+}
+
 /// resolve_page_asset action（targetType=source，直连执行）：
-/// path = "{gid}/{token}/{page}"，定位单页图片并注册为 asset，返回 asset_id。
-fn resolve_page_asset(input: &PluginInput) -> Value {
+/// path = "{gid}/{token}/{page}"，直接返回图片二进制数据（零磁盘、零 asset）。
+fn resolve_page_asset(input: &PluginInput) -> Vec<u8> {
     let path = input.path.trim();
     if path.is_empty() {
-        return output_err("path is required for resolve_page_asset");
+        return build_binary_response(&output_err("path is required for resolve_page_asset"), &[]);
     }
     // path 自包含 gid/token/page，避免依赖 targetId 解析。
     let parts: Vec<&str> = path.split('/').collect();
     if parts.len() < 3 {
-        return output_err(&format!("invalid path (expected gid/token/page): {path}"));
+        return build_binary_response(
+            &output_err(&format!("invalid path (expected gid/token/page): {path}")),
+            &[],
+        );
     }
     let gid = parts[0];
     let token = parts[1];
     let page: u64 = match parts[2].parse() {
         Ok(n) => n,
-        Err(_) => return output_err(&format!("invalid page number in path: {path}")),
+        Err(_) => {
+            return build_binary_response(
+                &output_err(&format!("invalid page number in path: {path}")),
+                &[],
+            )
+        }
     };
     if page == 0 {
-        return output_err("page number must be >= 1");
+        return build_binary_response(&output_err("page number must be >= 1"), &[]);
     }
 
     HostBridge::progress(10, "加载登录态...");
     let auth = match load_eh_auth() {
         Ok(v) => v,
-        Err(e) => return output_err(&e),
+        Err(e) => return build_binary_response(&output_err(&e), &[]),
     };
     let login_cookies = build_eh_login_cookies(&auth);
     let domain = if !auth.igneous.trim().is_empty() || !auth.star.trim().is_empty() {
@@ -1617,33 +1651,47 @@ fn resolve_page_asset(input: &PluginInput) -> Value {
         let gallery_url = format!("{domain}/g/{gid}/{token}");
         let fetched = match fetch_gallery_showpages(&gallery_url, gid, &login_cookies) {
             Ok(v) => v,
-            Err(e) => return output_err(&format!("fetch gallery showpages failed: {e}")),
+            Err(e) => {
+                return build_binary_response(
+                    &output_err(&format!("fetch gallery showpages failed: {e}")),
+                    &[],
+                )
+            }
         };
         let _ = HostBridge::task_kv_set(&cache_key, json!(fetched));
         fetched
     };
     if showpages.is_empty() {
-        return output_err("no page links found in gallery");
+        return build_binary_response(
+            &output_err("no page links found in gallery"),
+            &[],
+        );
     }
     let idx = (page - 1) as usize;
     if idx >= showpages.len() {
-        return output_err(&format!(
-            "page {page} out of range ({} pages)",
-            showpages.len()
-        ));
+        return build_binary_response(
+            &output_err(&format!(
+                "page {page} out of range ({} pages)",
+                showpages.len()
+            )),
+            &[],
+        );
     }
     let showpage_url = &showpages[idx];
 
     HostBridge::progress(60, "解析图片地址...");
     let image_url = match fetch_image_url(showpage_url, &login_cookies) {
         Ok(v) => v,
-        Err(e) => return output_err(&format!("resolve image url failed: {e}")),
+        Err(e) => {
+            return build_binary_response(
+                &output_err(&format!("resolve image url failed: {e}")),
+                &[],
+            )
+        }
     };
 
-    HostBridge::progress(80, "下载并注册资源...");
+    HostBridge::progress(80, "下载图片...");
     let ext = guess_ext_from_url(&image_url);
-    let guest_path = format!("/plugin/ehdl_page_{gid}_{token}_{page}.{ext}");
-    let original_filename = format!("ehdl_page_{gid}_{token}_{page}.{ext}");
     let content_type = guess_content_type(&ext);
 
     let resp = match http_request_bytes_follow_redirects_with_headers(
@@ -1655,35 +1703,34 @@ fn resolve_page_asset(input: &PluginInput) -> Value {
         &[],
     ) {
         Ok(v) => v,
-        Err(e) => return output_err(&format!("download image failed: {e}")),
+        Err(e) => {
+            return build_binary_response(
+                &output_err(&format!("download image failed: {e}")),
+                &[],
+            )
+        }
     };
     if resp.status >= 400 {
-        return output_err(&format!("download image HTTP {}", resp.status));
+        return build_binary_response(
+            &output_err(&format!("download image HTTP {}", resp.status)),
+            &[],
+        );
     }
     if let Err(e) = validate_downloaded_page_image(&resp) {
-        return output_err(&format!("downloaded page is not a valid image: {e}"));
-    }
-    if let Err(e) = fs::write(&guest_path, &resp.body) {
-        return output_err(&format!("write image failed: {e}"));
-    }
-    let install = match HostBridge::call(
-        "asset.install_from_file",
-        json!({
-            "guest_path": guest_path,
-            "original_filename": original_filename,
-            "content_type": content_type,
-        }),
-    ) {
-        Ok(v) => v,
-        Err(e) => return output_err(&format!("asset.install_from_file failed: {e}")),
-    };
-    let asset_id = install.get("asset_id").and_then(Value::as_i64).unwrap_or(0);
-    if asset_id <= 0 {
-        return output_err("asset.install_from_file returned no asset_id");
+        return build_binary_response(
+            &output_err(&format!("downloaded page is not a valid image: {e}")),
+            &[],
+        );
     }
 
     HostBridge::progress(100, "单页资源解析完成");
-    json!({ "success": true, "data": { "asset_id": asset_id } })
+
+    // 新协议：直接返回图片二进制，零磁盘、零 asset 系统
+    let success_json = json!({
+        "success": true,
+        "content_type": content_type
+    });
+    build_binary_response(&success_json, &resp.body)
 }
 
 /// 从 sourceId（source:ehentaisource:{remoteId}）提取 remoteId（gallery URL）。
