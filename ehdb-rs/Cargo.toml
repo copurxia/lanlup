@@ -19,3 +19,6 @@ sha2 = "0.10"
 stringprep = "0.1"
 url = "2.5"
 time = { version = "0.3", features = ["formatting", "macros"] }
+
+[target.'cfg(all(target_arch = "wasm32", target_os = "wasi"))'.dependencies]
+wasmedge_wasi_socket = "0.5.5"

@@ -19,7 +19,10 @@ use time::macros::format_description;
 use time::OffsetDateTime;
 use url::Url;
 
-#[cfg(any(not(target_arch = "wasm32"), target_os = "wasi"))]
+#[cfg(all(target_arch = "wasm32", target_os = "wasi"))]
+use wasmedge_wasi_socket::TcpStream as WasiTcpStream;
+
+#[cfg(not(target_arch = "wasm32"))]
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 
 #[cfg(target_arch = "wasm32")]
@@ -325,13 +328,52 @@ impl Write for HostTcpStream {
     }
 }
 
-#[cfg(any(not(target_arch = "wasm32"), target_os = "wasi"))]
+#[cfg(all(target_arch = "wasm32", target_os = "wasi"))]
+#[derive(Debug)]
+struct HostTcpStream {
+    stream: WasiTcpStream,
+}
+
+#[cfg(all(target_arch = "wasm32", target_os = "wasi"))]
+impl HostTcpStream {
+    fn connect(host: &str, port: u16, timeout_ms: i32) -> Result<Self, String> {
+        let mut stream = WasiTcpStream::connect((host, port)).map_err(|e| e.to_string())?;
+        let timeout = std::time::Duration::from_millis(timeout_ms.max(1) as u64);
+        let _ = stream.as_mut().set_recv_timeout(Some(timeout));
+        let _ = stream.as_mut().set_send_timeout(Some(timeout));
+        Ok(Self { stream })
+    }
+
+    fn close(&mut self) {
+        // WasiTcpStream will be closed on drop
+    }
+}
+
+#[cfg(all(target_arch = "wasm32", target_os = "wasi"))]
+impl Read for HostTcpStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.stream.read(buf)
+    }
+}
+
+#[cfg(all(target_arch = "wasm32", target_os = "wasi"))]
+impl Write for HostTcpStream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.stream.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.stream.flush()
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug)]
 struct HostTcpStream {
     stream: TcpStream,
 }
 
-#[cfg(any(not(target_arch = "wasm32"), target_os = "wasi"))]
+#[cfg(not(target_arch = "wasm32"))]
 impl HostTcpStream {
     fn connect(host: &str, port: u16, timeout_ms: i32) -> Result<Self, String> {
         let addr = resolve_socket_addr(host, port)?;
@@ -348,14 +390,14 @@ impl HostTcpStream {
     }
 }
 
-#[cfg(any(not(target_arch = "wasm32"), target_os = "wasi"))]
+#[cfg(not(target_arch = "wasm32"))]
 impl Read for HostTcpStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.stream.read(buf)
     }
 }
 
-#[cfg(any(not(target_arch = "wasm32"), target_os = "wasi"))]
+#[cfg(not(target_arch = "wasm32"))]
 impl Write for HostTcpStream {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.stream.write(buf)
@@ -891,7 +933,7 @@ fn plugin_info_json() -> Value {
     })
 }
 
-#[cfg(any(not(target_arch = "wasm32"), target_os = "wasi"))]
+#[cfg(not(target_arch = "wasm32"))]
 fn resolve_socket_addr(host: &str, port: u16) -> Result<SocketAddr, String> {
     let mut addrs = format!("{host}:{port}").to_socket_addrs().map_err(io_err)?;
     addrs
