@@ -715,9 +715,10 @@ fn resolve_redirect_url(base: &ParsedUrl, location: &str) -> Result<String, Stri
 }
 
 fn connect_tls_stream(host: &str, port: u16) -> Result<HttpStream, String> {
-    let tcp = if let Some((proxy_host, proxy_port)) = resolve_proxy_for_https() {
-        let mut proxy_stream = HostTcpStream::connect(&proxy_host, proxy_port, DEFAULT_TIMEOUT_MS)?;
-        establish_proxy_connect_tunnel(&mut proxy_stream, host, port)?;
+    let tcp = if let Some(proxy) = resolve_proxy_for_https() {
+        let mut proxy_stream = HostTcpStream::connect(&proxy.host, proxy.port, DEFAULT_TIMEOUT_MS)?;
+        let auth = proxy.username.as_deref().zip(proxy.password.as_deref());
+        establish_proxy_connect_tunnel(&mut proxy_stream, host, port, auth)?;
         proxy_stream
     } else {
         HostTcpStream::connect(host, port, DEFAULT_TIMEOUT_MS)?
@@ -733,7 +734,7 @@ fn connect_tls_stream(host: &str, port: u16) -> Result<HttpStream, String> {
     Ok(HttpStream::Tls(Box::new(StreamOwned::new(conn, tcp))))
 }
 
-fn resolve_proxy_for_https() -> Option<(String, u16)> {
+fn resolve_proxy_for_https() -> Option<ProxyEndpoint> {
     let keys = ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"];
     for key in keys {
         if let Ok(raw) = std::env::var(key) {
@@ -745,7 +746,14 @@ fn resolve_proxy_for_https() -> Option<(String, u16)> {
     None
 }
 
-fn parse_proxy_endpoint(raw: &str) -> Option<(String, u16)> {
+struct ProxyEndpoint {
+    host: String,
+    port: u16,
+    username: Option<String>,
+    password: Option<String>,
+}
+
+fn parse_proxy_endpoint(raw: &str) -> Option<ProxyEndpoint> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return None;
@@ -760,11 +768,27 @@ fn parse_proxy_endpoint(raw: &str) -> Option<(String, u16)> {
     if authority.is_empty() {
         return None;
     }
-    let host_port = authority.rsplit_once('@').map(|(_, rhs)| rhs).unwrap_or(authority);
 
-    if host_port.starts_with('[') {
+    // Extract userinfo before stripping for host:port
+    let (userinfo, host_port) = if let Some((user, rest)) = authority.rsplit_once('@') {
+        (Some(user), rest)
+    } else {
+        (None, authority)
+    };
+
+    let (username, password) = if let Some(ui) = userinfo {
+        if let Some((u, p)) = ui.split_once(':') {
+            (Some(u.to_string()), Some(p.to_string()))
+        } else {
+            (Some(ui.to_string()), None)
+        }
+    } else {
+        (None, None)
+    };
+
+    let (host, port) = if host_port.starts_with('[') {
         let end = host_port.find(']')?;
-        let host = &host_port[1..end];
+        let host = host_port[1..end].to_string();
         if host.is_empty() {
             return None;
         }
@@ -774,25 +798,44 @@ fn parse_proxy_endpoint(raw: &str) -> Option<(String, u16)> {
         } else {
             8080
         };
-        return Some((host.to_string(), port));
-    }
-
-    if let Some((h, p)) = host_port.rsplit_once(':') {
+        (host, port)
+    } else if let Some((h, p)) = host_port.rsplit_once(':') {
         if !h.is_empty() && p.chars().all(|c| c.is_ascii_digit()) {
             let port = p.parse::<u16>().ok()?;
-            return Some((h.to_string(), port));
+            (h.to_string(), port)
+        } else {
+            return None;
         }
-    }
-    Some((host_port.to_string(), 8080))
+    } else {
+        (host_port.to_string(), 8080)
+    };
+
+    Some(ProxyEndpoint {
+        host,
+        port,
+        username,
+        password,
+    })
 }
 
 fn establish_proxy_connect_tunnel(
     stream: &mut HostTcpStream,
     target_host: &str,
     target_port: u16,
+    proxy_auth: Option<(&str, &str)>,
 ) -> Result<(), String> {
+    let auth_header = if let Some((user, pass)) = proxy_auth {
+        let creds = format!("{user}:{pass}");
+        use base64::Engine as _;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(creds.as_bytes());
+        format!("Proxy-Authorization: Basic {encoded}\r\n")
+    } else {
+        String::new()
+    };
     let req = format!(
-        "CONNECT {target_host}:{target_port} HTTP/1.1\r\nHost: {target_host}:{target_port}\r\nProxy-Connection: Keep-Alive\r\n\r\n"
+        "CONNECT {target_host}:{target_port} HTTP/1.1\r\n\
+         Host: {target_host}:{target_port}\r\n\
+         {auth_header}Proxy-Connection: Keep-Alive\r\n\r\n"
     );
     stream
         .write_all(req.as_bytes())

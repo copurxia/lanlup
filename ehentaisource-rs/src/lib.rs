@@ -789,9 +789,10 @@ fn http_request_once(
 
 fn connect_http_stream(scheme: &str, host: &str, port: u16) -> Result<HttpStream, String> {
     let tcp = if scheme.eq_ignore_ascii_case("https") {
-        if let Some((proxy_host, proxy_port)) = resolve_proxy_for_scheme(scheme) {
-            let mut proxy_stream = HostTcpStream::connect(&proxy_host, proxy_port, DEFAULT_TIMEOUT_MS)?;
-            establish_proxy_connect_tunnel(&mut proxy_stream, host, port)?;
+        if let Some(proxy) = resolve_proxy_for_scheme(scheme) {
+            let mut proxy_stream = HostTcpStream::connect(&proxy.host, proxy.port, DEFAULT_TIMEOUT_MS)?;
+            let auth = proxy.username.as_deref().zip(proxy.password.as_deref());
+            establish_proxy_connect_tunnel(&mut proxy_stream, host, port, auth)?;
             proxy_stream
         } else {
             HostTcpStream::connect(host, port, DEFAULT_TIMEOUT_MS)?
@@ -813,7 +814,7 @@ fn connect_http_stream(scheme: &str, host: &str, port: u16) -> Result<HttpStream
     }
 }
 
-fn resolve_proxy_for_scheme(scheme: &str) -> Option<(String, u16)> {
+fn resolve_proxy_for_scheme(scheme: &str) -> Option<ProxyEndpoint> {
     let keys: &[&str] = if scheme.eq_ignore_ascii_case("https") {
         &["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"]
     } else {
@@ -827,18 +828,35 @@ fn resolve_proxy_for_scheme(scheme: &str) -> Option<(String, u16)> {
     None
 }
 
-fn parse_proxy_endpoint(raw: &str) -> Option<(String, u16)> {
+struct ProxyEndpoint {
+    host: String,
+    port: u16,
+    username: Option<String>,
+    password: Option<String>,
+}
+
+fn parse_proxy_endpoint(raw: &str) -> Option<ProxyEndpoint> {
     let trimmed = raw.trim();
     if trimmed.is_empty() { return None; }
     let normalized = if trimmed.contains("://") { trimmed.to_string() } else { format!("http://{trimmed}") };
     let parsed = Url::parse(&normalized).ok()?;
     let host = parsed.host_str()?.to_string();
     let port = parsed.port_or_known_default().unwrap_or(8080);
-    Some((host, port))
+    let username = if parsed.username().is_empty() { None } else { Some(parsed.username().to_string()) };
+    let password = parsed.password().map(|s| s.to_string());
+    Some(ProxyEndpoint { host, port, username, password })
 }
 
-fn establish_proxy_connect_tunnel(stream: &mut HostTcpStream, target_host: &str, target_port: u16) -> Result<(), String> {
-    let req = format!("CONNECT {target_host}:{target_port} HTTP/1.1\r\nHost: {target_host}:{target_port}\r\nProxy-Connection: Keep-Alive\r\n\r\n");
+fn establish_proxy_connect_tunnel(stream: &mut HostTcpStream, target_host: &str, target_port: u16, proxy_auth: Option<(&str, &str)>) -> Result<(), String> {
+    let auth_header = if let Some((user, pass)) = proxy_auth {
+        let creds = format!("{user}:{pass}");
+        use base64::Engine as _;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(creds.as_bytes());
+        format!("Proxy-Authorization: Basic {encoded}\r\n")
+    } else {
+        String::new()
+    };
+    let req = format!("CONNECT {target_host}:{target_port} HTTP/1.1\r\nHost: {target_host}:{target_port}\r\n{auth_header}Proxy-Connection: Keep-Alive\r\n\r\n");
     stream.write_all(req.as_bytes()).and_then(|_| stream.flush()).map_err(|e| e.to_string())?;
     let mut buf = Vec::with_capacity(4096);
     let mut chunk = [0u8; 1024];
