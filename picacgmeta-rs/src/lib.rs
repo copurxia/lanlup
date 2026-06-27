@@ -8,6 +8,7 @@ use std::alloc::{alloc, dealloc, Layout};
 use std::cell::RefCell;
 use std::io::{self, Read, Write};
 use std::slice;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use url::Url;
 use webpki_roots::TLS_SERVER_ROOTS;
@@ -592,9 +593,10 @@ fn generate_nonce() -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
-        .as_millis();
-    let pid = std::process::id();
-    format!("{:08x}{:08x}{:08x}{:08x}", now as u32, pid, now.swap_bytes() as u32, pid.swap_bytes())
+        .as_millis() as u64;
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let count = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{:08x}{:08x}{:08x}{:08x}", now as u32, count as u32, now.swap_bytes() as u32, count.swap_bytes() as u32)
 }
 
 fn picacg_signature(path: &str, nonce: &str, time: &str, method: &str) -> String {
