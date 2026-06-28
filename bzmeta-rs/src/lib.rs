@@ -136,6 +136,18 @@ impl HostBridge {
         if !found { return Ok(None); }
         Ok(response.get("value").cloned())
     }
+    fn task_kv_set(key: &str, value: Value) -> Result<(), String> {
+        Self::call("task_kv.set", json!({ "key": key, "value": value }))?;
+        Ok(())
+    }
+    fn install_asset(guest_path: &str, original_filename: &str, content_type: &str) -> Result<i64, String> {
+        let resp = Self::call("asset.install_from_file", json!({
+            "guest_path": guest_path,
+            "original_filename": original_filename,
+            "content_type": content_type,
+        }))?;
+        resp.get("asset_id").and_then(Value::as_i64).ok_or_else(|| "no asset_id in response".to_string())
+    }
     fn select_index(title: &str, options: Vec<Value>, message: &str, default_index: i32, timeout_seconds: i32) -> Result<usize, String> {
         let value = Self::call("ui.select", json!({
             "title": title,
@@ -246,6 +258,7 @@ fn plugin_info_json() -> Value {
             "log.write",
             "progress.report",
             "task_kv.read",
+            "task_kv.write",
             "asset.install_from_file"
         ]
     })
@@ -255,6 +268,78 @@ fn resolve_cover_action(input: &PluginInput) -> Value {
     let asset_id = input.extra_params.get("asset_id").and_then(Value::as_i64).unwrap_or(0);
     if asset_id <= 0 { return json!({"success": false, "error": "missing asset_id"}); }
     json!({"success": false, "error": "resolve_cover not yet implemented"})
+}
+
+/// 下载 BZ 漫画封面并安装为 asset，返回 cover_asset_id（0 表示失败）。
+/// 带 task_kv 缓存（按 comic_id），避免每次 resolve_metadata 都重下封面。
+/// 对齐 picacgmeta/jmcomicmeta 的 resolve_cover_asset。
+fn resolve_cover_asset(cover_url: &str, comic_id: &str) -> i64 {
+    if cover_url.trim().is_empty() {
+        return 0;
+    }
+
+    // 缓存命中则直接返回已安装的 asset_id
+    let cache_key = format!("bz_cover_{comic_id}");
+    if let Ok(Some(cached)) = HostBridge::task_kv_get(&cache_key) {
+        if let Some(id) = cached.as_i64() {
+            if id > 0 { return id; }
+        }
+    }
+
+    // 推断扩展名与 content_type
+    let lower = cover_url.to_ascii_lowercase();
+    let ext = if lower.ends_with(".png") { "png" }
+        else if lower.ends_with(".gif") { "gif" }
+        else if lower.ends_with(".webp") { "webp" }
+        else { "jpg" };
+    let content_type = match ext {
+        "png" => "image/png",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        _ => "image/jpeg",
+    };
+    let guest_path = format!("/plugin/bz_cover_{comic_id}.{ext}");
+    let original_filename = format!("cover_{comic_id}.{ext}");
+
+    // 下载封面（CDN，无需鉴权 header，带 UA + Referer 即可）
+    let headers = vec![
+        ("User-Agent".to_string(), USER_AGENT.to_string()),
+        ("Accept".to_string(), "image/webp,image/apng,image/*,*/*;q=0.8".to_string()),
+        ("Referer".to_string(), cover_url.to_string()),
+    ];
+    let response = match http_get_bytes_follow_redirects(cover_url, &headers) {
+        Ok(v) => v,
+        Err(e) => {
+            HostBridge::log(2, &format!("bz cover download failed for {comic_id}: {e}"));
+            return 0;
+        }
+    };
+    if response.status >= 400 {
+        HostBridge::log(2, &format!("bz cover HTTP {} for {comic_id}", response.status));
+        return 0;
+    }
+    if response.body.is_empty() {
+        HostBridge::log(2, &format!("bz cover empty body for {comic_id}"));
+        return 0;
+    }
+
+    // 写入 WASI guest path
+    if let Err(e) = std::fs::write(&guest_path, &response.body) {
+        HostBridge::log(2, &format!("bz cover write failed for {comic_id}: {e}"));
+        return 0;
+    }
+
+    // 安装为 asset
+    match HostBridge::install_asset(&guest_path, &original_filename, content_type) {
+        Ok(asset_id) => {
+            let _ = HostBridge::task_kv_set(&cache_key, json!(asset_id));
+            asset_id
+        }
+        Err(e) => {
+            HostBridge::log(2, &format!("bz cover install failed for {comic_id}: {e}"));
+            0
+        }
+    }
 }
 
 fn normalize_target_type(raw: &str, params: &Value) -> String {
@@ -321,6 +406,10 @@ fn resolve_source_metadata(input: &PluginInput) -> Value {
         Ok(detail) => {
             let tags = metadata_tags_from_csv(&detail.tags);
 
+            // 下载封面并安装为 asset（对齐 picacgmeta/jmcomicmeta）
+            HostBridge::progress(70, "处理封面...");
+            let cover_asset_id = resolve_cover_asset(&detail.cover, &remote_id);
+
             // 解析章节
             let comic_url = format!("{}/comic/{}", auth.base_url, remote_id);
             let (status, html) = match http_get_text(&comic_url, &build_headers(&auth)) {
@@ -332,12 +421,17 @@ fn resolve_source_metadata(input: &PluginInput) -> Value {
             }
             let chapters = parse_chapters_from_html(&html);
             let children: Vec<Value> = chapters.iter().enumerate().map(|(idx, (ep_id, ch_title))| {
-                json!({
+                let mut child = json!({
                     "entity_type": "archive",
                     "entity_id": format!("source:bzsource:{}_{}", remote_id, ep_id),
                     "title": ch_title,
                     "sort_order": (idx + 1) as i64,
-                })
+                });
+                // 每个档案复用合集封面（对齐 picacgmeta/jmcomicmeta）
+                if cover_asset_id > 0 {
+                    child["assets"] = json!({ "cover": cover_asset_id });
+                }
+                child
             }).collect();
 
             let mut data = json!({
@@ -346,8 +440,8 @@ fn resolve_source_metadata(input: &PluginInput) -> Value {
                 "tags": tags,
                 "children": children,
             });
-            if !detail.cover.is_empty() {
-                data["cover"] = json!(detail.cover);
+            if cover_asset_id > 0 {
+                data["cover_asset_id"] = json!(cover_asset_id);
             }
             HostBridge::progress(100, "元数据获取完成");
             json!({"success": true, "data": data})
@@ -405,30 +499,47 @@ fn fetch_chapter_image_urls(comic_chapter_id: &str) -> Result<usize, String> {
 
 /// 从漫画详情 HTML 解析章节列表（复用 bzsource 的解析模式）
 fn parse_chapters_from_html(html: &str) -> Vec<(String, String)> {
-    // Try primary regex pattern from bzsource
-    if let Ok(re) = Regex::new(r#"<a[^>]*href=["']?/chapter/[^"']*?/(\d+)_["']?[^>]*>.*?<span[^>]*>(.*?)</span>.*?</a>"#) {
-        let chapters: Vec<(String, String)> = re.captures_iter(html)
-            .filter_map(|cap| {
-                let ep_id = cap.get(1)?.as_str().to_string();
-                let title = strip_html_tags(cap.get(2).map(|m| m.as_str()).unwrap_or(""));
-                if ep_id.is_empty() { None } else { Some((ep_id, title)) }
-            })
-            .collect();
-        if !chapters.is_empty() { return chapters; }
+    // 对齐 venera baozi.js: div#chapter-items / div#chapters_other_list 下的
+    // <div class="comics-chapters"><a href="/user/page_direct?...&chapter_slot=N"><div><span>title</span></div></a></div>
+    // 页面常渲染两份列表（正序+倒序），需按 chapter_slot 去重后排序。
+    // ep_id = chapter_slot 的值。先尝试带 chapter_slot 的链接（新版 HTML）。
+    use std::collections::BTreeMap;
+    let mut chapters_map: BTreeMap<i64, String> = BTreeMap::new();
+    if let Ok(re) = Regex::new(r#"<a[^>]*href="[^"]*chapter_slot=(\d+)[^"]*"[^>]*>\s*(?:<div[^>]*>)?\s*<span[^>]*>(.*?)</span>"#) {
+        for cap in re.captures_iter(html) {
+            let ep_id_str = cap.get(1).map(|m| m.as_str()).unwrap_or("");
+            let title = strip_html_tags(cap.get(2).map(|m| m.as_str()).unwrap_or("").trim());
+            if let Ok(ep_id) = ep_id_str.parse::<i64>() {
+                if !title.is_empty() {
+                    chapters_map.entry(ep_id).or_insert(title);
+                }
+            }
+        }
+    }
+    if !chapters_map.is_empty() {
+        return chapters_map.into_iter().map(|(ep, title)| (ep.to_string(), title)).collect();
     }
 
-    // Fallback: parse #chapter-items div
+    // 旧版 HTML：/chapter/{comicId}/{epId}_ 格式
+    if let Ok(re) = Regex::new(r#"<a[^>]*href=["']?/chapter/[^"']*?/(\d+)_["']?[^>]*>[\s\S]*?<span[^>]*>(.*?)</span>[\s\S]*?</a>"#) {
+        let mut found = Vec::new();
+        for cap in re.captures_iter(html) {
+            let ep_id = cap.get(1).map(|m| m.as_str()).unwrap_or("").to_string();
+            let title = strip_html_tags(cap.get(2).map(|m| m.as_str()).unwrap_or("").trim());
+            if !ep_id.is_empty() && !title.is_empty() {
+                found.push((ep_id, title));
+            }
+        }
+        if !found.is_empty() { return found; }
+    }
+
+    // Fallback: comics-chapters > span（仅标题，ep_id 用序号）
     let mut chapters = Vec::new();
-    if let Ok(re) = Regex::new(r#"<div[^>]*id=["']?chapter-items["']?[^>]*>(.*?)</div>"#) {
-        if let Some(caps) = re.captures(html) {
-            let block = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-            if let Ok(link_re) = Regex::new(r#"<a[^>]*>(.*?)</a>"#) {
-                for (idx, cap) in link_re.captures_iter(block).enumerate() {
-                    let title = strip_html_tags(cap.get(1).map(|m| m.as_str()).unwrap_or(""));
-                    if !title.is_empty() {
-                        chapters.push(((idx + 1).to_string(), title));
-                    }
-                }
+    if let Ok(re) = Regex::new(r#"class=["']?[^"']*comics-chapters["']?[^>]*>[\s\S]*?<span[^>]*>(.*?)</span>"#) {
+        for (idx, cap) in re.captures_iter(html).enumerate() {
+            let title = strip_html_tags(cap.get(1).map(|m| m.as_str()).unwrap_or("").trim());
+            if !title.is_empty() {
+                chapters.push((idx.to_string(), title));
             }
         }
     }

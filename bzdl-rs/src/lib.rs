@@ -272,11 +272,12 @@ fn run_download(input: &PluginInput) -> Value {
 
     HostBridge::progress(1, "获取漫画信息...");
     let detail_url = format!("{}/comic/{comic_id}", auth.base_url);
-    let (status, html) = match http_get_with_retry(&detail_url, &build_headers(&auth), MAX_HTTP_RETRIES) {
+    let (status, html_bytes) = match http_get_with_retry(&detail_url, &build_headers(&auth), MAX_HTTP_RETRIES) {
         Ok(v) => v,
         Err(e) => return output_err(&format!("Detail fetch failed: {e}")),
     };
     if status != 200 { return output_err(&format!("Detail returned status {status}")); }
+    let html = String::from_utf8_lossy(&html_bytes).to_string();
 
     let title = parse_title(&html);
     let chapters = parse_chapters(&html);
@@ -592,8 +593,9 @@ fn parse_chapters(html: &str) -> Vec<(String, String)> {
 }
 
 fn fetch_chapter_images(url: &str, auth: &BzAuthData) -> Result<Vec<String>, String> {
-    let (status, html) = http_get_with_retry(url, &build_headers(auth), MAX_HTTP_RETRIES)?;
+    let (status, html_bytes) = http_get_with_retry(url, &build_headers(auth), MAX_HTTP_RETRIES)?;
     if status != 200 { return Err(format!("HTTP {status}")); }
+    let html = String::from_utf8_lossy(&html_bytes).to_string();
     Ok(parse_chapter_images(&html, auth))
 }
 
@@ -652,7 +654,7 @@ fn download_file(url: &str, referer: Option<&str>, auth: &BzAuthData, output: &P
     if status >= 400 { return Err(format!("HTTP {status}")); }
     if body.is_empty() { return Err("empty response body".to_string()); }
     let mut file = File::create(output).map_err(|e| e.to_string())?;
-    file.write_all(body.as_bytes()).map_err(|e| e.to_string())?;
+    file.write_all(&body).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -750,7 +752,7 @@ struct HttpResponse {
     body: Vec<u8>,
 }
 
-fn http_get_with_retry(url: &str, extra_headers: &[(String, String)], max_retries: usize) -> Result<(u16, String), String> {
+fn http_get_with_retry(url: &str, extra_headers: &[(String, String)], max_retries: usize) -> Result<(u16, Vec<u8>), String> {
     let mut last_err = String::new();
     for attempt in 0..=max_retries {
         match http_get(url, extra_headers) {
@@ -763,13 +765,15 @@ fn http_get_with_retry(url: &str, extra_headers: &[(String, String)], max_retrie
                 }
                 if is_retryable_status(response.status) {
                     last_err = format!("HTTP {}", response.status);
-                    if attempt >= max_retries { return Ok((response.status, String::from_utf8_lossy(&response.body).to_string())); }
+                    if attempt >= max_retries { return Ok((response.status, response.body)); }
                     let wait_ms = 250u64.saturating_mul(attempt as u64 + 1);
                     std::thread::sleep(std::time::Duration::from_millis(wait_ms));
                     continue;
                 }
-                let text = String::from_utf8_lossy(&response.body).to_string();
-                return Ok((response.status, text));
+                // 直接返回原始字节（Vec<u8>），不做 from_utf8_lossy：
+                // 二进制内容（如图片）的字节会被 replacement char 污染。
+                // 文本调用方按需 String::from_utf8_lossy。
+                return Ok((response.status, response.body));
             }
             Err(err) => {
                 if attempt >= max_retries || !is_retryable_network_error(&err) { return Err(err); }
