@@ -15,6 +15,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use url::Url;
 use webpki_roots::TLS_SERVER_ROOTS;
 
+// JM 图片分块打乱阈值（对齐 venera jm.js onImageLoad）。
+const JM_SCRAMBLE_ID: u64 = 220980;
+const JM_SCRAMBLE_ID_2: u64 = 268850;
+const JM_SCRAMBLE_ID_3: u64 = 421926;
+
 #[cfg(not(target_arch = "wasm32"))]
 use std::net::{TcpStream, ToSocketAddrs};
 #[cfg(target_arch = "wasm32")]
@@ -561,12 +566,16 @@ fn resolve_page_asset(input: &PluginInput) -> Vec<u8> {
         );
     }
 
+    // JM 图片分块打乱重组（对齐 venera onImageLoad/modifyImage）
+    let ep_id_num: u64 = ep_id.parse().unwrap_or(0);
+    let body = descramble_jm_image(&img_resp.body, ep_id_num, img_name);
+
     HostBridge::progress(100, "单页资源解析完成");
     let success_json = json!({
         "success": true,
         "content_type": content_type
     });
-    build_binary_response(&success_json, &img_resp.body)
+    build_binary_response(&success_json, &body)
 }
 
 /// download_archive action（targetType=source）：从 targetId 解析 remoteId，复用整本下载流程。
@@ -630,6 +639,112 @@ fn guess_content_type(ext: &str) -> &'static str {
         "webp" => "image/webp",
         "bmp" => "image/bmp",
         _ => "application/octet-stream",
+    }
+}
+
+/// 计算 JM 图片分块数（对齐 venera jm.js onImageLoad 的 num 计算）。
+/// num=0 表示无需重组；>1 表示按高度分 num 块逆序重排。
+fn jm_scramble_num(ep_id: u64, picture_name: &str) -> u64 {
+    if ep_id < JM_SCRAMBLE_ID {
+        0
+    } else if ep_id < JM_SCRAMBLE_ID_2 {
+        10
+    } else if ep_id > JM_SCRAMBLE_ID_3 {
+        let str = format!("{}{}", ep_id, picture_name);
+        let hash = md5_hash(str.as_bytes());
+        let hex = bytes_to_hex(&hash);
+        let char_code = hex.as_bytes().last().copied().unwrap_or(b'0') as u64;
+        let remainder = char_code % 8;
+        remainder * 2 + 2
+    } else {
+        let str = format!("{}{}", ep_id, picture_name);
+        let hash = md5_hash(str.as_bytes());
+        let hex = bytes_to_hex(&hash);
+        let char_code = hex.as_bytes().last().copied().unwrap_or(b'0') as u64;
+        let remainder = char_code % 10;
+        remainder * 2 + 2
+    }
+}
+
+/// 对 JM 打乱图片按 num 块逆序重排（对齐 venera modifyImage）。
+/// gif 不重组。返回重组后的图片字节（同格式），失败时返回原始字节。
+fn descramble_jm_image(img_bytes: &[u8], ep_id: u64, img_name: &str) -> Vec<u8> {
+    // gif 不需要重组
+    let lower = img_name.to_ascii_lowercase();
+    if lower.ends_with(".gif") {
+        return img_bytes.to_vec();
+    }
+    // pictureName = 文件名去扩展名（对齐 venera url.substring(i+1, len-5) 的等效：去最后一段扩展名）
+    let picture_name = match lower.rfind('.') {
+        Some(dot) => &img_name[..dot],
+        None => img_name,
+    };
+    let num = jm_scramble_num(ep_id, picture_name);
+    if num <= 1 {
+        return img_bytes.to_vec();
+    }
+    let num: u32 = num as u32;
+
+    // 解码图片
+    let img = match image::load_from_memory(img_bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            HostBridge::log(2, &format!("jmcomic descramble decode failed (ep={}, num={}): {}", ep_id, num, e));
+            return img_bytes.to_vec();
+        }
+    };
+    let (width, height) = (img.width(), img.height());
+    if height < num {
+        return img_bytes.to_vec();
+    }
+
+    // 分块：前 num-1 块各 blockSize 高，最后一块 blockSize + remainder
+    let block_size = height / num;
+    let remainder = height % num;
+    let mut blocks: Vec<(u32, u32)> = Vec::with_capacity(num as usize);
+    for i in 0..num {
+        let start = i * block_size;
+        let end = start + block_size + if i == num - 1 { remainder } else { 0 };
+        blocks.push((start, end));
+    }
+
+    // 逆序重排：从最后一块开始，依次贴到结果图从 y=0 往下
+    use image::GenericImageView;
+    let mut result = image::RgbaImage::new(width, height);
+    let mut y: u32 = 0;
+    for i in (0..blocks.len()).rev() {
+        let (start, end) = blocks[i];
+        let current_height = end - start;
+        if current_height == 0 {
+            continue;
+        }
+        // 取原图 [start, end) 行贴到结果 [y, y+current_height)
+        let sub = img.view(0, start, width, current_height).to_image();
+        for row in 0..current_height {
+            for col in 0..width {
+                result.put_pixel(col, y + row, *sub.get_pixel(col, row));
+            }
+        }
+        y += current_height;
+    }
+
+    // 重编码同格式（用 DynamicImage::write_to 统一编码，按原始扩展名选 ImageFormat）
+    let ext = guess_ext_from_url(img_name);
+    let format = match ext.as_str() {
+        "webp" => image::ImageFormat::WebP,
+        "png" => image::ImageFormat::Png,
+        "gif" => image::ImageFormat::Gif,
+        "bmp" => image::ImageFormat::Bmp,
+        _ => image::ImageFormat::Jpeg,
+    };
+    let dyn_img = image::DynamicImage::from(result);
+    let mut buf = Vec::new();
+    match dyn_img.write_to(&mut std::io::Cursor::new(&mut buf), format) {
+        Ok(()) => buf,
+        Err(e) => {
+            HostBridge::log(2, &format!("jmcomic descramble encode failed (ep={}, num={}): {}", ep_id, num, e));
+            img_bytes.to_vec()
+        }
     }
 }
 
@@ -773,7 +888,10 @@ fn download_album(
                         let zip_entry_name = format!("{}/{:04}_{}", ep_id, img_idx + 1, img_name);
                         zip.start_file(&zip_entry_name, options)
                             .map_err(|e| e.to_string())?;
-                        zip.write_all(&img_resp.body).map_err(|e| e.to_string())?;
+                        // JM 图片分块打乱重组（对齐 venera onImageLoad/modifyImage）
+                        let ep_id_num: u64 = ep_id.parse().unwrap_or(0);
+                        let body = descramble_jm_image(&img_resp.body, ep_id_num, img_name);
+                        zip.write_all(&body).map_err(|e| e.to_string())?;
                         total_images += 1;
                     } else {
                         HostBridge::log(

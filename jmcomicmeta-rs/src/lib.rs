@@ -571,7 +571,7 @@ fn resolve_source_metadata(input: &PluginInput) -> Value {
                             .unwrap_or(0)
                     });
 
-                    let children: Vec<Value> = sorted.iter().enumerate().filter_map(|(idx, item)| {
+                    let mut children: Vec<Value> = sorted.iter().enumerate().filter_map(|(idx, item)| {
                         let ep_id = value_to_id_string(item.get("id"));
                         if ep_id.is_empty() { return None; }
                         let ep_name = item.get("name").and_then(Value::as_str).unwrap_or("").trim().to_string();
@@ -595,6 +595,28 @@ fn resolve_source_metadata(input: &PluginInput) -> Value {
                         }
                         Some(child)
                     }).collect();
+
+                    // JM 典型模式：series[0].id == album_id（合集第一话 id 即 album id）。
+                    // 此时 album_id 同时是第一话的 chapter_id，/chapter?id={album_id} 可直接取第一话图片。
+                    // reader（fetchPages）直接访问合集顶层时需要 page children 才能读第一话，
+                    // 故在此内联第一话的 page children。detail 端按 entity_type=archive 显示话数列表，
+                    // page children 由 reader 的 fetchPages 过滤使用，互不干扰。
+                    let first_ep_id = value_to_id_string(series.get(0).and_then(|s| s.get("id")).or(series.get(0)));
+                    if first_ep_id == album_id {
+                        if let Ok(first_ep_images) = fetch_chapter_images(&album_id, &api_base, &bypass_url) {
+                            for (idx, _) in first_ep_images.iter().enumerate() {
+                                let page_num = idx + 1;
+                                children.push(json!({
+                                    "entity_type": "page",
+                                    "entity_id": format!("source:jmcomicsource:{}#page:{}", album_id, page_num),
+                                    "title": "",
+                                    "sort_order": page_num as i64,
+                                    "path": format!("{}/{}", album_id, page_num),
+                                    "media_type": "image",
+                                }));
+                            }
+                        }
+                    }
 
                     let mut data = json!({
                         "title": album_title,
