@@ -23,6 +23,9 @@ const HTTP_TIMEOUT_MS: i32 = 15000;
 const MAX_REDIRECTS: usize = 5;
 const AUTH_DATA_KEY: &str = "__lanlu.phase.picacglogin.data";
 const MAX_HTTP_RETRIES: usize = 3;
+/// namespace 作用域 KV 中登录令牌的缓存 TTL（秒），默认 7 天。
+/// 可经插件参数 auth_ttl_seconds 覆盖；到期后重新触达上游登录。
+const AUTH_CACHE_TTL_SECONDS: i64 = 604_800;
 const PICACG_API_KEY: &str = "C69BAF41DA5ABD1FFEDC6D2FEA56B";
 const PICACG_SIGNATURE_KEY: &str = r#"~d}$Q7$eIni=V)9\RK/P.RM4;9[7|@/CA}b~OW!3?EV`:<>M7pddUBL5n|0/*Cn"#;
 const DEFAULT_BASE_URL: &str = "https://picaapi.picacomic.com";
@@ -113,6 +116,24 @@ impl HostBridge {
 
     fn task_kv_set(key: &str, value: Value) -> Result<bool, String> {
         let response = Self::call("task_kv.set", json!({"key": key, "value": value}))?;
+        Ok(response.get("stored").and_then(Value::as_bool).unwrap_or(false))
+    }
+
+    /// 读取本插件 namespace 作用域的 KV 缓存（跨管线留存）。
+    /// 仅取自身命名空间下的键；调用方按需解析 found/value。
+    fn plugin_kv_get(key: &str) -> Result<Option<Value>, String> {
+        let response = Self::call("plugin_kv.get", json!({"key": key}))?;
+        let found = response.get("found").and_then(Value::as_bool).unwrap_or(false);
+        if !found { return Ok(None); }
+        Ok(response.get("value").cloned())
+    }
+
+    /// 写入本插件 namespace 作用域的 KV 缓存（跨管线留存），携带 TTL。
+    fn plugin_kv_set(key: &str, value: Value, ttl_seconds: i64) -> Result<bool, String> {
+        let response = Self::call(
+            "plugin_kv.set",
+            json!({"key": key, "value": value, "ttl_seconds": ttl_seconds}),
+        )?;
         Ok(response.get("stored").and_then(Value::as_bool).unwrap_or(false))
     }
 }
@@ -711,19 +732,53 @@ fn execute_plugin(params: Value) -> Value {
     HostBridge::progress(10, "读取 Picacg 登录配置...");
     let email = read_string_param(&params, "email");
     let password = read_string_param(&params, "password");
+    let auth_ttl_seconds = read_ttl_param(&params, "auth_ttl_seconds", AUTH_CACHE_TTL_SECONDS);
 
     if email.is_empty() || password.is_empty() {
         return json!({ "success": false, "error": "Email and password are required." });
     }
 
-    let result = do_login(&email, &password);
+    // 先查 namespace 作用域 KV 缓存：命中且 token 非空则复用，跳过上游登录。
+    // namespace KV 仅随 TTL 过期，不受任务组 release/deleteGroup 清理，故可跨管线留存。
+    match HostBridge::plugin_kv_get(AUTH_DATA_KEY) {
+        Ok(Some(cached)) if cached.get("token").and_then(Value::as_str).map_or(false, |t| !t.is_empty()) => {
+            HostBridge::progress(100, "命中登录缓存，跳过上游登录");
+            HostBridge::log(1, "picacglogin cache hit: reuse cached auth data");
+            // 仍镜像写入 group 作用域 task_kv，供同管线消费方 picacgmeta 读取。
+            match HostBridge::task_kv_set(AUTH_DATA_KEY, cached.clone()) {
+                Ok(true) => json!({ "success": true, "data": cached, "cached": true }),
+                Ok(false) => json!({ "success": false, "error": "Failed to persist Picacg auth data to task KV." }),
+                Err(e) => json!({ "success": false, "error": format!("Failed to persist Picacg auth data: {e}") }),
+            }
+        }
+        Ok(_) => persist_after_login(&email, &password, auth_ttl_seconds),
+        Err(e) => {
+            // 缓存不可用时不应阻断登录流程，仅记录后回退到正常登录。
+            HostBridge::log(1, &format!("picacglogin cache read failed, fallback to login: {e}"));
+            persist_after_login(&email, &password, auth_ttl_seconds)
+        }
+    }
+}
+
+/// 执行上游登录，并将结果写入 namespace 缓存（带 TTL）+ 镜像到 group 作用域 task_kv。
+fn persist_after_login(email: &str, password: &str, auth_ttl_seconds: i64) -> Value {
+    let result = do_login(email, password);
     HostBridge::progress(100, "配置完成");
     match result {
-        Ok(data) => match HostBridge::task_kv_set(AUTH_DATA_KEY, data.clone()) {
-            Ok(true) => json!({ "success": true, "data": data }),
-            Ok(false) => json!({ "success": false, "error": "Failed to persist Picacg auth data to task KV." }),
-            Err(e) => json!({ "success": false, "error": format!("Failed to persist Picacg auth data: {e}") }),
-        },
+        Ok(data) => {
+            // 缓存到 namespace 作用域 KV 供后续管线复用；失败不影响本次成功登录。
+            if let Err(e) = HostBridge::plugin_kv_set(AUTH_DATA_KEY, data.clone(), auth_ttl_seconds) {
+                HostBridge::log(1, &format!("picacglogin cache write failed: {e}"));
+            } else {
+                HostBridge::log(1, "picacglogin cache stored");
+            }
+            // 供同管线消费方 picacgmeta 读取镜像。
+            match HostBridge::task_kv_set(AUTH_DATA_KEY, data.clone()) {
+                Ok(true) => json!({ "success": true, "data": data }),
+                Ok(false) => json!({ "success": false, "error": "Failed to persist Picacg auth data to task KV." }),
+                Err(e) => json!({ "success": false, "error": format!("Failed to persist Picacg auth data: {e}") }),
+            }
+        }
         Err(e) => json!({ "success": false, "error": e }),
     }
 }
@@ -770,6 +825,15 @@ fn do_login(email: &str, password: &str) -> Result<Value, String> {
 
 fn read_string_param(params: &Value, name: &str) -> String {
     params.get(name).and_then(Value::as_str).unwrap_or_default().trim().to_string()
+}
+
+/// 读取可正的 TTL 参数；缺失或非正则回退到默认值。
+fn read_ttl_param(params: &Value, name: &str, default: i64) -> i64 {
+    let v = params
+        .get(name)
+        .and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.trim().parse::<i64>().ok())))
+        .unwrap_or(default);
+    if v > 0 { v } else { default }
 }
 
 fn ensure_info_bytes(state: &mut PluginState) {
