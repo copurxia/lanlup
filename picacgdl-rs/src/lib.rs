@@ -296,17 +296,30 @@ fn http_request_once(
         path.push_str(query);
     }
 
+    let has_custom_host = extra_headers.iter().any(|(n, _)| n.eq_ignore_ascii_case("host"));
+    let has_custom_user_agent = extra_headers.iter().any(|(n, _)| n.eq_ignore_ascii_case("user-agent"));
+    let has_custom_accept = extra_headers.iter().any(|(n, _)| n.eq_ignore_ascii_case("accept"));
+    let has_custom_connection = extra_headers.iter().any(|(n, _)| n.eq_ignore_ascii_case("connection"));
+
     let mut req = String::new();
     req.push_str(&format!("{method} {path} HTTP/1.1\r\n"));
-    if has_default_port(scheme, port) {
-        req.push_str(&format!("Host: {host}\r\n"));
-    } else {
-        req.push_str(&format!("Host: {host}:{port}\r\n"));
+    if !has_custom_host {
+        if has_default_port(scheme, port) {
+            req.push_str(&format!("Host: {host}\r\n"));
+        } else {
+            req.push_str(&format!("Host: {host}:{port}\r\n"));
+        }
     }
-    req.push_str(&format!("User-Agent: {USER_AGENT}\r\n"));
-    req.push_str("Accept: */*\r\n");
+    if !has_custom_user_agent {
+        req.push_str(&format!("User-Agent: {USER_AGENT}\r\n"));
+    }
+    if !has_custom_accept {
+        req.push_str("Accept: */*\r\n");
+    }
     req.push_str("Accept-Encoding: identity\r\n");
-    req.push_str("Connection: close\r\n");
+    if !has_custom_connection {
+        req.push_str("Connection: close\r\n");
+    }
     for (name, value) in extra_headers {
         req.push_str(&format!("{name}: {value}\r\n"));
     }
@@ -606,7 +619,7 @@ fn picacg_headers(method: &str, path: &str, token: Option<&str>, nonce: &str, ti
         ("app-build-version".to_string(), "45".to_string()),
         ("Content-Type".to_string(), "application/json; charset=UTF-8".to_string()),
         ("user-agent".to_string(), "okhttp/3.8.1".to_string()),
-        ("version".to_string(), "v1.4.1".to_string()),
+        ("version".to_string(), "v1.5.4".to_string()),
         ("Host".to_string(), "picaapi.picacomic.com".to_string()),
         ("signature".to_string(), signature),
     ];

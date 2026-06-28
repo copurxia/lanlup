@@ -140,6 +140,22 @@ impl HostBridge {
         Ok(response.get("value").cloned())
     }
 
+    fn task_kv_set(key: &str, value: Value) -> Result<(), String> {
+        Self::call("task_kv.set", json!({"key": key, "value": value}))?;
+        Ok(())
+    }
+
+    fn install_asset(guest_path: &str, original_filename: &str, content_type: &str) -> Result<i64, String> {
+        let resp = Self::call("asset.install_from_file", json!({
+            "guest_path": guest_path,
+            "original_filename": original_filename,
+            "content_type": content_type,
+        }))?;
+        resp.get("asset_id")
+            .and_then(Value::as_i64)
+            .ok_or_else(|| "no asset_id in response".to_string())
+    }
+
     fn select_index(
         title: &str,
         options: Vec<Value>,
@@ -271,7 +287,39 @@ fn http_get_with_retry(
     headers: &[(String, String)],
     max_retries: usize,
 ) -> Result<HttpResponse, String> {
-    http_post_with_retry(url, headers, b"", max_retries)
+    let mut last_err = String::new();
+    for attempt in 0..=max_retries {
+        match http_request(url, "GET", headers, b"") {
+            Ok(response) => {
+                if response.status == 429 {
+                    let wait_ms = retry_after_millis(&response.headers)
+                        .unwrap_or_else(|| 1_000u64.saturating_mul(attempt as u64 + 1));
+                    if attempt >= max_retries {
+                        return Err(format!("HTTP 429 for {url}. Retry later."));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(wait_ms.min(60_000)));
+                    continue;
+                }
+                if is_retryable_status(response.status) {
+                    if attempt >= max_retries { return Ok(response); }
+                    last_err = format!("HTTP {}", response.status);
+                    let wait_ms = 250u64.saturating_mul(attempt as u64 + 1);
+                    std::thread::sleep(std::time::Duration::from_millis(wait_ms));
+                    continue;
+                }
+                return Ok(response);
+            }
+            Err(err) => {
+                if attempt >= max_retries || !is_retryable_network_error(&err) {
+                    return Err(err);
+                }
+                last_err = err;
+                let wait_ms = 200u64.saturating_mul(attempt as u64 + 1);
+                std::thread::sleep(std::time::Duration::from_millis(wait_ms));
+            }
+        }
+    }
+    Err(last_err)
 }
 
 fn http_request(
@@ -317,21 +365,36 @@ fn http_request_once(
         path.push_str(query);
     }
 
+    let has_custom_host = extra_headers.iter().any(|(n, _)| n.eq_ignore_ascii_case("host"));
+    let has_custom_user_agent = extra_headers.iter().any(|(n, _)| n.eq_ignore_ascii_case("user-agent"));
+    let has_custom_accept = extra_headers.iter().any(|(n, _)| n.eq_ignore_ascii_case("accept"));
+    let has_custom_connection = extra_headers.iter().any(|(n, _)| n.eq_ignore_ascii_case("connection"));
+
     let mut req = String::new();
     req.push_str(&format!("{method} {path} HTTP/1.1\r\n"));
-    if has_default_port(scheme, port) {
-        req.push_str(&format!("Host: {host}\r\n"));
-    } else {
-        req.push_str(&format!("Host: {host}:{port}\r\n"));
+    if !has_custom_host {
+        if has_default_port(scheme, port) {
+            req.push_str(&format!("Host: {host}\r\n"));
+        } else {
+            req.push_str(&format!("Host: {host}:{port}\r\n"));
+        }
     }
-    req.push_str(&format!("User-Agent: {USER_AGENT}\r\n"));
-    req.push_str("Accept: application/json,*/*\r\n");
+    if !has_custom_user_agent {
+        req.push_str(&format!("User-Agent: {USER_AGENT}\r\n"));
+    }
+    if !has_custom_accept {
+        req.push_str("Accept: application/json,*/*\r\n");
+    }
     req.push_str("Accept-Encoding: identity\r\n");
-    req.push_str("Connection: close\r\n");
+    if !has_custom_connection {
+        req.push_str("Connection: close\r\n");
+    }
     for (name, value) in extra_headers {
         req.push_str(&format!("{name}: {value}\r\n"));
     }
-    req.push_str(&format!("Content-Length: {}\r\n", body.len()));
+    if !body.is_empty() {
+        req.push_str(&format!("Content-Length: {}\r\n", body.len()));
+    }
     req.push_str("\r\n");
 
     let stream = connect_target_stream(scheme, host, port)?;
@@ -623,7 +686,7 @@ fn picacg_headers(method: &str, path: &str, token: Option<&str>, nonce: &str, ti
         ("app-build-version".to_string(), "45".to_string()),
         ("Content-Type".to_string(), "application/json; charset=UTF-8".to_string()),
         ("user-agent".to_string(), "okhttp/3.8.1".to_string()),
-        ("version".to_string(), "v1.4.1".to_string()),
+        ("version".to_string(), "v1.5.4".to_string()),
         ("Host".to_string(), "picaapi.picacomic.com".to_string()),
         ("signature".to_string(), signature),
     ];
@@ -734,6 +797,11 @@ fn search_comic_by_title(title: &str, auth: &PicacgAuthData) -> Result<Option<St
         .and_then(|c| c.get("_id").and_then(Value::as_str).map(|s| s.to_string())))
 }
 
+fn truncate_body(text: &str) -> String {
+    let t = text.trim();
+    if t.len() <= 500 { t.to_string() } else { format!("{}...", &t[..500]) }
+}
+
 fn fetch_comic_metadata(comic_id: &str, auth: &PicacgAuthData) -> Result<Value, String> {
     let path = format!("comics/{comic_id}");
     let (status, text) = picacg_get(&path, auth)?;
@@ -744,11 +812,16 @@ fn fetch_comic_metadata(comic_id: &str, auth: &PicacgAuthData) -> Result<Value, 
         return Err(format!("Comic not found: {comic_id}"));
     }
     if status != 200 {
-        return Err(format!("Failed to fetch comic metadata: HTTP {status}"));
+        return Err(format!("Failed to fetch comic metadata: HTTP {status} body={}", truncate_body(&text)));
     }
     let parsed: Value = serde_json::from_str(&text)
         .map_err(|e| format!("Failed to parse comic metadata: {e}"))?;
-    Ok(parsed.get("data").and_then(|d| d.get("comic")).cloned().unwrap_or(Value::Null))
+    let comic = parsed.get("data").and_then(|d| d.get("comic")).cloned()
+        .unwrap_or_else(|| parsed.get("data").cloned().unwrap_or(Value::Null));
+    if comic.is_null() {
+        return Err(format!("Picacg returned empty data for comic {comic_id} (likely removed/hidden). Response: {}", truncate_body(&text)));
+    }
+    Ok(comic)
 }
 
 fn build_metadata_from_comic(comic: &Value, comic_id: &str) -> Map<String, Value> {
@@ -909,11 +982,15 @@ fn plugin_info_json() -> Value {
         "permissions": [
             "metadata.read_input",
             "net=picaapi.picacomic.com",
+            "net=storage-b.picacomic.com",
+            "net=storage1.picacomic.com",
+            "net=storage2.picacomic.com",
             "ui.select",
             "tcp.connect",
             "log.write",
             "progress.report",
             "task_kv.read",
+            "task_kv.write",
             "asset.install_from_file"
         ]
     })
@@ -929,6 +1006,74 @@ fn normalize_target_type(raw: &str, params: &Value) -> String {
     let from_input = raw.trim().to_ascii_lowercase();
     if !from_input.is_empty() { return from_input; }
     params.get("__target_type").and_then(Value::as_str).unwrap_or("").to_ascii_lowercase()
+}
+
+/// 下载 picacg 封面并安装为 asset，返回 cover_asset_id（0 表示失败）。
+/// 带 task_kv 缓存（按 comic_id），避免每次 resolve_metadata 都重下封面。
+fn resolve_cover_asset(cover_url: &str, comic_id: &str) -> i64 {
+    if cover_url.trim().is_empty() {
+        return 0;
+    }
+
+    // 缓存命中则直接返回已安装的 asset_id
+    let cache_key = format!("picacg_cover_{comic_id}");
+    if let Ok(Some(cached)) = HostBridge::task_kv_get(&cache_key) {
+        if let Some(id) = cached.as_i64() {
+            if id > 0 {
+                return id;
+            }
+        }
+    }
+
+    // 推断扩展名与 content_type
+    let lower = cover_url.to_ascii_lowercase();
+    let ext = if lower.ends_with(".png") { "png" }
+        else if lower.ends_with(".gif") { "gif" }
+        else if lower.ends_with(".webp") { "webp" }
+        else { "jpg" };
+    let content_type = match ext {
+        "png" => "image/png",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        _ => "image/jpeg",
+    };
+    let guest_path = format!("/plugin/picacg_cover_{comic_id}.{ext}");
+    let original_filename = format!("cover_{comic_id}.{ext}");
+
+    // 下载封面图片（storage CDN，无需 picacg 签名）
+    let response = match http_request(cover_url, "GET", &[], b"") {
+        Ok(v) => v,
+        Err(e) => {
+            HostBridge::log(2, &format!("picacg cover download failed for {comic_id}: {e}"));
+            return 0;
+        }
+    };
+    if response.status >= 400 {
+        HostBridge::log(2, &format!("picacg cover HTTP {} for {comic_id}", response.status));
+        return 0;
+    }
+    if response.body.is_empty() {
+        HostBridge::log(2, &format!("picacg cover empty body for {comic_id}"));
+        return 0;
+    }
+
+    // 写入 WASI guest path
+    if let Err(e) = std::fs::write(&guest_path, &response.body) {
+        HostBridge::log(2, &format!("picacg cover write failed for {comic_id}: {e}"));
+        return 0;
+    }
+
+    // 安装为 asset
+    match HostBridge::install_asset(&guest_path, &original_filename, content_type) {
+        Ok(asset_id) => {
+            let _ = HostBridge::task_kv_set(&cache_key, json!(asset_id));
+            asset_id
+        }
+        Err(e) => {
+            HostBridge::log(2, &format!("picacg cover install failed for {comic_id}: {e}"));
+            0
+        }
+    }
 }
 
 /// 解析 source 元数据：从 sourceId（source:picacgsource:{comic_id}）解析
@@ -954,7 +1099,14 @@ fn resolve_source_metadata(input: &PluginInput) -> Value {
     let title = comic.get("title").and_then(Value::as_str).unwrap_or("").to_string();
     let author = comic.get("author").and_then(Value::as_str).unwrap_or("").to_string();
     let description = comic.get("description").and_then(Value::as_str).unwrap_or("").to_string();
-    let cover_path = comic.get("cover").and_then(|c| c.get("path")).and_then(Value::as_str).unwrap_or("").to_string();
+    // picacg 封面在 thumb 字段（{fileServer, path, originalName}），不是 cover
+    let cover_url = if let Some(thumb) = comic.get("thumb") {
+        let file_server = thumb.get("fileServer").and_then(Value::as_str).unwrap_or("").trim_end_matches('/');
+        let path = thumb.get("path").and_then(Value::as_str).unwrap_or("").trim_start_matches('/');
+        if !file_server.is_empty() && !path.is_empty() {
+            format!("{file_server}/static/{path}")
+        } else { String::new() }
+    } else { String::new() };
     let mut tags = Vec::new();
     if let Some(cats) = comic.get("categories").and_then(Value::as_array) {
         for c in cats {
@@ -973,7 +1125,7 @@ fn resolve_source_metadata(input: &PluginInput) -> Value {
         Err(e) => return json!({"success": false, "error": format!("eps fetch: {e}")}),
     };
     if status != 200 {
-        return json!({"success": false, "error": format!("eps HTTP {status}")});
+        return json!({"success": false, "error": format!("eps HTTP {status} body={}", truncate_body(&eps_text))});
     }
 
     let parsed: Value = match serde_json::from_str(&eps_text) {
@@ -983,9 +1135,9 @@ fn resolve_source_metadata(input: &PluginInput) -> Value {
     let eps = parsed.get("data").and_then(|d| d.get("eps")).and_then(|e| e.get("docs"))
         .and_then(Value::as_array).cloned().unwrap_or_default();
 
-    let cover_url = if !cover_path.is_empty() {
-        format!("https://picaapi.picacomic.com{}", cover_path)
-    } else { String::new() };
+    // 下载封面并安装为 asset（带 task_kv 缓存），产出 cover_asset_id
+    HostBridge::progress(70, "处理封面...");
+    let cover_asset_id = resolve_cover_asset(&cover_url, &comic_id);
 
     if !eps.is_empty() {
         // 有多话 → archive children
@@ -1006,7 +1158,7 @@ fn resolve_source_metadata(input: &PluginInput) -> Value {
             "tags": Value::Array(tags),
             "children": children,
         });
-        if !cover_url.is_empty() { data["cover"] = json!(cover_url); }
+        if cover_asset_id > 0 { data["cover_asset_id"] = json!(cover_asset_id); }
         HostBridge::progress(100, "元数据获取完成");
         json!({"success": true, "data": data})
     } else {
@@ -1017,7 +1169,7 @@ fn resolve_source_metadata(input: &PluginInput) -> Value {
             Err(e) => return json!({"success": false, "error": format!("pages fetch: {e}")}),
         };
         if p_status != 200 {
-            return json!({"success": false, "error": format!("pages HTTP {p_status}")});
+            return json!({"success": false, "error": format!("pages HTTP {p_status} body={}", truncate_body(&p_text))});
         }
         let p_parsed: Value = match serde_json::from_str(&p_text) {
             Ok(v) => v,
@@ -1044,7 +1196,7 @@ fn resolve_source_metadata(input: &PluginInput) -> Value {
             "tags": Value::Array(tags),
             "children": children,
         });
-        if !cover_url.is_empty() { data["cover"] = json!(cover_url); }
+        if cover_asset_id > 0 { data["cover_asset_id"] = json!(cover_asset_id); }
         HostBridge::progress(100, "元数据获取完成");
         json!({"success": true, "data": data})
     }

@@ -600,7 +600,7 @@ fn picacg_headers(method: &str, path: &str, token: Option<&str>, nonce: &str, ti
         ("app-build-version".to_string(), "45".to_string()),
         ("Content-Type".to_string(), "application/json; charset=UTF-8".to_string()),
         ("user-agent".to_string(), "okhttp/3.8.1".to_string()),
-        ("version".to_string(), "v1.4.1".to_string()),
+        ("version".to_string(), "v1.5.4".to_string()),
         ("Host".to_string(), "picaapi.picacomic.com".to_string()),
         ("signature".to_string(), signature),
     ];
