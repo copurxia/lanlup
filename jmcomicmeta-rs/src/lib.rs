@@ -119,6 +119,8 @@ struct JmAuthData {
     #[serde(default)]
     api_domain: i64,
     #[serde(default)]
+    api_domains: Vec<String>,
+    #[serde(default)]
     image_stream: i64,
     #[serde(default)]
     bypass_url: String,
@@ -139,7 +141,6 @@ impl HostTcpStream {
         let mut stream = WasiTcpStream::connect((host, port)).map_err(|e| e.to_string())?;
         let _ = stream.as_mut().set_recv_timeout(Some(timeout));
         let _ = stream.as_mut().set_send_timeout(Some(timeout));
-        let _ = stream.set_nonblocking(true);
         Ok(Self { stream })
     }
 }
@@ -270,6 +271,22 @@ impl HostBridge {
             return Ok(None);
         }
         Ok(response.get("value").cloned())
+    }
+
+    fn task_kv_set(key: &str, value: Value) -> Result<(), String> {
+        Self::call("task_kv.set", json!({ "key": key, "value": value }))?;
+        Ok(())
+    }
+
+    fn install_asset(guest_path: &str, original_filename: &str, content_type: &str) -> Result<i64, String> {
+        let resp = Self::call("asset.install_from_file", json!({
+            "guest_path": guest_path,
+            "original_filename": original_filename,
+            "content_type": content_type,
+        }))?;
+        resp.get("asset_id")
+            .and_then(Value::as_i64)
+            .ok_or_else(|| "no asset_id in response".to_string())
     }
 }
 
@@ -421,6 +438,76 @@ fn build_result_payload(input: PluginInput) -> Value {
     }
 }
 
+/// 下载 JM 专辑封面并安装为 asset，返回 cover_asset_id（0 表示失败）。
+/// 带 task_kv 缓存（按 album_id），避免每次 resolve_metadata 都重下封面。
+/// 对齐 picacgmeta 的 `resolve_cover_asset`，但 JM 图床需要图片 header（Referer 等）。
+fn resolve_cover_asset(cover_url: &str, album_id: &str, bypass_url: &str) -> i64 {
+    if cover_url.trim().is_empty() {
+        return 0;
+    }
+
+    // 缓存命中则直接返回已安装的 asset_id
+    let cache_key = format!("jmcomic_cover_{album_id}");
+    if let Ok(Some(cached)) = HostBridge::task_kv_get(&cache_key) {
+        if let Some(id) = cached.as_i64() {
+            if id > 0 {
+                return id;
+            }
+        }
+    }
+
+    // 推断扩展名与 content_type（JM 封面默认 jpg）
+    let lower = cover_url.to_ascii_lowercase();
+    let ext = if lower.ends_with(".png") { "png" }
+        else if lower.ends_with(".gif") { "gif" }
+        else if lower.ends_with(".webp") { "webp" }
+        else { "jpg" };
+    let content_type = match ext {
+        "png" => "image/png",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        _ => "image/jpeg",
+    };
+    let guest_path = format!("/plugin/jm_cover_{album_id}.{ext}");
+    let original_filename = format!("cover_{album_id}.{ext}");
+
+    // 下载封面图片（JM 图床，需带 Referer/UA/X-Requested-With，对齐 jmcomicdl build_img_headers）
+    let headers = build_img_headers();
+    let response = match http_request_text("GET", cover_url, None, &headers, bypass_url) {
+        Ok(v) => v,
+        Err(e) => {
+            HostBridge::log(2, &format!("jmcomic cover download failed for {album_id}: {e}"));
+            return 0;
+        }
+    };
+    if response.status >= 400 {
+        HostBridge::log(2, &format!("jmcomic cover HTTP {} for {album_id}", response.status));
+        return 0;
+    }
+    if response.body.is_empty() {
+        HostBridge::log(2, &format!("jmcomic cover empty body for {album_id}"));
+        return 0;
+    }
+
+    // 写入 WASI guest path
+    if let Err(e) = std::fs::write(&guest_path, &response.body) {
+        HostBridge::log(2, &format!("jmcomic cover write failed for {album_id}: {e}"));
+        return 0;
+    }
+
+    // 安装为 asset
+    match HostBridge::install_asset(&guest_path, &original_filename, content_type) {
+        Ok(asset_id) => {
+            let _ = HostBridge::task_kv_set(&cache_key, json!(asset_id));
+            asset_id
+        }
+        Err(e) => {
+            HostBridge::log(2, &format!("jmcomic cover install failed for {album_id}: {e}"));
+            0
+        }
+    }
+}
+
 /// 解析 source 元数据：从 sourceId（source:jmcomicsource:{albumId}）解析专辑ID，
 /// 调 JM 专辑/章节 API 获取title/tags/cover，构建 archive 或 page children。
 fn resolve_source_metadata(input: &PluginInput) -> Value {
@@ -451,13 +538,20 @@ fn resolve_source_metadata(input: &PluginInput) -> Value {
         }
     };
 
+    // album 元数据（title/description/tags/cover）：仅在成功取到专辑时存在，
+    // 单话回退路径（album fetch 失败）下为空，与 picacg 始终先成功 fetch 再分支的行为对齐。
+    let mut album_title = String::new();
+    let mut album_description = String::new();
+    let mut album_tags = Value::Array(Vec::new());
+    let mut album_cover = String::new();
+
     // 1. 尝试获取专辑数据
     match fetch_album_json(&album_id, &api_base, &bypass_url) {
         Ok(album) => {
-            let title = album.get("name").and_then(Value::as_str).unwrap_or("").to_string();
-            let description = album.get("description").and_then(Value::as_str).unwrap_or("").to_string();
-            let tags = build_tags_from_album(&album);
-            let cover = if fetch_cover_setting {
+            album_title = album.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+            album_description = album.get("description").and_then(Value::as_str).unwrap_or("").to_string();
+            album_tags = build_tags_from_album(&album);
+            album_cover = if fetch_cover_setting {
                 format!("{}/media/albums/{}_3x4.jpg", image_base, album_id)
             } else { String::new() };
 
@@ -465,29 +559,51 @@ fn resolve_source_metadata(input: &PluginInput) -> Value {
             if let Some(series) = album.get("series").and_then(Value::as_array) {
                 if !series.is_empty() {
                     // 多话专辑 → archive children
-                    let children: Vec<Value> = series.iter().enumerate().filter_map(|(idx, item)| {
+                    HostBridge::progress(70, "处理封面...");
+                    let cover_asset_id = resolve_cover_asset(&album_cover, &album_id, &bypass_url);
+
+                    // 对齐 venera jm.js：按 sort 升序排序，title 空时用 第{sort}話，sort_order 用 sort 值。
+                    let mut sorted: Vec<&Value> = series.iter().collect();
+                    sorted.sort_by_key(|item| {
+                        item.get("sort")
+                            .and_then(Value::as_i64)
+                            .or_else(|| item.get("sort").and_then(Value::as_str).and_then(|s| s.parse::<i64>().ok()))
+                            .unwrap_or(0)
+                    });
+
+                    let children: Vec<Value> = sorted.iter().enumerate().filter_map(|(idx, item)| {
                         let ep_id = value_to_id_string(item.get("id"));
                         if ep_id.is_empty() { return None; }
                         let ep_name = item.get("name").and_then(Value::as_str).unwrap_or("").trim().to_string();
+                        let ep_sort = item.get("sort")
+                            .and_then(Value::as_i64)
+                            .or_else(|| item.get("sort").and_then(Value::as_str).and_then(|s| s.parse::<i64>().ok()))
+                            .unwrap_or((idx + 1) as i64);
+                        // name 空时用 第{sort}話（对齐 venera jm.js:781），而非 第{id}話
                         let display_name = if ep_name.is_empty() {
-                            format!("第{}話", ep_id)
+                            format!("第{}話", ep_sort)
                         } else { ep_name };
-                        Some(json!({
+                        let mut child = json!({
                             "entity_type": "archive",
                             "entity_id": format!("source:jmcomicsource:{}", ep_id),
                             "title": display_name,
-                            "sort_order": (idx + 1) as i64,
-                        }))
+                            "sort_order": ep_sort,
+                        });
+                        // 每个档案复用合集封面（对齐 picacgmeta）
+                        if cover_asset_id > 0 {
+                            child["assets"] = json!({ "cover": cover_asset_id });
+                        }
+                        Some(child)
                     }).collect();
 
                     let mut data = json!({
-                        "title": title,
-                        "description": description,
-                        "tags": tags,
+                        "title": album_title,
+                        "description": album_description,
+                        "tags": album_tags,
                         "children": children,
                     });
-                    if !cover.is_empty() {
-                        data["cover"] = json!(cover);
+                    if cover_asset_id > 0 {
+                        data["cover_asset_id"] = json!(cover_asset_id);
                     }
                     HostBridge::progress(100, "元数据获取完成");
                     return json!({"success": true, "data": data});
@@ -520,9 +636,19 @@ fn resolve_source_metadata(input: &PluginInput) -> Value {
         })
     }).collect();
 
-    let data = json!({
+    // 单话档案同样补全 title/description/tags/cover_asset_id（对齐 picacg build_single_ep_result）
+    HostBridge::progress(70, "处理封面...");
+    let cover_asset_id = resolve_cover_asset(&album_cover, &album_id, &bypass_url);
+
+    let mut data = json!({
+        "title": album_title,
+        "description": album_description,
+        "tags": album_tags,
         "children": children,
     });
+    if cover_asset_id > 0 {
+        data["cover_asset_id"] = json!(cover_asset_id);
+    }
 
     HostBridge::progress(100, "元数据获取完成");
     json!({"success": true, "data": data})
@@ -873,14 +999,33 @@ fn build_jm_headers(time: u64) -> Vec<(String, String)> {
     ]
 }
 
+/// JM 图片 CDN 请求头（对齐 jmcomicdl build_img_headers / venera getImgHeaders）。
+/// JM 图床要求带 Referer/UA/X-Requested-With，否则可能 403。
+fn build_img_headers() -> Vec<(String, String)> {
+    vec![
+        ("Accept".to_string(), "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8".to_string()),
+        ("Accept-Language".to_string(), "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7".to_string()),
+        ("Connection".to_string(), "keep-alive".to_string()),
+        ("Referer".to_string(), "https://localhost/".to_string()),
+        ("User-Agent".to_string(), USER_AGENT.to_string()),
+        ("X-Requested-With".to_string(), JM_PKG_NAME.to_string()),
+    ]
+}
+
 fn resolve_api_base(params: &Value, auth: &JmAuthData) -> String {
     let index = if auth.api_domain > 0 {
         auth.api_domain
     } else {
         read_int_param(params, "api_domain", 1)
     };
-    let chosen = clamp_index(index, API_DOMAINS.len());
-    format!("https://{}", API_DOMAINS[chosen])
+    let chosen = clamp_index(index, 4);
+    // 优先用 login 插件刷新来的动态域名，空则回退硬编码 API_DOMAINS。
+    if !auth.api_domains.is_empty() {
+        let i = chosen.min(auth.api_domains.len() - 1);
+        format!("https://{}", auth.api_domains[i])
+    } else {
+        format!("https://{}", API_DOMAINS[chosen])
+    }
 }
 
 fn resolve_image_base(
@@ -1329,11 +1474,13 @@ fn parse_http_response(raw: &[u8]) -> Result<HttpResponse, String> {
         rest.to_vec()
     };
 
-    let text = String::from_utf8_lossy(&body).to_string();
+    // 直接保留原始字节（Vec<u8>），不做 from_utf8_lossy 转换：
+    // 二进制内容（如封面图片）的字节会被 replacement char (U+FFFD) 污染。
+    // 文本响应（JSON 均为合法 UTF-8）不受影响，由调用方按需 from_utf8。
     Ok(HttpResponse {
         status,
         headers,
-        body: text.into_bytes(),
+        body,
     })
 }
 

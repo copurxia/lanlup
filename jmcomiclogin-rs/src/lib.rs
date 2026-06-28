@@ -34,6 +34,13 @@ const AUTH_DATA_KEY: &str = "__lanlu.phase.jmcomiclogin.data";
 const HTTP_TIMEOUT_MS: i32 = 15000;
 const MAX_REDIRECTS: usize = 5;
 
+// 动态 API 域名刷新（对齐 venera jm.js refreshApiDomains）。
+// 从字节跳动对象存储拉取加密的域名列表，用 DOMAIN_SECRET 解密，取前 4 项。
+const DOMAIN_LIST_URL: &str = "https://rup4a04-c02.tos-cn-hongkong.bytepluses.com/newsvr-2025.txt";
+const DOMAIN_SECRET: &str = "diosfjckwpqpdfjkvnqQjsik";
+const DOMAIN_CACHE_KEY: &str = "__lanlu.phase.jmcomiclogin.domains";
+const DOMAIN_CACHE_TTL_SECS: u64 = 6 * 60 * 60;
+
 #[cfg(target_arch = "wasm32")]
 #[link(wasm_import_module = "wasmedge_host")]
 extern "C" {
@@ -135,7 +142,6 @@ impl HostTcpStream {
         let mut stream = WasiTcpStream::connect((host, port)).map_err(|e| e.to_string())?;
         let _ = stream.as_mut().set_recv_timeout(Some(timeout));
         let _ = stream.as_mut().set_send_timeout(Some(timeout));
-        let _ = stream.set_nonblocking(true);
         Ok(Self { stream })
     }
 }
@@ -263,6 +269,15 @@ impl HostBridge {
             .and_then(Value::as_bool)
             .unwrap_or(false))
     }
+
+    fn task_kv_get(key: &str) -> Result<Option<Value>, String> {
+        let response = Self::call("task_kv.get", json!({ "key": key }))?;
+        let found = response.get("found").and_then(Value::as_bool).unwrap_or(false);
+        if !found {
+            return Ok(None);
+        }
+        Ok(response.get("value").cloned())
+    }
 }
 
 unsafe fn read_guest_bytes(ptr: i32, len: i32) -> &'static [u8] {
@@ -366,6 +381,7 @@ fn plugin_info_json() -> Value {
         "permissions": [
             "log.write",
             "progress.report",
+            "task_kv.read",
             "task_kv.write",
             "tcp.connect"
         ],
@@ -378,8 +394,13 @@ fn execute_plugin(params: Value) -> Value {
     let username = read_string_param(&params, "username");
     let password = read_string_param(&params, "password");
 
+    // 刷新动态 API 域名（对齐 venera refreshApiDomains）。失败回退硬编码域名，不阻塞登录。
+    HostBridge::progress(15, "刷新 JM API 域名...");
+    let api_domains = refresh_api_domains();
+    HostBridge::progress(20, "JM API 域名就绪");
+
     if username.is_empty() && password.is_empty() {
-        let data = guest_auth_data(&params);
+        let data = guest_auth_data(&params, &api_domains);
         return match HostBridge::task_kv_set(AUTH_DATA_KEY, data.clone()) {
             Ok(true) => json!({ "success": true, "data": data }),
             Ok(false) => {
@@ -396,7 +417,7 @@ fn execute_plugin(params: Value) -> Value {
     }
 
     HostBridge::progress(30, "正在登录 JM Comic...");
-    let result = do_login(&username, &password, &params);
+    let result = do_login(&username, &password, &params, &api_domains);
     HostBridge::progress(100, "登录处理完成");
 
     match result {
@@ -413,19 +434,20 @@ fn execute_plugin(params: Value) -> Value {
     }
 }
 
-fn guest_auth_data(params: &Value) -> Value {
+fn guest_auth_data(params: &Value, api_domains: &[String]) -> Value {
     json!({
         "uid": "",
         "username": "",
         "mode": "guest",
         "api_domain": read_int_param(params, "api_domain", 1),
+        "api_domains": api_domains,
         "image_stream": read_int_param(params, "image_stream", 1),
         "bypass_url": read_string_param(params, "bypass_url"),
         "message": "JM Comic guest mode configured."
     })
 }
 
-fn do_login(username: &str, password: &str, params: &Value) -> Result<Value, String> {
+fn do_login(username: &str, password: &str, params: &Value, api_domains: &[String]) -> Result<Value, String> {
     let api_base = resolve_api_base(params);
     let bypass_url = read_string_param(params, "bypass_url");
     let time = current_timestamp();
@@ -482,6 +504,7 @@ fn do_login(username: &str, password: &str, params: &Value) -> Result<Value, Str
         "username": username,
         "mode": "cookie",
         "api_domain": read_int_param(params, "api_domain", 1),
+        "api_domains": api_domains,
         "image_stream": read_int_param(params, "image_stream", 1),
         "bypass_url": read_string_param(params, "bypass_url"),
         "message": "Successfully logged in to JM Comic."
@@ -528,6 +551,97 @@ fn resolve_api_base(params: &Value) -> String {
     let index = read_int_param(params, "api_domain", 1);
     let chosen = clamp_index(index, API_DOMAINS.len());
     format!("https://{}", API_DOMAINS[chosen])
+}
+
+/// 刷新 JM API 域名列表（对齐 venera jm.js refreshApiDomains）。
+///
+/// 从字节跳动对象存储拉取加密的 `newsvr-2025.txt`，用 DOMAIN_SECRET 调
+/// `jm_decrypt`（AES-256-ECB）解密，取 JSON `Server` 前 4 项。失败回退硬编码
+/// `API_DOMAINS`。带 6 小时 task_kv 缓存，避免每次 pre-hook 都重拉。
+fn refresh_api_domains() -> Vec<String> {
+    let now = current_timestamp();
+
+    // 1. 缓存命中且未过期则直接返回
+    if let Ok(Some(cached)) = HostBridge::task_kv_get(DOMAIN_CACHE_KEY) {
+        let ts = cached.get("ts").and_then(Value::as_u64).unwrap_or(0);
+        let fresh = ts > 0 && now.saturating_sub(ts) < DOMAIN_CACHE_TTL_SECS;
+        if fresh {
+            if let Some(arr) = cached.get("domains").and_then(Value::as_array) {
+                let domains: Vec<String> = arr
+                    .iter()
+                    .filter_map(|v| v.as_str().map(|s| s.trim().to_string()))
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if !domains.is_empty() {
+                    return domains;
+                }
+            }
+        }
+    }
+
+    // 2. 拉取加密域名列表（baseHeaders，无需 JM token）
+    let headers = vec![
+        ("Accept".to_string(), "*/*".to_string()),
+        ("Accept-Language".to_string(), "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7".to_string()),
+        ("Connection".to_string(), "close".to_string()),
+        ("Origin".to_string(), "https://localhost".to_string()),
+        ("Referer".to_string(), "https://localhost/".to_string()),
+        ("User-Agent".to_string(), USER_AGENT.to_string()),
+        ("X-Requested-With".to_string(), JM_PKG_NAME.to_string()),
+    ];
+    let fallback = API_DOMAINS.iter().map(|s| s.to_string()).collect();
+    let response = match http_request_text("GET", DOMAIN_LIST_URL, None, &headers, "") {
+        Ok(v) => v,
+        Err(e) => {
+            HostBridge::log(1, &format!("jmcomic domain refresh fetch failed: {e}"));
+            return fallback;
+        }
+    };
+    if response.status != 200 || response.body.is_empty() {
+        HostBridge::log(1, &format!("jmcomic domain refresh HTTP {} (empty={})", response.status, response.body.is_empty()));
+        return fallback;
+    }
+
+    // 3. 解密并解析 Server 数组
+    // 响应体是带 UTF-8 BOM 的 base64 文本，BOM 会令 base64_decode 失败，需先剥除。
+    let mut body_text = String::from_utf8_lossy(&response.body).to_string();
+    if body_text.starts_with('\u{feff}') {
+        body_text = body_text[3..].to_string();
+    }
+    let decrypted = match jm_decrypt(body_text.trim(), DOMAIN_SECRET) {
+        Ok(v) => v,
+        Err(e) => {
+            HostBridge::log(1, &format!("jmcomic domain refresh decrypt failed: {e}"));
+            return fallback;
+        }
+    };
+    let parsed: Value = match serde_json::from_str(&decrypted) {
+        Ok(v) => v,
+        Err(e) => {
+            HostBridge::log(1, &format!("jmcomic domain refresh parse failed: {e}"));
+            return fallback;
+        }
+    };
+    let servers: Vec<String> = parsed
+        .get("Server")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .take(4)
+                .filter_map(|v| v.as_str().map(|s| s.trim().to_string()))
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let domains = if servers.is_empty() { fallback } else { servers };
+
+    // 4. 写缓存
+    let _ = HostBridge::task_kv_set(
+        DOMAIN_CACHE_KEY,
+        json!({ "domains": domains, "ts": now }),
+    );
+    domains
 }
 
 fn clamp_index(index: i64, len: usize) -> usize {
@@ -963,11 +1077,13 @@ fn parse_http_response(raw: &[u8]) -> Result<HttpResponse, String> {
         rest.to_vec()
     };
 
-    let text = String::from_utf8_lossy(&body).to_string();
+    // 直接保留原始字节（Vec<u8>），不做 from_utf8_lossy 转换：
+    // 二进制内容（如加密的域名列表 newsvr-2025.txt）的字节会被 replacement char (U+FFFD) 污染。
+    // 文本响应（JSON / base64 均为合法 UTF-8）不受影响，由调用方按需 from_utf8。
     Ok(HttpResponse {
         status,
         headers,
-        body: text.into_bytes(),
+        body,
     })
 }
 

@@ -119,6 +119,8 @@ struct JmAuthData {
     #[serde(default)]
     api_domain: i64,
     #[serde(default)]
+    api_domains: Vec<String>,
+    #[serde(default)]
     image_stream: i64,
     #[serde(default)]
     bypass_url: String,
@@ -139,7 +141,6 @@ impl HostTcpStream {
         let mut stream = WasiTcpStream::connect((host, port)).map_err(|e| e.to_string())?;
         let _ = stream.as_mut().set_recv_timeout(Some(timeout));
         let _ = stream.as_mut().set_send_timeout(Some(timeout));
-        let _ = stream.set_nonblocking(true);
         Ok(Self { stream })
     }
 }
@@ -873,8 +874,14 @@ fn resolve_api_base(params: &Value, auth: &JmAuthData) -> String {
     } else {
         read_int_param(params, "api_domain", 1)
     };
-    let chosen = clamp_index(index, API_DOMAINS.len());
-    format!("https://{}", API_DOMAINS[chosen])
+    let chosen = clamp_index(index, 4);
+    // 优先用 login 插件刷新来的动态域名，空则回退硬编码 API_DOMAINS。
+    if !auth.api_domains.is_empty() {
+        let i = chosen.min(auth.api_domains.len() - 1);
+        format!("https://{}", auth.api_domains[i])
+    } else {
+        format!("https://{}", API_DOMAINS[chosen])
+    }
 }
 
 fn resolve_bypass_url(params: &Value, auth: &JmAuthData) -> String {
@@ -1112,12 +1119,9 @@ fn http_request_text(
     headers: &[(String, String)],
     bypass_url: &str,
 ) -> Result<HttpResponse, String> {
-    let resp = http_request(method, url, body, headers, bypass_url)?;
-    Ok(HttpResponse {
-        status: resp.status,
-        headers: resp.headers,
-        body: String::from_utf8_lossy(&resp.body).to_string().into_bytes(),
-    })
+    // 底层 http_request 已返回原始 Vec<u8>，这里直接透传，不做 from_utf8_lossy，
+    // 以免损坏二进制内容（如加密的 API 响应、图片字节）。文本由调用方按需 from_utf8。
+    http_request(method, url, body, headers, bypass_url)
 }
 
 fn http_request_bytes(
