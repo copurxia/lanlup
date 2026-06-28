@@ -1015,20 +1015,40 @@ fn run_download(input: &PluginInput) -> Value {
     })
 }
 
-/// resolve_page_asset action：path = "{comic_id}/{page_num}"，下载图片返回二进制
+/// resolve_page_asset action：path 形态（按宽窄兼容）：
+/// - 新形态: "{comic_id}/{ep_order}/{page_num}"   ← 三段，对齐 metadata 插件 page child 的 path
+/// - 旧形态: "{comic_id}/{page_num}"               ← 两段，ep_order 缺省取第一话
+///
+/// 不再写死「取第一话」——ep_order 直接从 path 取,与 picacg-qt 的
+/// `GetComicsBookOrderReq(bookId, epsId=order, page)` 三参数定位一致。
 fn resolve_page_asset(input: &PluginInput) -> Vec<u8> {
     let path = input.path.trim();
     if path.is_empty() {
         return build_binary_response(&output_err("path is required"), &[]);
     }
     let parts: Vec<&str> = path.split('/').collect();
-    if parts.len() < 2 {
+
+    // 兼容旧的两段 path: "{comic_id}/{page_num}" → ep_order 默认为 1
+    let (comic_id, ep_order, page_num): (&str, i64, usize) = if parts.len() >= 3 {
+        let cid = parts[0];
+        let order: i64 = match parts[1].parse() {
+            Ok(o) if o >= 1 => o,
+            _ => return build_binary_response(&output_err(&format!("invalid ep_order in path: {path}")), &[]),
+        };
+        let pn: usize = match parts[2].parse() {
+            Ok(n) if n >= 1 => n,
+            _ => return build_binary_response(&output_err(&format!("invalid page: {path}")), &[]),
+        };
+        (cid, order, pn)
+    } else if parts.len() == 2 {
+        let cid = parts[0];
+        let pn: usize = match parts[1].parse() {
+            Ok(n) if n >= 1 => n,
+            _ => return build_binary_response(&output_err(&format!("invalid page: {path}")), &[]),
+        };
+        (cid, 1i64, pn)
+    } else {
         return build_binary_response(&output_err(&format!("invalid path: {path}")), &[]);
-    }
-    let comic_id = parts[0];
-    let page_num: usize = match parts[1].parse() {
-        Ok(n) if n >= 1 => n,
-        _ => return build_binary_response(&output_err(&format!("invalid page: {path}")), &[]),
     };
 
     let auth = match load_picacg_auth() {
@@ -1036,29 +1056,7 @@ fn resolve_page_asset(input: &PluginInput) -> Vec<u8> {
         Err(e) => return build_binary_response(&output_err(&e), &[]),
     };
 
-    // 获取第一话的页面列表
-    let eps_path = format!("comics/{comic_id}/eps?page=1");
-    let (status, eps_text) = match picacg_get(&eps_path, &auth) {
-        Ok(v) => v,
-        Err(e) => return build_binary_response(&output_err(&format!("eps: {e}")), &[]),
-    };
-    if status != 200 {
-        return build_binary_response(&output_err(&format!("eps HTTP {status}")), &[]);
-    }
-    let eps_parsed: Value = match serde_json::from_str(&eps_text) {
-        Ok(v) => v,
-        Err(e) => return build_binary_response(&output_err(&format!("eps JSON: {e}")), &[]),
-    };
-    let first_ep = eps_parsed.get("data").and_then(|d| d.get("eps"))
-        .and_then(|e| e.get("docs")).and_then(Value::as_array)
-        .and_then(|arr| arr.first()).cloned();
-
-    let ep_order = match first_ep {
-        Some(ref ep) => ep.get("order").and_then(Value::as_i64).unwrap_or(1),
-        None => 1i64,
-    };
-
-    // 获取指定页
+    // ep_order 已由 path 给出,无需再请求 eps 列表去取第一话。
     let pages_path = format!("comics/{comic_id}/order/{ep_order}/pages?page={}", (page_num - 1) / 50 + 1);
     let (p_status, p_text) = match picacg_get(&pages_path, &auth) {
         Ok(v) => v,

@@ -1076,14 +1076,41 @@ fn resolve_cover_asset(cover_url: &str, comic_id: &str) -> i64 {
     }
 }
 
-/// 解析 source 元数据：从 sourceId（source:picacgsource:{comic_id}）解析
+/// 解析 source targetId。
+///
+/// 支持两种形态：
+/// - `source:picacgsource:{comic_id}`           → 顶层合集，返回 (comic_id, None)，按合集/单章策略处理
+/// - `source:picacgsource:{comic_id}:ep{order}`  → 单章阅读叶节点，返回 (comic_id, Some(order))，直接产出 page children
+///
+/// picacg-qt 中章节用 (bookId, order) 双参数定位（`req.GetComicsBookOrderReq(bookId, epsId, page)`），
+/// 这里把 `:ep{order}` 视为独立维度而非拼进 comic_id。
+fn parse_picacg_source_target(target_id: &str) -> Option<(String, Option<i64>)> {
+    let id = target_id.strip_prefix("source:picacgsource:")?.trim();
+    if id.is_empty() {
+        return None;
+    }
+    if let Some((cid, ep)) = id.rsplit_once(":ep") {
+        if let Ok(order) = ep.trim().parse::<i64>() {
+            let comic_id = cid.trim().to_string();
+            if !comic_id.is_empty() {
+                return Some((comic_id, Some(order)));
+            }
+        }
+    }
+    Some((id.to_string(), None))
+}
+
+/// 解析 source 元数据：从 sourceId（source:picacgsource:{comic_id} 或 source:picacgsource:{comic_id}:ep{order}）解析
 fn resolve_source_metadata(input: &PluginInput) -> Value {
     HostBridge::progress(5, "解析 sourceId...");
     let target_id = input.target_id.trim();
-    let comic_id = match target_id.strip_prefix("source:picacgsource:") {
-        Some(id) if !id.is_empty() => id.trim().to_string(),
-        _ => return json!({"success": false, "error": format!("invalid sourceId: {target_id}")}),
+    let (comic_id, ep_order_opt) = match parse_picacg_source_target(target_id) {
+        Some(v) => v,
+        None => return json!({"success": false, "error": format!("invalid sourceId: {target_id}")}),
     };
+    if comic_id.is_empty() {
+        return json!({"success": false, "error": format!("invalid sourceId: {target_id}")});
+    }
 
     let auth = match load_picacg_auth() {
         Ok(v) => v,
@@ -1117,7 +1144,16 @@ fn resolve_source_metadata(input: &PluginInput) -> Value {
     }
     if !author.is_empty() { tags.push(Value::String(format!("author:{author}"))); }
 
-    // 获取章节列表
+    // 下载封面并安装为 asset（带 task_kv 缓存），产出 cover_asset_id
+    HostBridge::progress(70, "处理封面...");
+    let cover_asset_id = resolve_cover_asset(&cover_url, &comic_id);
+
+    // 单章阅读叶节点（source:picacgsource:{comic_id}:ep{order}）：直接产出 page children
+    if let Some(ep_order) = ep_order_opt {
+        return build_single_ep_result(&comic_id, ep_order, &title, &description, tags, cover_asset_id, &auth);
+    }
+
+    // 顶层合集：需要先获取章节列表来判断走多话合集还是单话直出
     HostBridge::progress(50, "获取章节列表...");
     let eps_path = format!("comics/{comic_id}/eps?page=1");
     let (status, eps_text) = match picacg_get(&eps_path, &auth) {
@@ -1134,10 +1170,6 @@ fn resolve_source_metadata(input: &PluginInput) -> Value {
     };
     let eps = parsed.get("data").and_then(|d| d.get("eps")).and_then(|e| e.get("docs"))
         .and_then(Value::as_array).cloned().unwrap_or_default();
-
-    // 下载封面并安装为 asset（带 task_kv 缓存），产出 cover_asset_id
-    HostBridge::progress(70, "处理封面...");
-    let cover_asset_id = resolve_cover_asset(&cover_url, &comic_id);
 
     if !eps.is_empty() {
         // 有多话 → archive children
@@ -1162,44 +1194,66 @@ fn resolve_source_metadata(input: &PluginInput) -> Value {
         HostBridge::progress(100, "元数据获取完成");
         json!({"success": true, "data": data})
     } else {
-        // 无多话 → page children（comic 本身就是单话）
-        let pages_path = format!("comics/{comic_id}/order/1/pages?page=1");
-        let (p_status, p_text) = match picacg_get(&pages_path, &auth) {
-            Ok(v) => v,
-            Err(e) => return json!({"success": false, "error": format!("pages fetch: {e}")}),
-        };
-        if p_status != 200 {
-            return json!({"success": false, "error": format!("pages HTTP {p_status} body={}", truncate_body(&p_text))});
-        }
-        let p_parsed: Value = match serde_json::from_str(&p_text) {
-            Ok(v) => v,
-            Err(e) => return json!({"success": false, "error": format!("pages JSON: {e}")}),
-        };
-        let total_pages = p_parsed.get("data")
-            .and_then(|d| d.get("pages")).and_then(|p| p.get("pages"))
-            .and_then(Value::as_i64).unwrap_or(0);
-
-        let children: Vec<Value> = (1..=total_pages).map(|pn| {
-            json!({
-                "entity_type": "page",
-                "entity_id": format!("source:picacgsource:{}#page:{}", comic_id, pn),
-                "title": "",
-                "sort_order": pn,
-                "path": format!("{}/{}", comic_id, pn),
-                "media_type": "image",
-            })
-        }).collect();
-
-        let mut data = json!({
-            "title": title,
-            "description": description,
-            "tags": Value::Array(tags),
-            "children": children,
-        });
-        if cover_asset_id > 0 { data["cover_asset_id"] = json!(cover_asset_id); }
-        HostBridge::progress(100, "元数据获取完成");
-        json!({"success": true, "data": data})
+        // 无多话 → page children（comic 本身就是单话，等价于 ep_order=1）
+        build_single_ep_result(&comic_id, 1i64, &title, &description, tags, cover_asset_id, &auth)
     }
+}
+
+/// 构造单章 page children 结果。
+/// path 形如 `{comic_id}/{ep_order}/{page_num}`，entity_id 形如 `source:picacgsource:{comic_id}:ep{order}#page:{pn}`，
+/// 确保 download/source 插件能从 path 中还原 (comic_id, ep_order, page_num) 三维定位，
+/// 而不再写死取第一话（对齐 picacg-qt 的 `GetComicsBookOrderReq(bookId, epsId, page)`）。
+fn build_single_ep_result(
+    comic_id: &str,
+    ep_order: i64,
+    title: &str,
+    description: &str,
+    tags: Vec<Value>,
+    cover_asset_id: i64,
+    auth: &PicacgAuthData,
+) -> Value {
+    let pages_path = format!("comics/{comic_id}/order/{ep_order}/pages?page=1");
+    let (p_status, p_text) = match picacg_get(&pages_path, auth) {
+        Ok(v) => v,
+        Err(e) => return json!({"success": false, "error": format!("pages fetch: {e}")}),
+    };
+    if p_status != 200 {
+        return json!({"success": false, "error": format!("pages HTTP {p_status} body={}", truncate_body(&p_text))});
+    }
+    let p_parsed: Value = match serde_json::from_str(&p_text) {
+        Ok(v) => v,
+        Err(e) => return json!({"success": false, "error": format!("pages JSON: {e}")}),
+    };
+
+    // 章节总页数优先用 pages.pages；为 0 时退化为本页 docs 数量，避免空白章节导致的 0 页
+    let docs_count = p_parsed.get("data")
+        .and_then(|d| d.get("pages")).and_then(|p| p.get("docs"))
+        .and_then(Value::as_array).map(|a| a.len() as i64).unwrap_or(0);
+    let total_pages = p_parsed.get("data")
+        .and_then(|d| d.get("pages")).and_then(|p| p.get("pages"))
+        .and_then(Value::as_i64).unwrap_or(0);
+    let total_pages = if total_pages > 0 { total_pages } else { docs_count };
+
+    let children: Vec<Value> = (1..=total_pages).map(|pn| {
+        json!({
+            "entity_type": "page",
+            "entity_id": format!("source:picacgsource:{}:ep{}#page:{}", comic_id, ep_order, pn),
+            "title": "",
+            "sort_order": pn,
+            "path": format!("{}/{}/{}", comic_id, ep_order, pn),
+            "media_type": "image",
+        })
+    }).collect();
+
+    let mut data = json!({
+        "title": title,
+        "description": description,
+        "tags": Value::Array(tags),
+        "children": children,
+    });
+    if cover_asset_id > 0 { data["cover_asset_id"] = json!(cover_asset_id); }
+    HostBridge::progress(100, "元数据获取完成");
+    json!({"success": true, "data": data})
 }
 
 fn build_result_payload(input: PluginInput) -> Value {

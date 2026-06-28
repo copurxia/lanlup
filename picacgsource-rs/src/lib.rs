@@ -976,8 +976,30 @@ fn run_source_download(input: &PluginInput) -> Value {
     }))
 }
 
+/// 把 remote_id 拆成 (comic_id, ep_order)。
+/// remote_id 可能为:
+///   - "{comic_id}"              → 顶层合集, ep_order=None(后续回退到第一话)
+///   - "{comic_id}:ep{order}"     → 单章引用, ep_order=Some(order)
+/// 与 picacg-qt 的 `GetComicsBookOrderReq(bookId, epsId=order, page)` 三参数定位对齐。
+fn split_remote_id_ep(remote_id: &str) -> (String, Option<i64>) {
+    let id = remote_id.trim();
+    if let Some((cid, ep)) = id.rsplit_once(":ep") {
+        if let Ok(order) = ep.trim().parse::<i64>() {
+            let comic_id = cid.trim().to_string();
+            if !comic_id.is_empty() {
+                return (comic_id, Some(order));
+            }
+        }
+    }
+    (id.to_string(), None)
+}
+
 fn run_source_reader(input: &PluginInput) -> Value {
-    let comic_id = extract_remote_id(&input.params);
+    let raw_remote_id = extract_remote_id(&input.params);
+    if raw_remote_id.is_empty() {
+        return output_err("remote_id (comic_id) is required for reader");
+    }
+    let (comic_id, ep_order_opt) = split_remote_id_ep(&raw_remote_id);
     if comic_id.is_empty() {
         return output_err("remote_id (comic_id) is required for reader");
     }
@@ -987,13 +1009,14 @@ fn run_source_reader(input: &PluginInput) -> Value {
         Err(e) => return output_err(&e),
     };
 
-    HostBridge::progress(10, "加载章节...");
-
-    let ep_order = match get_first_ep_order(&comic_id, &auth) {
-        Ok(v) => v,
-        Err(e) => {
-            HostBridge::log(1, &format!("picacgsource failed to get first ep order: {e}, fallback to 1"));
-            1
+    let ep_order = match ep_order_opt {
+        Some(order) => order,
+        None => match get_first_ep_order(&comic_id, &auth) {
+            Ok(v) => v,
+            Err(e) => {
+                HostBridge::log(1, &format!("picacgsource failed to get first ep order: {e}, fallback to 1"));
+                1
+            }
         }
     };
 
