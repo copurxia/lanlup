@@ -1172,16 +1172,20 @@ fn resolve_source_metadata(input: &PluginInput) -> Value {
         .and_then(Value::as_array).cloned().unwrap_or_default();
 
     if !eps.is_empty() {
-        // 有多话 → archive children
+        // 有多话 → archive children（每个档案复用合集封面）
         let children: Vec<Value> = eps.iter().enumerate().map(|(idx, e)| {
             let ep_title = e.get("title").and_then(Value::as_str).unwrap_or("").to_string();
             let ep_order = e.get("order").and_then(Value::as_i64).unwrap_or((idx + 1) as i64);
-            json!({
+            let mut child = json!({
                 "entity_type": "archive",
                 "entity_id": format!("source:picacgsource:{}:ep{}", comic_id, ep_order),
                 "title": if ep_title.is_empty() { format!("第{}話", idx + 1) } else { ep_title },
                 "sort_order": ep_order,
-            })
+            });
+            if cover_asset_id > 0 {
+                child["assets"] = json!({ "cover": cover_asset_id });
+            }
+            child
         }).collect();
 
         let mut data = json!({
@@ -1225,13 +1229,19 @@ fn build_single_ep_result(
         Err(e) => return json!({"success": false, "error": format!("pages JSON: {e}")}),
     };
 
-    // 章节总页数优先用 pages.pages；为 0 时退化为本页 docs 数量，避免空白章节导致的 0 页
+    // picacg 的 pages 字段结构（对照 picacg-qt book.py:221-224）：
+    //   total = 图片总数（真正的页数）
+    //   pages = API 分页总页数（每页 limit=40 张），≠ 图片总数
+    //   limit = 每页条数（40）
+    //   docs  = 本分页的图片数组
+    // 此前误用 pages.pages（分页数）当总页数，导致 40 页漫画只显示 1 页。
     let docs_count = p_parsed.get("data")
         .and_then(|d| d.get("pages")).and_then(|p| p.get("docs"))
         .and_then(Value::as_array).map(|a| a.len() as i64).unwrap_or(0);
     let total_pages = p_parsed.get("data")
-        .and_then(|d| d.get("pages")).and_then(|p| p.get("pages"))
+        .and_then(|d| d.get("pages")).and_then(|p| p.get("total"))
         .and_then(Value::as_i64).unwrap_or(0);
+    // total 为 0 时退化为本页 docs 数量，避免空白章节返回 0 页
     let total_pages = if total_pages > 0 { total_pages } else { docs_count };
 
     let children: Vec<Value> = (1..=total_pages).map(|pn| {

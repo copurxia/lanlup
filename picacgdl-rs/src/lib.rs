@@ -1056,8 +1056,9 @@ fn resolve_page_asset(input: &PluginInput) -> Vec<u8> {
         Err(e) => return build_binary_response(&output_err(&e), &[]),
     };
 
-    // ep_order 已由 path 给出,无需再请求 eps 列表去取第一话。
-    let pages_path = format!("comics/{comic_id}/order/{ep_order}/pages?page={}", (page_num - 1) / 50 + 1);
+    // picacg 每页 limit=40（对照 picacg-qt book.py:224），此前误用 50 导致跨页取图错位。
+    let picacg_page_limit: usize = 40;
+    let pages_path = format!("comics/{comic_id}/order/{ep_order}/pages?page={}", (page_num - 1) / picacg_page_limit + 1);
     let (p_status, p_text) = match picacg_get(&pages_path, &auth) {
         Ok(v) => v,
         Err(e) => return build_binary_response(&output_err(&format!("pages: {e}")), &[]),
@@ -1073,7 +1074,7 @@ fn resolve_page_asset(input: &PluginInput) -> Vec<u8> {
         .and_then(|p| p.get("docs")).and_then(Value::as_array)
         .cloned().unwrap_or_default();
 
-    let page_idx_in_doc = ((page_num - 1) % 50) as usize;
+    let page_idx_in_doc = ((page_num - 1) % picacg_page_limit) as usize;
     let page_doc = docs.get(page_idx_in_doc);
     let image_url = match page_doc.and_then(|d| build_image_url(d)) {
         Some(url) => url,
