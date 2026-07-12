@@ -5,11 +5,11 @@ use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::{json, Map, Value};
 use std::alloc::{alloc, dealloc, Layout};
 use std::cell::RefCell;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::slice;
-use std::time::{SystemTime, UNIX_EPOCH};
+use data_encoding::BASE64;
 
 #[cfg(target_arch = "wasm32")]
 #[link(wasm_import_module = "wasmedge_host")]
@@ -93,20 +93,6 @@ struct ArchiveFilesResponse {
     files: Vec<String>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
-struct ExportedFileItem {
-    #[serde(default)]
-    source: String,
-    #[serde(default)]
-    relative_path: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct ExportEntriesResponse {
-    #[serde(default)]
-    files: Vec<ExportedFileItem>,
-}
-
 #[derive(Debug, Deserialize)]
 struct TankoubonArchivesResponse {
     #[serde(default)]
@@ -155,6 +141,7 @@ struct AudioMetaOptions {
     include_genre_tag: bool,
     include_year_tag: bool,
     ensure_artist_collection: bool,
+    #[allow(dead_code)]
     levels_up: i64,
 }
 
@@ -251,7 +238,7 @@ fn plugin_info_json() -> Value {
         "permissions": [
             "metadata.read_input",
             "archive.list_files",
-            "archive.export_entries",
+            "archive.read_entry_range",
             "tankoubon.list_archives",
             "tankoubon.ensure_named_collection_for_archive",
             "log.write",
@@ -308,7 +295,6 @@ fn execute_plugin(input: PluginInput) -> Result<Value, String> {
         ensure_artist_collection: read_bool_param(&input.params, "ensure_artist_collection", true),
         levels_up: read_i64_param(&input.params, "levels_up", 0).clamp(0, 8),
     };
-    let execution_tag = resolve_execution_tag(&input.params);
     let preferred = first_non_empty(&[
         input.oneshot_param.trim().to_string(),
         read_string_param(&input.params, "entry_name", ""),
@@ -319,7 +305,6 @@ fn execute_plugin(input: PluginInput) -> Result<Value, String> {
             target_id,
             &preferred,
             options,
-            execution_tag.as_str(),
             input.metadata,
         );
     }
@@ -328,7 +313,6 @@ fn execute_plugin(input: PluginInput) -> Result<Value, String> {
         target_id,
         &preferred,
         options,
-        execution_tag.as_str(),
         input.metadata,
     )
 }
@@ -337,11 +321,10 @@ fn execute_archive_mode(
     archive_id: &str,
     preferred: &str,
     options: AudioMetaOptions,
-    execution_tag: &str,
     metadata_input: Value,
 ) -> Result<Value, String> {
     HostBridge::progress(5, "扫描归档音频文件...");
-    let extracted = extract_archive_audio(archive_id, preferred, options, execution_tag)?;
+    let extracted = extract_archive_audio(archive_id, preferred, options)?;
     ensure_artist_collection_for_archive(archive_id, &extracted.parsed, options);
     HostBridge::progress(85, "合并元数据输出...");
     let mut metadata = ensure_metadata_object(metadata_input);
@@ -411,7 +394,6 @@ fn execute_tankoubon_mode(
     tankoubon_id: &str,
     preferred: &str,
     options: AudioMetaOptions,
-    execution_tag: &str,
     metadata_input: Value,
 ) -> Result<Value, String> {
     HostBridge::progress(5, "列出合集成员归档...");
@@ -446,8 +428,7 @@ fn execute_tankoubon_mode(
             percent.min(90),
             &format!("处理合集成员 {}/{}", index + 1, archive_ids.len()),
         );
-        let member_exec_tag = format!("{execution_tag}_v{}", index + 1);
-        let extracted = extract_archive_audio(archive_id, preferred, options, &member_exec_tag)?;
+        let extracted = extract_archive_audio(archive_id, preferred, options)?;
         ensure_artist_collection_for_archive(archive_id, &extracted.parsed, options);
         merge_archive_tags(&mut aggregate_tags, &extracted.parsed, options);
 
@@ -509,8 +490,7 @@ fn execute_tankoubon_mode(
 fn extract_archive_audio(
     archive_id: &str,
     preferred: &str,
-    options: AudioMetaOptions,
-    execution_tag: &str,
+    _options: AudioMetaOptions,
 ) -> Result<ArchiveAudioExtraction, String> {
     let listing = HostBridge::list_files(archive_id)?;
     let _ = &listing.archive_id;
@@ -522,27 +502,11 @@ fn extract_archive_audio(
     let mut target_parsed: Option<ParsedAudioTags> = None;
     let mut target_cover: Option<ExtractedCover> = None;
     let mut target_artist_cover: Option<ExtractedCover> = None;
-    let exported_entries = export_audio_entries(archive_id, &audio_entries, options.levels_up)?;
 
     for (idx, entry) in audio_entries.iter().enumerate() {
-        let exported_relative_path = match exported_entries.get(&normalize_entry_key(entry)) {
-            Some(path) => path,
-            None => {
-                if normalize_entry_key(entry) == normalize_entry_key(&target_entry) {
-                    return Err(format!(
-                        "failed to export target audio entry: entry={entry}"
-                    ));
-                }
-                HostBridge::log(
-                    2,
-                    &format!("skip entry: not exported for archive={archive_id}, entry={entry}"),
-                );
-                continue;
-            }
-        };
-        let runtime_audio_path = format!("/plugin/{exported_relative_path}");
-
-        let parsed = match read_audio_tags(&runtime_audio_path) {
+        // 按需从宿主读取音频标签：不导出整个音频文件到磁盘，
+        // lofty 通过 RemoteReader 的 seek 只读标签区域（头部/尾部几百 KB）。
+        let tagged_file = match read_audio_tags_from_remote(archive_id, entry) {
             Ok(v) => v,
             Err(e) => {
                 if normalize_entry_key(entry) == normalize_entry_key(&target_entry) {
@@ -557,14 +521,9 @@ fn extract_archive_audio(
                 continue;
             }
         };
+        let parsed = parse_tags_from_tagged_file(&tagged_file)?;
 
-        let cover_prefix = format!("__embedded_cover_{}", idx + 1);
-        let extracted_cover = match extract_embedded_cover(
-            &runtime_audio_path,
-            exported_relative_path,
-            &cover_prefix,
-            execution_tag,
-        ) {
+        let extracted_cover = match extract_embedded_cover(&tagged_file, archive_id) {
             Ok(v) => v,
             Err(e) => {
                 HostBridge::log(
@@ -575,13 +534,7 @@ fn extract_archive_audio(
             }
         };
 
-        let artist_cover_prefix = format!("__embedded_artist_cover_{}", idx + 1);
-        let extracted_artist_cover = match extract_embedded_artist_cover(
-            &runtime_audio_path,
-            exported_relative_path,
-            &artist_cover_prefix,
-            execution_tag,
-        ) {
+        let extracted_artist_cover = match extract_embedded_artist_cover(&tagged_file, archive_id) {
             Ok(v) => v,
             Err(e) => {
                 HostBridge::log(
@@ -594,14 +547,7 @@ fn extract_archive_audio(
             }
         };
 
-        let lyrics_prefix = format!("__embedded_lyrics_{}", idx + 1);
-        let extracted_lyrics = match extract_embedded_lyrics(
-            &runtime_audio_path,
-            exported_relative_path,
-            &lyrics_prefix,
-            parsed.lyrics.trim(),
-            execution_tag,
-        ) {
+        let extracted_lyrics = match extract_embedded_lyrics(parsed.lyrics.trim(), archive_id) {
             Ok(v) => v,
             Err(e) => {
                 HostBridge::log(
@@ -658,27 +604,6 @@ fn extract_archive_audio(
         artist_cover: target_artist_cover,
         pages: page_patches,
     })
-}
-
-fn export_audio_entries(
-    archive_id: &str,
-    audio_entries: &[String],
-    levels_up: i64,
-) -> Result<HashMap<String, String>, String> {
-    let exported = HostBridge::export_entries(archive_id, audio_entries.to_vec(), levels_up)?;
-    let mut by_source = HashMap::<String, String>::new();
-    for file in exported.files {
-        let source_key = normalize_entry_key(&file.source);
-        let relative_path = file
-            .relative_path
-            .trim()
-            .trim_start_matches('/')
-            .to_string();
-        if !source_key.is_empty() && !relative_path.is_empty() {
-            by_source.insert(source_key, relative_path);
-        }
-    }
-    Ok(by_source)
 }
 
 fn merge_archive_tags(
@@ -863,12 +788,17 @@ fn is_audio_file_name(file_name: &str) -> bool {
         || lower.ends_with(".alac")
 }
 
-fn read_audio_tags(path: &str) -> Result<ParsedAudioTags, String> {
-    let tagged_file = Probe::open(path)
-        .map_err(|e| format!("failed to open audio file: {e}"))?
+fn read_audio_tags_from_remote(
+    archive_id: &str,
+    entry_name: &str,
+) -> Result<lofty::file::TaggedFile, String> {
+    let reader = RemoteReader::new(archive_id, entry_name)?;
+    let probe = Probe::new(reader)
+        .guess_file_type()
+        .map_err(|e| format!("failed to guess file type: {e}"))?;
+    probe
         .read()
-        .map_err(|e| format!("failed to parse tags: {e}"))?;
-    parse_tags_from_tagged_file(&tagged_file)
+        .map_err(|e| format!("failed to parse tags: {e}"))
 }
 
 fn parse_tags_from_tagged_file(
@@ -980,50 +910,25 @@ fn build_collection_description(
 }
 
 fn extract_embedded_cover(
-    runtime_audio_path: &str,
-    exported_relative_path: &str,
-    output_prefix: &str,
-    execution_tag: &str,
+    tagged_file: &lofty::file::TaggedFile,
+    archive_id: &str,
 ) -> Result<Option<ExtractedCover>, String> {
-    extract_embedded_picture(
-        runtime_audio_path,
-        exported_relative_path,
-        output_prefix,
-        execution_tag,
-        &[PictureType::CoverFront],
-        true,
-    )
+    extract_embedded_picture(tagged_file, archive_id, &[PictureType::CoverFront], true)
 }
 
 fn extract_embedded_artist_cover(
-    runtime_audio_path: &str,
-    exported_relative_path: &str,
-    output_prefix: &str,
-    execution_tag: &str,
+    tagged_file: &lofty::file::TaggedFile,
+    archive_id: &str,
 ) -> Result<Option<ExtractedCover>, String> {
-    extract_embedded_picture(
-        runtime_audio_path,
-        exported_relative_path,
-        output_prefix,
-        execution_tag,
-        &[PictureType::LeadArtist, PictureType::Artist],
-        false,
-    )
+    extract_embedded_picture(tagged_file, archive_id, &[PictureType::LeadArtist, PictureType::Artist], false)
 }
 
 fn extract_embedded_picture(
-    runtime_audio_path: &str,
-    exported_relative_path: &str,
-    output_prefix: &str,
-    execution_tag: &str,
+    tagged_file: &lofty::file::TaggedFile,
+    archive_id: &str,
     preferred_types: &[PictureType],
     fallback_first: bool,
 ) -> Result<Option<ExtractedCover>, String> {
-    let tagged_file = Probe::open(runtime_audio_path)
-        .map_err(|e| format!("failed to open audio file for picture extraction: {e}"))?
-        .read()
-        .map_err(|e| format!("failed to parse tags for picture extraction: {e}"))?;
-
     let mut picture_data: Option<Vec<u8>> = None;
     for preferred_type in preferred_types {
         for tag in tagged_file.tags() {
@@ -1060,27 +965,18 @@ fn extract_embedded_picture(
     }
 
     let ext = detect_image_extension(&bytes);
-    let output_name = build_runtime_output_name(output_prefix, execution_tag, ext);
+    let output_name = build_runtime_output_name(&bytes, ext);
 
-    let runtime_audio = Path::new(runtime_audio_path);
-    let runtime_parent = runtime_audio
-        .parent()
-        .ok_or_else(|| "failed to resolve runtime output directory".to_string())?;
-    let runtime_cover_path = runtime_parent.join(&output_name);
+    // 封面写入运行时目录 exports/{archive_id}/，供宿主后续安装为资产。
+    let cover_dir = format!("/plugin/exports/{archive_id}");
+    let _ = fs::create_dir_all(&cover_dir);
+    let runtime_cover_path = format!("{cover_dir}/{output_name}");
 
     if let Err(e) = fs::write(&runtime_cover_path, &bytes) {
         return Err(format!("failed to write extracted picture: {e}"));
     }
 
-    let rel_parent = Path::new(exported_relative_path)
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(PathBuf::new);
-    let rel_cover_path = if rel_parent.as_os_str().is_empty() {
-        output_name
-    } else {
-        format!("{}/{}", path_to_forward_slash(&rel_parent), output_name)
-    };
+    let rel_cover_path = format!("exports/{archive_id}/{output_name}");
 
     Ok(Some(ExtractedCover {
         relative_path: format_runtime_path_for_host(&rel_cover_path),
@@ -1088,11 +984,8 @@ fn extract_embedded_picture(
 }
 
 fn extract_embedded_lyrics(
-    runtime_audio_path: &str,
-    exported_relative_path: &str,
-    output_prefix: &str,
     lyrics_text: &str,
-    execution_tag: &str,
+    archive_id: &str,
 ) -> Result<Option<ExtractedLyrics>, String> {
     let text = lyrics_text.trim();
     if text.is_empty() {
@@ -1103,27 +996,18 @@ fn extract_embedded_lyrics(
         .lines()
         .any(|line| line.trim_start().starts_with('[') && line.contains(':') && line.contains(']'));
     let ext = if has_time_tag { "lrc" } else { "txt" };
-    let output_name = build_runtime_output_name(output_prefix, execution_tag, ext);
+    let output_name = build_runtime_output_name(text.as_bytes(), ext);
 
-    let runtime_audio = Path::new(runtime_audio_path);
-    let runtime_parent = runtime_audio
-        .parent()
-        .ok_or_else(|| "failed to resolve runtime output directory".to_string())?;
-    let runtime_lyrics_path = runtime_parent.join(&output_name);
+    // 歌词写入运行时目录 exports/{archive_id}/，供宿主后续安装为资产。
+    let lyrics_dir = format!("/plugin/exports/{archive_id}");
+    let _ = fs::create_dir_all(&lyrics_dir);
+    let runtime_lyrics_path = format!("{lyrics_dir}/{output_name}");
 
     if let Err(e) = fs::write(&runtime_lyrics_path, text.as_bytes()) {
         return Err(format!("failed to write extracted lyrics: {e}"));
     }
 
-    let rel_parent = Path::new(exported_relative_path)
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(PathBuf::new);
-    let rel_lyrics_path = if rel_parent.as_os_str().is_empty() {
-        output_name
-    } else {
-        format!("{}/{}", path_to_forward_slash(&rel_parent), output_name)
-    };
+    let rel_lyrics_path = format!("exports/{archive_id}/{output_name}");
 
     Ok(Some(ExtractedLyrics {
         relative_path: format_runtime_path_for_host(&rel_lyrics_path),
@@ -1159,46 +1043,24 @@ fn attachment_extension_from_path(path: &str) -> String {
         .unwrap_or_default()
 }
 
-fn build_runtime_output_name(output_prefix: &str, execution_tag: &str, ext: &str) -> String {
-    if execution_tag.is_empty() {
-        format!("{output_prefix}.{ext}")
-    } else {
-        format!("{execution_tag}_{output_prefix}.{ext}")
-    }
+fn build_runtime_output_name(content: &[u8], ext: &str) -> String {
+    // 纯内容寻址命名：文件名只用内容哈希 + 扩展名，不含 idx/前缀。
+    // - 相同内容 → 相同文件名 → 自动覆盖去重：同一归档内 N 首歌内嵌同一封面时只落一个文件。
+    // - 不同内容 → 不同文件名 → 并发执行同一归档时不会互相覆盖（避免封面串台）。
+    // - 跨归档隔离由 exports/{archive_id}/ 子目录天然保证。
+    // 用 FNV-1a（轻量、无外部依赖、WASM 友好）；碰撞概率极低，且最坏情况只是多写一个文件，不损坏数据。
+    let hash = fnv1a_64(content);
+    format!("{hash:016x}.{ext}")
 }
 
-fn sanitize_runtime_token(raw: &str) -> String {
-    raw.trim()
-        .chars()
-        .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '_' || *ch == '-')
-        .collect()
-}
-
-fn resolve_execution_tag(params: &Value) -> String {
-    let host_tag = sanitize_runtime_token(&read_string_param(params, "__task_id", ""));
-    if !host_tag.is_empty() {
-        return host_tag;
+/// FNV-1a 64bit 哈希。用于运行时产物（封面/歌词）的内容寻址命名，无需加密强度。
+fn fnv1a_64(data: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for &b in data {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
     }
-
-    let now_nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
-    if now_nanos == 0 {
-        return "exec_fallback".to_string();
-    }
-    format!("exec_{now_nanos:x}")
-}
-
-fn path_to_forward_slash(path: &Path) -> String {
-    let mut out = String::new();
-    for (i, part) in path.components().enumerate() {
-        if i > 0 {
-            out.push('/');
-        }
-        out.push_str(&part.as_os_str().to_string_lossy());
-    }
-    out
+    hash
 }
 
 fn detect_image_extension(bytes: &[u8]) -> &'static str {
@@ -1413,6 +1275,136 @@ unsafe fn read_guest_bytes(ptr: i32, len: i32) -> &'static [u8] {
     slice::from_raw_parts(ptr as *const u8, len as usize)
 }
 
+/// 从宿主按需读取归档内条目的字节范围，实现 Read + Seek。
+/// lofty 通过 seek 只读标签区域（头部/尾部几百 KB），不读整个音频文件，
+/// 内存占用 ≈ 0，磁盘 = 0（不导出文件）。
+struct RemoteReader {
+    archive_id: String,
+    entry_name: String,
+    position: u64,
+    total_size: u64,
+    /// 本地缓冲区：一次 host call 读一个 chunk，多次 read() 从缓冲区取
+    buffer: Vec<u8>,
+    buffer_offset: u64,
+}
+
+impl RemoteReader {
+    fn new(archive_id: &str, entry_name: &str) -> Result<Self, String> {
+        // 先用一次 range 请求拿到 total_size（读 0 字节也能返回 total）
+        let (_, _, total) = read_entry_range(archive_id, entry_name, 0, 0)?;
+        Ok(RemoteReader {
+            archive_id: archive_id.to_string(),
+            entry_name: entry_name.to_string(),
+            position: 0,
+            total_size: total,
+            buffer: Vec::new(),
+            buffer_offset: 0,
+        })
+    }
+
+    /// 从宿主读取 [offset, offset+len) 的字节。len=0 时只返回 total_size。
+    fn read_range(&mut self, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+        if len == 0 {
+            return Ok(Vec::new());
+        }
+        if offset >= self.total_size {
+            return Ok(Vec::new());
+        }
+        let actual_len = (len as u64).min(self.total_size - offset) as usize;
+        match read_entry_range(&self.archive_id, &self.entry_name, offset, actual_len as u64) {
+            Ok((data, _read, _total)) => Ok(data),
+            Err(e) => Err(io::Error::new(io::ErrorKind::Other, e)),
+        }
+    }
+}
+
+impl Read for RemoteReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.position >= self.total_size {
+            return Ok(0);
+        }
+        // 缓冲区耗尽时从宿主拉一个新 chunk
+        if self.buffer_offset as usize >= self.buffer.len() {
+            let chunk_size = 65536.min((self.total_size - self.position) as usize);
+            if chunk_size == 0 {
+                return Ok(0);
+            }
+            self.buffer = self.read_range(self.position, chunk_size)?;
+            self.buffer_offset = 0;
+            if self.buffer.is_empty() {
+                return Ok(0);
+            }
+        }
+        // 从缓冲区拷贝到 caller 的 buf
+        let available = &self.buffer[self.buffer_offset as usize..];
+        let n = available.len().min(buf.len());
+        buf[..n].copy_from_slice(&available[..n]);
+        self.buffer_offset += n as u64;
+        self.position += n as u64;
+        Ok(n)
+    }
+}
+
+impl Seek for RemoteReader {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        let new_pos = match pos {
+            SeekFrom::Start(offset) => offset,
+            SeekFrom::End(offset) => {
+                if offset < 0 && (offset.unsigned_abs()) > self.total_size {
+                    return Err(io::Error::new(io::ErrorKind::InvalidInput, "seek before start"));
+                }
+                (self.total_size as i64 + offset) as u64
+            }
+            SeekFrom::Current(offset) => {
+                (self.position as i64 + offset) as u64
+            }
+        };
+        if new_pos > self.total_size {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "seek past end"));
+        }
+        // 如果新位置在当前缓冲区内，只移动 offset；否则清空缓冲区
+        let buf_start = self.position - self.buffer_offset;
+        let buf_end = buf_start + self.buffer.len() as u64;
+        if new_pos >= buf_start && new_pos < buf_end {
+            self.buffer_offset = new_pos - buf_start;
+        } else {
+            self.buffer.clear();
+            self.buffer_offset = 0;
+        }
+        self.position = new_pos;
+        Ok(new_pos)
+    }
+}
+
+/// 调用宿主 archive.read_entry_range，返回 (解码后的字节, 实际读取数, 文件总大小)
+fn read_entry_range(
+    archive_id: &str,
+    entry_name: &str,
+    offset: u64,
+    length: u64,
+) -> Result<(Vec<u8>, u64, u64), String> {
+    let v: Value = HostBridge::call(
+        "archive.read_entry_range",
+        json!({
+            "archive_id": archive_id,
+            "entry_name": entry_name,
+            "offset": offset,
+            "length": length,
+        }),
+    )?;
+    let data_b64 = v.get("data").and_then(|d| d.as_str()).unwrap_or("");
+    let size = v.get("size").and_then(|s| s.as_u64()).unwrap_or(0);
+    let total = v.get("total").and_then(|t| t.as_u64()).unwrap_or(0);
+    let bytes = if data_b64.is_empty() {
+        Vec::new()
+    } else {
+        BASE64
+            .decode(data_b64.as_bytes())
+            .map_err(|e| format!("failed to base64 decode: {e}"))?
+    };
+    Ok((bytes, size, total))
+}
+
 struct HostBridge;
 
 impl HostBridge {
@@ -1433,21 +1425,6 @@ impl HostBridge {
 
     fn list_files(archive_id: &str) -> Result<ArchiveFilesResponse, String> {
         Self::call_typed("archive.list_files", json!({ "archive_id": archive_id }))
-    }
-
-    fn export_entries(
-        archive_id: &str,
-        entries: Vec<String>,
-        levels_up: i64,
-    ) -> Result<ExportEntriesResponse, String> {
-        Self::call_typed(
-            "archive.export_entries",
-            json!({
-                "archive_id": archive_id,
-                "entries": entries,
-                "levels_up": levels_up,
-            }),
-        )
     }
 
     fn list_tankoubon_archives(tankoubon_id: &str) -> Result<Vec<String>, String> {
