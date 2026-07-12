@@ -406,17 +406,88 @@ fn perform_archive_download(
     plugin_dir: &str,
     login_cookies: &[LoginCookie],
 ) -> Value {
+    let gallery_url = format!("{domain}/g/{gid}/{token}");
     let archiver_url = format!("{domain}/archiver.php?gid={gid}&token={token}");
     HostBridge::log(1, &format!("resolved gallery gid={gid} token={token}"));
 
+    // Step 1: 画廊页面连通性预检 — 确认 E-Hentai 是否可达
+    HostBridge::progress(10, "Verifying gallery page access...");
+    let gallery_r = http_request_text("GET", &gallery_url, None, None, login_cookies);
+    let gallery_ok = match &gallery_r {
+        Ok((status, body)) => {
+            HostBridge::log(
+                1,
+                &format!("gallery check: HTTP {} body={}B", status, body.len()),
+            );
+            *status < 400 && !body.is_empty()
+        }
+        Err(e) => {
+            HostBridge::log(1, &format!("gallery check error: {e}"));
+            false
+        }
+    };
+    if !gallery_ok {
+        if domain == "https://exhentai.org" {
+            HostBridge::log(
+                1,
+                "exhentai gallery unreachable, falling back to e-hentai.org",
+            );
+            return perform_archive_download(
+                gid,
+                token,
+                "https://e-hentai.org",
+                forceresampled,
+                plugin_dir,
+                login_cookies,
+            );
+        }
+        return match gallery_r {
+            Ok((status, body)) => {
+                if status >= 400 {
+                    output_err(&format!("Gallery page check failed: HTTP {status}"))
+                } else {
+                    output_err(&format!(
+                        "Gallery page returned empty body ({}B) — server may be blocking this client",
+                        body.len()
+                    ))
+                }
+            }
+            Err(e) => output_err(&format!("Gallery page check failed: {e}")),
+        };
+    }
+
     HostBridge::progress(15, "Checking archiver page...");
-    let check = match http_request_text("GET", &archiver_url, None, None, login_cookies) {
+    let check = match http_request_text(
+        "GET",
+        &archiver_url,
+        None,
+        Some(&gallery_url),
+        login_cookies,
+    ) {
         Ok(v) => v,
         Err(e) => return output_err(&format!("Archiver check failed: {e}")),
     };
     if check.0 >= 400 {
         return output_err(&format!("Failed to access archiver: HTTP {}", check.0));
     }
+    // 诊断日志：记录 archiver 页面内容的前 2048 字节
+    let page_preview = if check.1.len() > 2048 {
+        format!(
+            "{}... (truncated, total {} bytes)",
+            &check.1[..2048],
+            check.1.len()
+        )
+    } else {
+        check.1.clone()
+    };
+    HostBridge::log(
+        1,
+        &format!(
+            "archiver GET response ({} bytes): {}",
+            check.1.len(),
+            page_preview
+        ),
+    );
     if check.1.contains("Invalid archiver key") {
         return output_err(&format!("Invalid archiver key. ({archiver_url})"));
     }
@@ -447,6 +518,24 @@ fn perform_archive_download(
     if req.0 >= 400 {
         return output_err(&format!("POST request failed: HTTP {}", req.0));
     }
+    // 诊断日志：记录 POST 响应体的前 2048 字节
+    let resp_preview = if req.1.len() > 2048 {
+        format!(
+            "{}... (truncated, total {} bytes)",
+            &req.1[..2048],
+            req.1.len()
+        )
+    } else {
+        req.1.clone()
+    };
+    HostBridge::log(
+        1,
+        &format!(
+            "archiver POST response body ({} bytes): {}",
+            req.1.len(),
+            resp_preview
+        ),
+    );
     if req.1.contains("Insufficient funds") {
         return output_err("You do not have enough GP to download this URL.");
     }
@@ -814,8 +903,8 @@ fn http_request_once(
         req.extend_from_slice(format!("Host: {host}:{port}\r\n").as_bytes());
     }
     req.extend_from_slice(format!("User-Agent: {USER_AGENT}\r\n").as_bytes());
-    req.extend_from_slice(b"Accept: */*\r\n");
-    req.extend_from_slice(b"Accept-Encoding: identity\r\n");
+    req.extend_from_slice(b"Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8\r\n");
+    req.extend_from_slice(b"Accept-Language: en-US,en;q=0.9\r\n");
     req.extend_from_slice(b"Connection: close\r\n");
     if let Some(v) = referer {
         req.extend_from_slice(format!("Referer: {v}\r\n").as_bytes());
@@ -1014,6 +1103,12 @@ fn read_http_response(stream: &mut HttpStream) -> Result<HttpResponse, String> {
             header_value(&headers, "Content-Length")
         ),
     );
+    // 诊断日志：记录所有响应头
+    let header_lines: Vec<String> = headers
+        .iter()
+        .map(|(k, v)| format!("{k}: {v}"))
+        .collect();
+    HostBridge::log(1, &format!("response headers: {}", header_lines.join(" | ")));
     let body = read_response_body(stream, &headers, pending)?;
     Ok(HttpResponse {
         status,
@@ -1070,6 +1165,19 @@ fn read_response_body(
             }
             raw.extend_from_slice(&buf[..n]);
         }
+        // 诊断日志：记录 chunked 解码前的原始字节
+        let raw_preview = if raw.len() > 256 {
+            format!("{}... (truncated, total {} bytes)", String::from_utf8_lossy(&raw[..256]), raw.len())
+        } else if raw.is_empty() {
+            "(empty)".to_string()
+        } else {
+            String::from_utf8_lossy(&raw).to_string()
+        };
+        HostBridge::log(1, &format!(
+            "chunked raw data ({} bytes): {}",
+            raw.len(),
+            raw_preview
+        ));
         return decode_chunked_lenient(&raw);
     }
     if let Some(v) = header_value(headers, "Content-Length") {
