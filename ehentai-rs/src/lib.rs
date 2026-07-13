@@ -1540,6 +1540,14 @@ fn get_tags_from_eh(
         }
     }
 
+    if let Some(rating_str) = data.get("rating").and_then(value_to_string) {
+        if let Ok(rating_val) = rating_str.parse::<f64>() {
+            if rating_val > 0.0 {
+                tags.push(format!("star:{:.2}", rating_val));
+            }
+        }
+    }
+
     let mut updated_at = String::new();
     if settings.additionaltags {
         if let Some(uploader) = data.get("uploader").and_then(value_to_string) {
