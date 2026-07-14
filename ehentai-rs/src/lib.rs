@@ -587,7 +587,11 @@ fn resolve_source_metadata(input: &PluginInput) -> Value {
     let filecount = gdata.get("filecount").and_then(value_to_string).unwrap_or("0".to_string());
     let thumb = gdata.get("thumb").and_then(value_to_string).unwrap_or_default();
     let filesize = gdata.get("filesize").and_then(value_to_string).unwrap_or_default();
-    let rating = gdata.get("rating").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let rating = gdata
+        .get("rating")
+        .and_then(value_to_string)
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(0.0);
 
     let mut tags: Vec<String> = gdata
         .get("tags")
@@ -599,6 +603,9 @@ fn resolve_source_metadata(input: &PluginInput) -> Value {
     }
     if !uploader.is_empty() {
         tags.push(format!("uploader:{}", uploader));
+    }
+    if rating > 0.0 {
+        tags.push(format!("star:{:.2}", rating));
     }
 
     let mut description = String::new();
