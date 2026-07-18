@@ -93,6 +93,12 @@ struct TvshowMeta {
     cover: String,
     backdrop: String,
     clearlogo: String,
+    banner: String,
+    thumb: String,
+    disc: String,
+    clearart: String,
+    logo: String,
+    art: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -104,7 +110,21 @@ struct SeasonMeta {
     cover: String,
     backdrop: String,
     clearlogo: String,
+    banner: String,
+    thumb: String,
+    disc: String,
+    clearart: String,
+    logo: String,
+    art: String,
     pages: Vec<Value>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ParsedArtwork {
+    url: String,
+    aspect: String,
+    preview: String,
+    parent_tag: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -112,6 +132,7 @@ struct ParsedNfo {
     root_name: String,
     tags: HashMap<String, Vec<String>>,
     unique_ids: Vec<ParsedUniqueId>,
+    artwork_urls: Vec<ParsedArtwork>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -131,7 +152,13 @@ struct XmlElementContext {
 #[derive(Debug, Clone, Copy)]
 enum ArtworkKey {
     Backdrop,
+    Banner,
     Clearlogo,
+    Logo,
+    Thumb,
+    Disc,
+    Clearart,
+    Art,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -159,6 +186,7 @@ struct PageAttachmentCandidate {
     mime_type: String,
     kind: String,
     language: String,
+    flags: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -297,7 +325,7 @@ impl ListingIndex {
         let mut seen = HashSet::<String>::new();
 
         for entry in &self.entries {
-            let Some((language, kind)) = match_page_attachment_to_base(&entry.name, base_name) else {
+            let Some((language, kind, flags)) = match_page_attachment_to_base(&entry.name, base_name) else {
                 continue;
             };
             if !seen.insert(entry.lower.clone()) {
@@ -310,6 +338,7 @@ impl ListingIndex {
                 mime_type: attachment_mime_type(&kind).to_string(),
                 kind,
                 language,
+                flags,
             });
         }
 
@@ -395,35 +424,40 @@ impl ListingIndex {
         })
     }
 
-    fn archive_cover(&self, parent: &ListingIndex, season_number: i64) -> String {
-        self.season_specific_cover_candidates(season_number)
-            .first()
-            .map(|path| adjacent_ref(path, 0))
-            .or_else(|| {
-                parent
-                    .season_specific_cover_candidates(season_number)
-                    .first()
-                    .map(|path| adjacent_ref(path, 1))
-            })
-            .or_else(|| {
-                self.season_cover_candidates(season_number)
-                    .first()
-                    .map(|path| adjacent_ref(path, 0))
-            })
-            .or_else(|| {
-                parent
-                    .season_cover_candidates(season_number)
-                    .first()
-                    .map(|path| adjacent_ref(path, 1))
-            })
-            .or_else(|| {
-                parent
-                    .general_cover_candidates()
-                    .first()
-                    .map(|path| adjacent_ref(path, 1))
-            })
-            .unwrap_or_default()
-    }
+fn archive_cover(&self, parent: &ListingIndex, season_number: i64) -> String {
+	        self.season_specific_cover_candidates(season_number)
+	            .first()
+	            .map(|path| adjacent_ref(path, 0))
+	            .or_else(|| {
+	                parent
+	                    .season_specific_cover_candidates(season_number)
+	                    .first()
+	                    .map(|path| adjacent_ref(path, 1))
+	            })
+	            .or_else(|| {
+	                self.season_cover_candidates(season_number)
+	                    .first()
+	                    .map(|path| adjacent_ref(path, 0))
+	            })
+	            .or_else(|| {
+	                parent
+	                    .season_cover_candidates(season_number)
+	                    .first()
+	                    .map(|path| adjacent_ref(path, 1))
+	            })
+	            .or_else(|| {
+	                self.general_cover_candidates()
+	                    .first()
+	                    .map(|path| adjacent_ref(path, 0))
+	            })
+	            .or_else(|| {
+	                parent
+	                    .general_cover_candidates()
+	                    .first()
+	                    .map(|path| adjacent_ref(path, 1))
+	            })
+	            .unwrap_or_default()
+	    }
 
     fn archive_artwork(
         &self,
@@ -754,6 +788,7 @@ fn run_archive_mode(
     let mut page_patches: HashMap<String, Value> = HashMap::new();
     let mut first_page_cover_fallback = String::new();
     let mut first_page_cover_sort = 0i64;
+    let mut nfo_artwork: HashMap<String, String> = HashMap::new();
 
     if !nfo_files.is_empty() {
         HostBridge::progress(28, "parsing NFO sidecars");
@@ -790,6 +825,7 @@ fn run_archive_mode(
             if !season_summary.is_empty() {
                 archive_summary = season_summary;
             }
+            nfo_artwork = extract_nfo_artwork(&doc);
             continue;
         }
 
@@ -871,14 +907,18 @@ fn run_archive_mode(
                     attachment_candidates
                         .iter()
                         .map(|attachment| {
-                            json!({
+                            let mut obj = json!({
                                 "slot": attachment.slot,
                                 "path": adjacent_ref(&attachment.path, 0),
                                 "name": attachment.name,
                                 "mime_type": attachment.mime_type,
                                 "kind": attachment.kind,
                                 "language": attachment.language,
-                            })
+                            });
+                            if !attachment.flags.is_empty() {
+                                obj["flags"] = json!(attachment.flags);
+                            }
+                            obj
                         })
                         .collect(),
                 ),
@@ -911,6 +951,18 @@ fn run_archive_mode(
     let archive_backdrop = index.archive_artwork(&parent_index, season_number_hint, ArtworkKey::Backdrop);
     let archive_clearlogo =
         index.archive_artwork(&parent_index, season_number_hint, ArtworkKey::Clearlogo);
+    let archive_banner =
+        index.archive_artwork(&parent_index, season_number_hint, ArtworkKey::Banner);
+    let archive_thumb =
+        index.archive_artwork(&parent_index, season_number_hint, ArtworkKey::Thumb);
+    let archive_disc =
+        index.archive_artwork(&parent_index, season_number_hint, ArtworkKey::Disc);
+    let archive_clearart =
+        index.archive_artwork(&parent_index, season_number_hint, ArtworkKey::Clearart);
+    let archive_logo =
+        index.archive_artwork(&parent_index, season_number_hint, ArtworkKey::Logo);
+    let archive_art =
+        index.archive_artwork(&parent_index, season_number_hint, ArtworkKey::Art);
 
     HostBridge::progress(90, "composing archive metadata");
     let mut tags = metadata_tags(&metadata);
@@ -946,9 +998,15 @@ fn run_archive_mode(
     }
     metadata.insert("description".to_string(), Value::String(archive_summary));
     metadata.insert("tags".to_string(), json!(unique_strings(tags)));
-    set_asset_value(&mut metadata, "cover", &archive_cover);
-    set_asset_value(&mut metadata, "backdrop", &archive_backdrop);
-    set_asset_value(&mut metadata, "clearlogo", &archive_clearlogo);
+    set_asset_value(&mut metadata, "cover", &nfo_artwork.get("cover").map(String::as_str).unwrap_or(&archive_cover));
+    set_asset_value(&mut metadata, "backdrop", &nfo_artwork.get("backdrop").map(String::as_str).unwrap_or(&archive_backdrop));
+    set_asset_value(&mut metadata, "clearlogo", &nfo_artwork.get("clearlogo").map(String::as_str).unwrap_or(&archive_clearlogo));
+    set_asset_value(&mut metadata, "banner", &nfo_artwork.get("banner").map(String::as_str).unwrap_or(&archive_banner));
+    set_asset_value(&mut metadata, "thumb", &nfo_artwork.get("thumb").map(String::as_str).unwrap_or(&archive_thumb));
+    set_asset_value(&mut metadata, "disc", &nfo_artwork.get("disc").map(String::as_str).unwrap_or(&archive_disc));
+    set_asset_value(&mut metadata, "clearart", &nfo_artwork.get("clearart").map(String::as_str).unwrap_or(&archive_clearart));
+    set_asset_value(&mut metadata, "logo", &nfo_artwork.get("logo").map(String::as_str).unwrap_or(&archive_logo));
+    set_asset_value(&mut metadata, "art", &nfo_artwork.get("art").map(String::as_str).unwrap_or(&archive_art));
     metadata.insert("children".to_string(), Value::Array(vec![]));
     metadata.remove("archive");
     metadata.remove("archive_id");
@@ -1018,10 +1076,16 @@ fn run_tankoubon_mode(
         child.insert("tags".to_string(), json!(unique_strings(patch_tags)));
         child.insert(
             "assets".to_string(),
-            json!(build_assets_json(
+            json!(build_assets_json_extended(
                 &season_meta.cover,
                 &season_meta.backdrop,
-                &season_meta.clearlogo
+                &season_meta.clearlogo,
+                &season_meta.banner,
+                &season_meta.thumb,
+                &season_meta.disc,
+                &season_meta.clearart,
+                &season_meta.logo,
+                &season_meta.art,
             )),
         );
         child.insert("pages".to_string(), Value::Array(season_meta.pages));
@@ -1084,6 +1148,60 @@ fn run_tankoubon_mode(
             &first_archive_clearlogo
         },
     );
+    set_asset_value(
+        &mut metadata,
+        "banner",
+        if !collection_meta.banner.is_empty() {
+            &collection_meta.banner
+        } else {
+            ""
+        },
+    );
+    set_asset_value(
+        &mut metadata,
+        "thumb",
+        if !collection_meta.thumb.is_empty() {
+            &collection_meta.thumb
+        } else {
+            ""
+        },
+    );
+    set_asset_value(
+        &mut metadata,
+        "disc",
+        if !collection_meta.disc.is_empty() {
+            &collection_meta.disc
+        } else {
+            ""
+        },
+    );
+    set_asset_value(
+        &mut metadata,
+        "clearart",
+        if !collection_meta.clearart.is_empty() {
+            &collection_meta.clearart
+        } else {
+            ""
+        },
+    );
+    set_asset_value(
+        &mut metadata,
+        "logo",
+        if !collection_meta.logo.is_empty() {
+            &collection_meta.logo
+        } else {
+            ""
+        },
+    );
+    set_asset_value(
+        &mut metadata,
+        "art",
+        if !collection_meta.art.is_empty() {
+            &collection_meta.art
+        } else {
+            ""
+        },
+    );
     metadata.insert("children".to_string(), Value::Array(patches));
     metadata.remove("archive");
     metadata.remove("archive_id");
@@ -1103,7 +1221,7 @@ fn read_season_metadata(archive_id: &str, options: ArchiveModeOptions) -> Option
         .find_file_ignore_ascii_case("season.nfo")
         .and_then(|season_nfo| text_map.get(&season_nfo).map(|xml| parse_nfo(xml)));
     let parent_tvshow = read_tvshow_info_for_archive(archive_id).unwrap_or_default();
-    let mut season_number = match (&season_doc) {
+    let mut season_number = match &season_doc {
         Some(doc) => read_xml_int(doc, &["seasonnumber", "season"]),
         None => 0,
     }
@@ -1173,14 +1291,18 @@ fn read_season_metadata(archive_id: &str, options: ArchiveModeOptions) -> Option
                     attachment_candidates
                         .iter()
                         .map(|attachment| {
-                            json!({
+                            let mut obj = json!({
                                 "slot": attachment.slot,
                                 "path": adjacent_ref(&attachment.path, 0),
                                 "name": attachment.name,
                                 "mime_type": attachment.mime_type,
                                 "kind": attachment.kind,
                                 "language": attachment.language,
-                            })
+                            });
+                            if !attachment.flags.is_empty() {
+                                obj["flags"] = json!(attachment.flags);
+                            }
+                            obj
                         })
                         .collect(),
                 ),
@@ -1203,18 +1325,24 @@ fn read_season_metadata(archive_id: &str, options: ArchiveModeOptions) -> Option
     }
     let backdrop = index.archive_artwork(&parent_index, season_number, ArtworkKey::Backdrop);
     let clearlogo = index.archive_artwork(&parent_index, season_number, ArtworkKey::Clearlogo);
-    let season_title = match (&season_doc) {
+    let banner = index.archive_artwork(&parent_index, season_number, ArtworkKey::Banner);
+    let thumb = index.archive_artwork(&parent_index, season_number, ArtworkKey::Thumb);
+    let disc = index.archive_artwork(&parent_index, season_number, ArtworkKey::Disc);
+    let clearart = index.archive_artwork(&parent_index, season_number, ArtworkKey::Clearart);
+    let logo = index.archive_artwork(&parent_index, season_number, ArtworkKey::Logo);
+    let art = index.archive_artwork(&parent_index, season_number, ArtworkKey::Art);
+    let season_title = match &season_doc {
         Some(doc) => read_xml_tag(doc, &["title"]),
         None => String::new(),
     };
-    let season_summary = match (&season_doc) {
+    let season_summary = match &season_doc {
         Some(doc) => first_non_empty(&[
             read_xml_tag(doc, &["plot"]),
             read_xml_tag(doc, &["outline"]),
         ]),
         None => String::new(),
     };
-    let source_tag = match (&season_doc) {
+    let source_tag = match &season_doc {
         Some(doc) => {
             let from_season = parse_source_tag(doc);
             if !from_season.is_empty() {
@@ -1257,6 +1385,12 @@ fn read_season_metadata(archive_id: &str, options: ArchiveModeOptions) -> Option
         cover,
         backdrop,
         clearlogo,
+        banner,
+        thumb,
+        disc,
+        clearart,
+        logo,
+        art,
         pages: page_patches.into_values().collect(),
     })
 }
@@ -1294,6 +1428,36 @@ fn read_tvshow_metadata_for_tankoubon(archive_ids: &[String]) -> Option<TvshowMe
             .first()
             .map(|path| adjacent_ref(path, 1))
             .unwrap_or_default();
+        let banner = index
+            .artwork_candidates(0, ArtworkKey::Banner)
+            .first()
+            .map(|path| adjacent_ref(path, 1))
+            .unwrap_or_default();
+        let thumb = index
+            .artwork_candidates(0, ArtworkKey::Thumb)
+            .first()
+            .map(|path| adjacent_ref(path, 1))
+            .unwrap_or_default();
+        let disc = index
+            .artwork_candidates(0, ArtworkKey::Disc)
+            .first()
+            .map(|path| adjacent_ref(path, 1))
+            .unwrap_or_default();
+        let clearart = index
+            .artwork_candidates(0, ArtworkKey::Clearart)
+            .first()
+            .map(|path| adjacent_ref(path, 1))
+            .unwrap_or_default();
+        let logo = index
+            .artwork_candidates(0, ArtworkKey::Logo)
+            .first()
+            .map(|path| adjacent_ref(path, 1))
+            .unwrap_or_default();
+        let art = index
+            .artwork_candidates(0, ArtworkKey::Art)
+            .first()
+            .map(|path| adjacent_ref(path, 1))
+            .unwrap_or_default();
         if !title.is_empty()
             || !summary.is_empty()
             || !source_tag.is_empty()
@@ -1301,6 +1465,12 @@ fn read_tvshow_metadata_for_tankoubon(archive_ids: &[String]) -> Option<TvshowMe
             || !cover.is_empty()
             || !backdrop.is_empty()
             || !clearlogo.is_empty()
+            || !banner.is_empty()
+            || !thumb.is_empty()
+            || !disc.is_empty()
+            || !clearart.is_empty()
+            || !logo.is_empty()
+            || !art.is_empty()
         {
             return Some(TvshowMeta {
                 title,
@@ -1310,6 +1480,12 @@ fn read_tvshow_metadata_for_tankoubon(archive_ids: &[String]) -> Option<TvshowMe
                 cover,
                 backdrop,
                 clearlogo,
+                banner,
+                thumb,
+                disc,
+                clearart,
+                logo,
+                art,
             });
         }
     }
@@ -1324,6 +1500,51 @@ fn read_tvshow_info_for_archive(archive_id: &str) -> Result<TvshowMeta, String> 
     };
     let xml = HostBridge::read_adjacent_text(archive_id, &tvshow_nfo, 1)?;
     let doc = parse_nfo(&xml);
+    let cover = index
+        .general_cover_candidates()
+        .first()
+        .map(|path| adjacent_ref(path, 1))
+        .unwrap_or_default();
+    let backdrop = index
+        .artwork_candidates(0, ArtworkKey::Backdrop)
+        .first()
+        .map(|path| adjacent_ref(path, 1))
+        .unwrap_or_default();
+    let clearlogo = index
+        .artwork_candidates(0, ArtworkKey::Clearlogo)
+        .first()
+        .map(|path| adjacent_ref(path, 1))
+        .unwrap_or_default();
+    let banner = index
+        .artwork_candidates(0, ArtworkKey::Banner)
+        .first()
+        .map(|path| adjacent_ref(path, 1))
+        .unwrap_or_default();
+    let thumb = index
+        .artwork_candidates(0, ArtworkKey::Thumb)
+        .first()
+        .map(|path| adjacent_ref(path, 1))
+        .unwrap_or_default();
+    let disc = index
+        .artwork_candidates(0, ArtworkKey::Disc)
+        .first()
+        .map(|path| adjacent_ref(path, 1))
+        .unwrap_or_default();
+    let clearart = index
+        .artwork_candidates(0, ArtworkKey::Clearart)
+        .first()
+        .map(|path| adjacent_ref(path, 1))
+        .unwrap_or_default();
+    let logo = index
+        .artwork_candidates(0, ArtworkKey::Logo)
+        .first()
+        .map(|path| adjacent_ref(path, 1))
+        .unwrap_or_default();
+    let art = index
+        .artwork_candidates(0, ArtworkKey::Art)
+        .first()
+        .map(|path| adjacent_ref(path, 1))
+        .unwrap_or_default();
     Ok(TvshowMeta {
         title: read_xml_tag(&doc, &["title"]),
         summary: first_non_empty(&[
@@ -1332,7 +1553,15 @@ fn read_tvshow_info_for_archive(archive_id: &str) -> Result<TvshowMeta, String> 
         ]),
         source_tag: parse_source_tag(&doc),
         tags: build_tvshow_tags(&doc),
-        ..TvshowMeta::default()
+        cover,
+        backdrop,
+        clearlogo,
+        banner,
+        thumb,
+        disc,
+        clearart,
+        logo,
+        art,
     })
 }
 
@@ -1498,6 +1727,32 @@ fn extract_best_unique_id(doc: &ParsedNfo) -> Option<SourceTagCandidate> {
     best
 }
 
+fn extract_nfo_artwork(doc: &ParsedNfo) -> HashMap<String, String> {
+    let mut artwork = HashMap::new();
+    for item in &doc.artwork_urls {
+        let key = match item.aspect.to_ascii_lowercase().as_str() {
+            "poster" | "cover" => "cover",
+            "banner" => "banner",
+            "fanart" | "backdrop" | "background" => "backdrop",
+            "clearlogo" | "logo" => "clearlogo",
+            "landscape" | "thumb" => "thumb",
+            "disc" | "cdart" => "disc",
+            "clearart" | "art" => "clearart",
+            _ => {
+                if item.parent_tag == "fanart" {
+                    "backdrop"
+                } else {
+                    ""
+                }
+            }
+        };
+        if !key.is_empty() && !artwork.contains_key(key) {
+            artwork.insert(key.to_string(), item.url.clone());
+        }
+    }
+    artwork
+}
+
 fn pick_better_source(
     current: Option<SourceTagCandidate>,
     candidate: Option<SourceTagCandidate>,
@@ -1571,7 +1826,10 @@ fn parse_nfo(xml: &str) -> ParsedNfo {
                 }
             }
             Ok(Event::Eof) => break,
-            Err(_) => return ParsedNfo::default(),
+            Err(e) => {
+                HostBridge::log(1, &format!("XML parse error: {e}"));
+                return ParsedNfo::default();
+            }
             _ => {}
         }
     }
@@ -1618,7 +1876,7 @@ fn finalize_xml_node(
 
         if node.name == "uniqueid" {
             parsed.unique_ids.push(ParsedUniqueId {
-                value: normalized,
+                value: normalized.clone(),
                 source_type: node
                     .attrs
                     .iter()
@@ -1631,6 +1889,29 @@ fn finalize_xml_node(
                     .find(|(key, _)| key == "default")
                     .map(|(_, value)| value.clone())
                     .unwrap_or_default(),
+            });
+        }
+
+        if node.name == "thumb" {
+            let parent_tag = stack
+                .last()
+                .map(|parent| parent.name.clone())
+                .unwrap_or_default();
+            parsed.artwork_urls.push(ParsedArtwork {
+                url: normalized.clone(),
+                aspect: node
+                    .attrs
+                    .iter()
+                    .find(|(key, _)| key == "aspect")
+                    .map(|(_, value)| value.clone())
+                    .unwrap_or_default(),
+                preview: node
+                    .attrs
+                    .iter()
+                    .find(|(key, _)| key == "preview")
+                    .map(|(_, value)| value.clone())
+                    .unwrap_or_default(),
+                parent_tag,
             });
         }
     }
@@ -1807,6 +2088,48 @@ fn build_assets_json(cover: &str, backdrop: &str, clearlogo: &str) -> Vec<Value>
     assets
 }
 
+fn build_assets_json_extended(
+    cover: &str,
+    backdrop: &str,
+    clearlogo: &str,
+    banner: &str,
+    thumb: &str,
+    disc: &str,
+    clearart: &str,
+    logo: &str,
+    art: &str,
+) -> Vec<Value> {
+    let mut assets = Vec::new();
+    if !cover.is_empty() {
+        assets.push(json!({"key":"cover","value":cover}));
+    }
+    if !backdrop.is_empty() {
+        assets.push(json!({"key":"backdrop","value":backdrop}));
+    }
+    if !clearlogo.is_empty() {
+        assets.push(json!({"key":"clearlogo","value":clearlogo}));
+    }
+    if !banner.is_empty() {
+        assets.push(json!({"key":"banner","value":banner}));
+    }
+    if !thumb.is_empty() {
+        assets.push(json!({"key":"thumb","value":thumb}));
+    }
+    if !disc.is_empty() {
+        assets.push(json!({"key":"disc","value":disc}));
+    }
+    if !clearart.is_empty() {
+        assets.push(json!({"key":"clearart","value":clearart}));
+    }
+    if !logo.is_empty() {
+        assets.push(json!({"key":"logo","value":logo}));
+    }
+    if !art.is_empty() {
+        assets.push(json!({"key":"art","value":art}));
+    }
+    assets
+}
+
 fn unique_strings(values: Vec<String>) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
@@ -1837,7 +2160,7 @@ fn strip_extension(name: &str) -> String {
         .unwrap_or_else(|| name.to_string())
 }
 
-fn parse_page_attachment_stem(name: &str) -> Option<(String, String, String)> {
+fn parse_page_attachment_stem(name: &str) -> Option<(String, String, String, Vec<String>)> {
     let lower = name.to_ascii_lowercase();
     let (without_kind, kind) = lower.rsplit_once('.')?;
     if !matches!(
@@ -1846,22 +2169,47 @@ fn parse_page_attachment_stem(name: &str) -> Option<(String, String, String)> {
     ) {
         return None;
     }
-    let mut base = without_kind.to_string();
     let mut language = String::new();
-    if let Some((candidate_base, candidate_language)) = without_kind.rsplit_once('.') {
-        if looks_like_attachment_language(candidate_language) {
-            base = candidate_base.to_string();
-            language = candidate_language.to_string();
+    let mut flags = Vec::new();
+
+    let known_flags = [
+        "forced", "sdh", "hi", "default", "commentary", "external",
+        "hearing-impaired", "hearing_impaired", "hearing impaired",
+        "cc", "closed-caption", "closed_caption", "closed caption",
+        "foreign", "foreign-parts", "foreign_parts",
+    ];
+
+    // Walk segments from right to left, collecting known flags and language
+    let mut remaining = without_kind.to_string();
+    loop {
+        let (candidate_base, candidate_suffix) = match remaining.rsplit_once('.') {
+            Some(pair) => pair,
+            None => break,
+        };
+        let suffix_lower = candidate_suffix.to_ascii_lowercase();
+        if known_flags.iter().any(|flag| flag.eq_ignore_ascii_case(&suffix_lower)) {
+            flags.push(candidate_suffix.to_string());
+            remaining = candidate_base.to_string();
+            continue;
         }
+        if language.is_empty() && looks_like_attachment_language(candidate_suffix) {
+            language = candidate_suffix.to_string();
+            remaining = candidate_base.to_string();
+            continue;
+        }
+        break;
     }
-    Some((base, language, kind.to_string()))
+
+    let base = remaining;
+    flags.reverse();
+    Some((base, language, kind.to_string(), flags))
 }
 
-fn match_page_attachment_to_base(name: &str, media_base: &str) -> Option<(String, String)> {
-    let (attachment_base, language, kind) = parse_page_attachment_stem(name)?;
+fn match_page_attachment_to_base(name: &str, media_base: &str) -> Option<(String, String, Vec<String>)> {
+    let (attachment_base, language, kind, flags) = parse_page_attachment_stem(name)?;
     let normalized_media_base = media_base.to_ascii_lowercase();
     if attachment_base == normalized_media_base {
-        return Some((language, kind));
+        return Some((language, kind, flags));
     }
     let rest = attachment_base.strip_prefix(&normalized_media_base)?;
     if !rest.starts_with('.') {
@@ -1869,19 +2217,35 @@ fn match_page_attachment_to_base(name: &str, media_base: &str) -> Option<(String
     }
     let suffix = rest.trim_start_matches('.');
     if suffix.is_empty() {
-        return Some((language, kind));
+        return Some((language, kind, flags));
     }
 
     let mut detected_language = language;
-    if detected_language.is_empty() {
-        for segment in suffix.rsplit('.') {
-            if looks_like_attachment_language(segment) {
-                detected_language = segment.to_string();
-                break;
+    let mut detected_flags = flags;
+
+    let known_flags = [
+        "forced", "sdh", "hi", "default", "commentary", "external",
+        "hearing-impaired", "hearing_impaired", "hearing impaired",
+        "cc", "closed-caption", "closed_caption", "closed caption",
+        "foreign", "foreign-parts", "foreign_parts",
+    ];
+
+    for segment in suffix.rsplit('.') {
+        let segment_lower = segment.to_ascii_lowercase();
+        if known_flags.iter().any(|flag| flag.eq_ignore_ascii_case(&segment_lower)) {
+            if !detected_flags.iter().any(|f| f.eq_ignore_ascii_case(segment)) {
+                detected_flags.push(segment.to_string());
             }
+            continue;
+        }
+        if detected_language.is_empty() && looks_like_attachment_language(segment) {
+            detected_language = segment.to_string();
+            continue;
         }
     }
-    Some((detected_language, kind))
+
+    detected_flags.reverse();
+    Some((detected_language, kind, detected_flags))
 }
 
 fn looks_like_attachment_language(value: &str) -> bool {
@@ -2061,15 +2425,14 @@ fn score_general_cover_candidate(stem: &str) -> i64 {
     match stem {
         "poster" => 1000,
         "folder" => 980,
+        "default" => 970,
         "cover" => 960,
+        "show" => 950,
         "thumb" => 940,
-        "landscape" => 900,
-        "backdrop" => 850,
-        "fanart" => 800,
+        "movie" => 930,
         _ if stem.contains("poster") => 700,
         _ if stem.contains("cover") => 650,
         _ if stem.contains("thumb") => 620,
-        _ if stem.contains("backdrop") || stem.contains("fanart") => 600,
         _ => 0,
     }
 }
@@ -2087,11 +2450,49 @@ fn score_general_artwork_candidate(stem: &str, asset_key: ArtworkKey) -> i64 {
             _ if matches_stem_token(stem, "background") => 700,
             _ => 0,
         },
+        ArtworkKey::Banner => match stem {
+            "banner" => 1100,
+            _ if matches_stem_token(stem, "banner") => 820,
+            _ => 0,
+        },
         ArtworkKey::Clearlogo => match stem {
             "clearlogo" => 1100,
             "logo" => 1000,
             _ if matches_stem_token(stem, "clearlogo") => 920,
             _ if matches_stem_token(stem, "logo") => 780,
+            _ => 0,
+        },
+        ArtworkKey::Logo => match stem {
+            "logo" => 1100,
+            "clearlogo" => 1000,
+            _ if matches_stem_token(stem, "logo") => 920,
+            _ if matches_stem_token(stem, "clearlogo") => 780,
+            _ => 0,
+        },
+        ArtworkKey::Thumb => match stem {
+            "landscape" => 1100,
+            "thumb" => 1000,
+            _ if matches_stem_token(stem, "landscape") => 820,
+            _ if matches_stem_token(stem, "thumb") => 780,
+            _ => 0,
+        },
+        ArtworkKey::Disc => match stem {
+            "disc" => 1100,
+            "cdart" => 1080,
+            _ if matches_stem_token(stem, "disc") => 820,
+            _ if matches_stem_token(stem, "cdart") => 780,
+            _ => 0,
+        },
+        ArtworkKey::Clearart => match stem {
+            "clearart" => 1100,
+            _ if matches_stem_token(stem, "clearart") => 820,
+            _ => 0,
+        },
+        ArtworkKey::Art => match stem {
+            "clearart" => 1100,
+            "art" => 1000,
+            _ if matches_stem_token(stem, "clearart") => 820,
+            _ if matches_stem_token(stem, "art") => 780,
             _ => 0,
         },
     }
@@ -2117,6 +2518,15 @@ fn score_season_artwork_candidate(stem: &str, token: &str, asset_key: ArtworkKey
                 0
             }
         }
+        ArtworkKey::Banner => {
+            if stem == format!("{token}-banner") || stem == format!("{token}_banner") {
+                1500
+            } else if stem.contains(token) && matches_stem_token(stem, "banner") {
+                1380
+            } else {
+                0
+            }
+        }
         ArtworkKey::Clearlogo => {
             if stem == format!("{token}-clearlogo") || stem == format!("{token}_clearlogo") {
                 1500
@@ -2125,6 +2535,67 @@ fn score_season_artwork_candidate(stem: &str, token: &str, asset_key: ArtworkKey
             } else if stem.contains(token) && matches_stem_token(stem, "clearlogo") {
                 1380
             } else if stem.contains(token) && matches_stem_token(stem, "logo") {
+                1260
+            } else {
+                0
+            }
+        }
+        ArtworkKey::Logo => {
+            if stem == format!("{token}-logo") || stem == format!("{token}_logo") {
+                1500
+            } else if stem == format!("{token}-clearlogo") || stem == format!("{token}_clearlogo") {
+                1450
+            } else if stem.contains(token) && matches_stem_token(stem, "logo") {
+                1380
+            } else if stem.contains(token) && matches_stem_token(stem, "clearlogo") {
+                1260
+            } else {
+                0
+            }
+        }
+        ArtworkKey::Thumb => {
+            if stem == format!("{token}-landscape") || stem == format!("{token}_landscape") {
+                1500
+            } else if stem == format!("{token}-thumb") || stem == format!("{token}_thumb") {
+                1450
+            } else if stem.contains(token) && matches_stem_token(stem, "landscape") {
+                1380
+            } else if stem.contains(token) && matches_stem_token(stem, "thumb") {
+                1260
+            } else {
+                0
+            }
+        }
+        ArtworkKey::Disc => {
+            if stem == format!("{token}-disc") || stem == format!("{token}_disc") {
+                1500
+            } else if stem == format!("{token}-cdart") || stem == format!("{token}_cdart") {
+                1450
+            } else if stem.contains(token) && matches_stem_token(stem, "disc") {
+                1380
+            } else if stem.contains(token) && matches_stem_token(stem, "cdart") {
+                1260
+            } else {
+                0
+            }
+        }
+        ArtworkKey::Clearart => {
+            if stem == format!("{token}-clearart") || stem == format!("{token}_clearart") {
+                1500
+            } else if stem.contains(token) && matches_stem_token(stem, "clearart") {
+                1380
+            } else {
+                0
+            }
+        }
+        ArtworkKey::Art => {
+            if stem == format!("{token}-clearart") || stem == format!("{token}_clearart") {
+                1500
+            } else if stem == format!("{token}-art") || stem == format!("{token}_art") {
+                1450
+            } else if stem.contains(token) && matches_stem_token(stem, "clearart") {
+                1380
+            } else if stem.contains(token) && matches_stem_token(stem, "art") {
                 1260
             } else {
                 0
@@ -2214,6 +2685,7 @@ mod tests {
         assert_eq!(parsed.0, "episode01");
         assert_eq!(parsed.1, "zh-cn");
         assert_eq!(parsed.2, "ass");
+        assert!(parsed.3.is_empty());
     }
 
     #[test]
@@ -2222,6 +2694,52 @@ mod tests {
         assert_eq!(parsed.0, "episode01");
         assert_eq!(parsed.1, "");
         assert_eq!(parsed.2, "srt");
+        assert!(parsed.3.is_empty());
+    }
+
+    #[test]
+    fn parses_subtitle_with_forced_flag() {
+        let parsed = parse_page_attachment_stem("episode01.forced.ass").unwrap();
+        assert_eq!(parsed.0, "episode01");
+        assert_eq!(parsed.1, "");
+        assert_eq!(parsed.2, "ass");
+        assert_eq!(parsed.3, vec!["forced"]);
+    }
+
+    #[test]
+    fn parses_subtitle_with_sdh_flag() {
+        let parsed = parse_page_attachment_stem("episode01.sdh.eng.srt").unwrap();
+        assert_eq!(parsed.0, "episode01");
+        assert_eq!(parsed.1, "eng");
+        assert_eq!(parsed.2, "srt");
+        assert_eq!(parsed.3, vec!["sdh"]);
+    }
+
+    #[test]
+    fn parses_subtitle_with_default_flag() {
+        let parsed = parse_page_attachment_stem("episode01.default.zh-cn.ass").unwrap();
+        assert_eq!(parsed.0, "episode01");
+        assert_eq!(parsed.1, "zh-cn");
+        assert_eq!(parsed.2, "ass");
+        assert_eq!(parsed.3, vec!["default"]);
+    }
+
+    #[test]
+    fn parses_subtitle_with_hi_flag() {
+        let parsed = parse_page_attachment_stem("episode01.hi.srt").unwrap();
+        assert_eq!(parsed.0, "episode01");
+        assert_eq!(parsed.1, "");
+        assert_eq!(parsed.2, "srt");
+        assert_eq!(parsed.3, vec!["hi"]);
+    }
+
+    #[test]
+    fn parses_subtitle_with_commentary_flag() {
+        let parsed = parse_page_attachment_stem("episode01.commentary.eng.srt").unwrap();
+        assert_eq!(parsed.0, "episode01");
+        assert_eq!(parsed.1, "eng");
+        assert_eq!(parsed.2, "srt");
+        assert_eq!(parsed.3, vec!["commentary"]);
     }
 
     #[test]
@@ -2233,6 +2751,7 @@ mod tests {
         .unwrap();
         assert_eq!(matched.0, "");
         assert_eq!(matched.1, "ass");
+        assert!(matched.2.is_empty());
     }
 
     #[test]
@@ -2244,6 +2763,7 @@ mod tests {
         .unwrap();
         assert_eq!(matched.0, "");
         assert_eq!(matched.1, "srt");
+        assert!(matched.2.is_empty());
     }
 
     #[test]
@@ -2255,6 +2775,7 @@ mod tests {
         .unwrap();
         assert_eq!(matched.0, "zh-cn");
         assert_eq!(matched.1, "ass");
+        assert_eq!(matched.2, vec!["default"]);
     }
 }
 
