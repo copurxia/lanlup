@@ -1,0 +1,62 @@
+name: Nightly Aggregate Release
+
+on:
+  schedule:
+    # Run daily at 02:00 UTC
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+    inputs:
+      plugins:
+        description: 'Comma-separated list of plugins to build (empty = all)'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  list-plugins:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.list.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: list
+        shell: bash
+        run: |
+          # Find all plugin workflow files (excluding templates)
+          plugins=()
+          for wf in .github/workflows/*-rs-wasip1.yml; do
+            plugin="$(basename "${wf}" -rs-wasip1.yml)"
+            plugins+=("${plugin}")
+          done
+          # If user specified plugins, filter
+          if [ -n "${{ inputs.plugins }}" ]; then
+            IFS=',' read -ra specified <<< "${{ inputs.plugins }}"
+            filtered=()
+            for spec in "${specified[@]}"; do
+              spec="$(echo "${spec}" | xargs)"
+              for plugin in "${plugins[@]}"; do
+                if [ "${plugin}" = "${spec}" ]; then
+                  filtered+=("${plugin}")
+                fi
+              done
+            done
+            plugins=("${filtered[@]}")
+          fi
+          echo "matrix=$(printf '%s\n' "${plugins[@]}" | jq -R -s -c 'split("\n") | map(select(length > 0))')" >> "${GITHUB_OUTPUT}"
+
+  build:
+    needs: list-plugins
+    strategy:
+      fail-fast: false
+      matrix:
+        plugin: ${{ fromJson(needs.list-plugins.outputs.matrix) }}
+    uses: ./.github/workflows/_build-wasip1.yml
+    with:
+      plugin: ${{ matrix.plugin }}
+
+  aggregate:
+    needs: build
+    if: always()
+    uses: ./.github/workflows/_release-aggregate.yml

@@ -1,0 +1,160 @@
+name: Reusable Aggregate Release
+
+on:
+  workflow_call:
+
+permissions:
+  contents: write
+
+jobs:
+  aggregate:
+    runs-on: ubuntu-latest
+    outputs:
+      artifact-count: ${{ steps.aggregate.outputs.artifact-count }}
+      total-size: ${{ steps.aggregate.outputs.total-size }}
+      package-name: ${{ steps.aggregate.outputs.package-name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 📥 Download all plugin artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: "*-wasip1"
+          merge-multiple: false
+
+      - name: 📦 Aggregate all plugins into master package
+        id: aggregate
+        shell: bash
+        run: |
+          staging_dir="${runner.temp}/lanlu-plugins-wasip1"
+          mkdir -p "${staging_dir}"
+
+          echo "::group::Collecting plugins"
+          artifact_count=0
+          total_size=0
+          declare -A plugin_sizes
+          plugin_list="[]"
+
+          for dir in artifacts/*/; do
+            plugin_name="$(basename "${dir}")"
+            wasm_files=("${dir}"*.wasm)
+            if [ ${#wasm_files[@]} -eq 0 ]; then
+              echo "  ⚠️  ${plugin_name}: no .wasm found, skipping"
+              continue
+            fi
+            wasm_file="${wasm_files[0]}"
+            wasm_name="$(basename "${wasm_file}")"
+            wasm_size="$(stat --printf='%s' "${wasm_file}")"
+            cp "${wasm_file}" "${staging_dir}/${wasm_name}"
+            plugin_sizes["${plugin_name}"]=${wasm_size}
+            total_size=$((total_size + wasm_size))
+            artifact_count=$((artifact_count + 1))
+            echo "  ✅ ${plugin_name}: ${wasm_name} ($(numfmt --to=iec-i ${wasm_size}))"
+          done
+          echo "::endgroup::"
+
+          # Create aggregate metadata
+          timestamp="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+          cat > "${staging_dir}/metadata.json" <<-EOF
+          {
+            "name": "lanlu-wasip1-plugins",
+            "version": "${GITHUB_SHA::7}",
+            "created": "${timestamp}",
+            "plugin_count": ${artifact_count},
+            "total_size_bytes": ${total_size},
+            "commit": "${GITHUB_SHA}",
+            "ref": "${GITHUB_REF_NAME}",
+            "plugins": [
+          EOF
+
+          first=true
+          for dir in artifacts/*/; do
+            plugin_name="$(basename "${dir}")"
+            wasm_files=("${dir}"*.wasm)
+            [ ${#wasm_files[@]} -eq 0 ] && continue
+            wasm_file="${wasm_files[0]}"
+            wasm_name="$(basename "${wasm_file}")"
+            wasm_size="${plugin_sizes[${plugin_name}]}"
+            if [ "${first}" = true ]; then
+              first=false
+            else
+              echo "," >> "${staging_dir}/metadata.json"
+            fi
+            printf '    {"plugin":"%s","artifact":"%s","size_bytes":%d}' \
+              "${plugin_name}" "${wasm_name}" "${wasm_size}" >> "${staging_dir}/metadata.json"
+          done
+          echo "" >> "${staging_dir}/metadata.json"
+          echo "]}" >> "${staging_dir}/metadata.json"
+
+          # Create compressed master package
+          version="${GITHUB_SHA::7}"
+          package_name="lanlu-plugins-wasip1-${version}.tar.gz"
+          package_path="${runner.temp}/${package_name}"
+          tar -czf "${package_path}" -C "${runner.temp}" "lanlu-plugins-wasip1"
+
+          package_size="$(stat --printf='%s' "${package_path}")"
+          echo "artifact-count=${artifact_count}" >> "${GITHUB_OUTPUT}"
+          echo "total-size=${total_size}" >> "${GITHUB_OUTPUT}"
+          echo "package-name=${package_name}" >> "${GITHUB_OUTPUT}"
+
+          echo "✅ Master package: ${package_name}"
+          echo "   Plugins: ${artifact_count}"
+          echo "   Total wasm size: $(numfmt --to=iec-i ${total_size})"
+          echo "   Package size: $(numfmt --to=iec-i ${package_size})"
+
+      - name: ⬆ Upload aggregate package
+        uses: actions/upload-artifact@v4
+        with:
+          name: lanlu-plugins-wasip1-aggregate
+          path: ${{ runner.temp }}/${{ steps.aggregate.outputs.package-name }}
+          if-no-files-found: error
+
+      - name: 📋 Aggregate build summary
+        if: always()
+        shell: bash
+        run: |
+          count="${{ steps.aggregate.outputs.artifact-count }}"
+          total="${{ steps.aggregate.outputs.total-size }}"
+          pkg="${{ steps.aggregate.outputs.package-name }}"
+          echo "## 📦 Aggregate Release Summary" >> "${GITHUB_STEP_SUMMARY}"
+          echo "" >> "${GITHUB_STEP_SUMMARY}"
+          echo "| Item | Value |" >> "${GITHUB_STEP_SUMMARY}"
+          echo "|------|-------|" >> "${GITHUB_STEP_SUMMARY}"
+          echo "| Plugins bundled | ${count} |" >> "${GITHUB_STEP_SUMMARY}"
+          echo "| Total wasm size | $(numfmt --to=iec-i ${total}) (${total} bytes) |" >> "${GITHUB_STEP_SUMMARY}"
+          echo "| Package | ${pkg} |" >> "${GITHUB_STEP_SUMMARY}"
+          echo "| Commit | ${GITHUB_SHA::7} |" >> "${GITHUB_STEP_SUMMARY}"
+          echo "| Ref | ${GITHUB_REF_NAME} |" >> "${GITHUB_STEP_SUMMARY}"
+          echo "" >> "${GITHUB_STEP_SUMMARY}"
+          echo "### Plugins included" >> "${GITHUB_STEP_SUMMARY}"
+          echo "" >> "${GITHUB_STEP_SUMMARY}"
+          echo "| # | Plugin | Artifact | Size |" >> "${GITHUB_STEP_SUMMARY}"
+          echo "|---|--------|----------|------|" >> "${GITHUB_STEP_SUMMARY}"
+          index=0
+          for dir in artifacts/*/; do
+            plugin_name="$(basename "${dir}")"
+            wasm_files=("${dir}"*.wasm)
+            [ ${#wasm_files[@]} -eq 0 ] && continue
+            wasm_file="${wasm_files[0]}"
+            wasm_name="$(basename "${wasm_file}")"
+            wasm_size="$(stat --printf='%s' "${wasm_file}")"
+            index=$((index + 1))
+            echo "| ${index} | ${plugin_name} | ${wasm_name} | $(numfmt --to=iec-i ${wasm_size}) |" >> "${GITHUB_STEP_SUMMARY}"
+          done
+
+      - name: 🚀 Publish aggregate to nightly release
+        if: github.event_name != 'pull_request'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: nightly
+          name: nightly
+          target_commitish: ${{ github.sha }}
+          make_latest: false
+          generate_release_notes: true
+          overwrite_files: true
+          files: |
+            ${{ runner.temp }}/${{ steps.aggregate.outputs.package-name }}

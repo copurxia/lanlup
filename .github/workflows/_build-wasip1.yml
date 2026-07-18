@@ -16,6 +16,9 @@ jobs:
     defaults:
       run:
         working-directory: ${{ inputs.plugin }}
+    outputs:
+      wasm-size: ${{ steps.package.outputs.wasm-size }}
+      wasm-name: ${{ steps.package.outputs.wasm-name }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -27,37 +30,121 @@ jobs:
         with:
           targets: wasm32-wasip1
 
-      - name: Build wasm32-wasip1 release
-        run: cargo build --locked --target wasm32-wasip1 --release
+      - name: ⏳ Build wasm32-wasip1 release
+        id: build
+        shell: bash
+        run: |
+          echo "::group::Build details"
+          echo "plugin: ${{ inputs.plugin }}"
+          echo "target: wasm32-wasip1"
+          echo "profile: release"
+          echo "started: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+          echo "::endgroup::"
+          cargo build --locked --target wasm32-wasip1 --release
+          echo "completed: $(date -u '+%Y-%m-%dT%H:%M:%SZ')" >> "${GITHUB_OUTPUT}"
 
-      - name: Locate wasm artifact
+      - name: 🔍 Locate wasm artifact
         id: locate
         shell: bash
         run: |
           wasm_file="$(find target/wasm32-wasip1/release -maxdepth 1 -type f -name '*.wasm' | head -n 1)"
           if [ -z "${wasm_file}" ]; then
-            echo "No wasm artifact found in target/wasm32-wasip1/release"
+            echo "❌ No wasm artifact found in target/wasm32-wasip1/release"
             exit 1
           fi
+          wasm_size="$(stat --printf='%s' "${wasm_file}")"
+          wasm_name="$(basename "${wasm_file}")"
           echo "wasm_file=${wasm_file}" >> "${GITHUB_OUTPUT}"
+          echo "wasm_size=${wasm_size}" >> "${GITHUB_OUTPUT}"
+          echo "wasm_name=${wasm_name}" >> "${GITHUB_OUTPUT}"
+          echo "✅ Found: ${wasm_name} ($(numfmt --to=iec-i "${wasm_size}"))"
 
-      - name: Upload wasm artifact
+      - name: 📦 Package compressed artifact
+        id: package
+        shell: bash
+        run: |
+          wasm_file="${{ steps.locate.outputs.wasm_file }}"
+          wasm_name="${{ steps.locate.outputs.wasm_name }}"
+          wasm_size="${{ steps.locate.outputs.wasm_size }}"
+          plugin="${{ inputs.plugin }}"
+          version="${GITHUB_SHA::7}"
+          timestamp="$(date -u '+%Y%m%dT%H%M%SZ')"
+
+          # Create staging directory
+          staging_dir="${runner.temp}/${plugin}-wasip1"
+          mkdir -p "${staging_dir}"
+
+          # Copy wasm
+          cp "${wasm_file}" "${staging_dir}/${wasm_name}"
+
+          # Create metadata file
+          cat > "${staging_dir}/metadata.json" <<-EOF
+          {
+            "plugin": "${plugin}",
+            "artifact": "${wasm_name}",
+            "size_bytes": ${wasm_size},
+            "commit": "${GITHUB_SHA}",
+            "build_time": "${timestamp}",
+            "target": "wasm32-wasip1",
+            "ref": "${GITHUB_REF_NAME}"
+          }
+          EOF
+
+          # Create compressed archive
+          archive_name="${plugin}-wasip1-${version}.tar.gz"
+          archive_path="${runner.temp}/${archive_name}"
+          tar -czf "${archive_path}" -C "${runner.temp}" "${plugin}-wasip1"
+
+          echo "archive=${archive_path}" >> "${GITHUB_OUTPUT}"
+          echo "archive-name=${archive_name}" >> "${GITHUB_OUTPUT}"
+          echo "wasm-size=${wasm_size}" >> "${GITHUB_OUTPUT}"
+          echo "wasm-name=${wasm_name}" >> "${GITHUB_OUTPUT}"
+          archive_size="$(stat --printf='%s' "${archive_path}")"
+          echo "✅ Packaged: ${archive_name} ($(numfmt --to=iec-i "${archive_size}"))"
+
+      - name: ⬆ Upload wasm artifact (raw)
         uses: actions/upload-artifact@v4
         with:
           name: ${{ inputs.plugin }}-wasip1
           path: ${{ inputs.plugin }}/${{ steps.locate.outputs.wasm_file }}
           if-no-files-found: error
 
-      - name: Prepare release asset
+      - name: ⬆ Upload compressed package
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.plugin }}-wasip1-package
+          path: ${{ steps.package.outputs.archive }}
+          if-no-files-found: error
+
+      - name: 📋 Build summary
+        if: always()
+        shell: bash
+        run: |
+          wasm_name="${{ steps.locate.outputs.wasm_name }}"
+          wasm_size="${{ steps.locate.outputs.wasm_size }}"
+          archive_name="${{ steps.package.outputs.archive-name }}"
+          echo "## ✅ Build result: ${{ inputs.plugin }}" >> "${GITHUB_STEP_SUMMARY}"
+          echo "" >> "${GITHUB_STEP_SUMMARY}"
+          echo "| Item | Value |" >> "${GITHUB_STEP_SUMMARY}"
+          echo "|------|-------|" >> "${GITHUB_STEP_SUMMARY}"
+          echo "| Plugin | ${{ inputs.plugin }} |" >> "${GITHUB_STEP_SUMMARY}"
+          echo "| Target | wasm32-wasip1 |" >> "${GITHUB_STEP_SUMMARY}"
+          echo "| Artifact | ${wasm_name} |" >> "${GITHUB_STEP_SUMMARY}"
+          echo "| Size | $(numfmt --to=iec-i "${wasm_size}") (${wasm_size} bytes) |" >> "${GITHUB_STEP_SUMMARY}"
+          echo "| Package | ${archive_name} |" >> "${GITHUB_STEP_SUMMARY}"
+          echo "| Commit | ${GITHUB_SHA::7} |" >> "${GITHUB_STEP_SUMMARY}"
+          echo "| Ref | ${GITHUB_REF_NAME} |" >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: 🚀 Prepare release asset
         if: github.event_name != 'pull_request'
         id: release_asset
         shell: bash
         run: |
-          asset="${{ runner.temp }}/${{ inputs.plugin }}-wasip1.wasm"
+          asset="${runner.temp}/${{ inputs.plugin }}-wasip1.wasm"
           cp "${{ steps.locate.outputs.wasm_file }}" "${asset}"
           echo "file=${asset}" >> "${GITHUB_OUTPUT}"
 
-      - name: Publish to shared nightly release
+      - name: 🚀 Publish to shared nightly release
         if: github.event_name != 'pull_request'
         uses: softprops/action-gh-release@v2
         with:
