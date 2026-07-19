@@ -41,7 +41,7 @@ jobs:
           echo "started: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
           echo "::endgroup::"
           cargo build --locked --target wasm32-wasip1 --release
-          echo "completed: $(date -u '+%Y-%m-%dT%H:%M:%SZ')" >> "${GITHUB_OUTPUT}"
+          echo "completed=$(date -u '+%Y-%m-%dT%H:%M:%SZ')" >> "${GITHUB_OUTPUT}"
 
       - name: 🔍 Locate wasm artifact
         id: locate
