@@ -71,7 +71,7 @@ jobs:
           timestamp="$(date -u '+%Y%m%dT%H%M%SZ')"
 
           # Create staging directory
-          staging_dir="${runner.temp}/${plugin}-wasip1"
+          staging_dir="${{ runner.temp }}/${plugin}-wasip1"
           mkdir -p "${staging_dir}"
 
           # Copy wasm
@@ -92,8 +92,8 @@ jobs:
 
           # Create compressed archive
           archive_name="${plugin}-wasip1-${version}.tar.gz"
-          archive_path="${runner.temp}/${archive_name}"
-          tar -czf "${archive_path}" -C "${runner.temp}" "${plugin}-wasip1"
+          archive_path="${{ runner.temp }}/${archive_name}"
+          tar -czf "${archive_path}" -C "${{ runner.temp }}" "${plugin}-wasip1"
 
           echo "archive=${archive_path}" >> "${GITHUB_OUTPUT}"
           echo "archive-name=${archive_name}" >> "${GITHUB_OUTPUT}"
@@ -140,7 +140,7 @@ jobs:
         id: release_asset
         shell: bash
         run: |
-          asset="${runner.temp}/${{ inputs.plugin }}-wasip1.wasm"
+          asset="${{ runner.temp }}/${{ inputs.plugin }}-wasip1.wasm"
           cp "${{ steps.locate.outputs.wasm_file }}" "${asset}"
           echo "file=${asset}" >> "${GITHUB_OUTPUT}"
 

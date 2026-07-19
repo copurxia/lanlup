@@ -30,7 +30,7 @@ jobs:
         id: aggregate
         shell: bash
         run: |
-          staging_dir="${runner.temp}/lanlu-plugins-wasip1"
+          staging_dir="${{ runner.temp }}/lanlu-plugins-wasip1"
           mkdir -p "${staging_dir}"
 
           echo "::group::Collecting plugins"
@@ -93,8 +93,8 @@ jobs:
           # Create compressed master package
           version="${GITHUB_SHA::7}"
           package_name="lanlu-plugins-wasip1-${version}.tar.gz"
-          package_path="${runner.temp}/${package_name}"
-          tar -czf "${package_path}" -C "${runner.temp}" "lanlu-plugins-wasip1"
+          package_path="${{ runner.temp }}/${package_name}"
+          tar -czf "${package_path}" -C "${{ runner.temp }}" "lanlu-plugins-wasip1"
 
           package_size="$(stat --printf='%s' "${package_path}")"
           echo "artifact-count=${artifact_count}" >> "${GITHUB_OUTPUT}"
