@@ -1183,7 +1183,7 @@ fn resolve_source_metadata(input: &PluginInput) -> Value {
                 "sort_order": ep_order,
             });
             if cover_asset_id > 0 {
-                child["assets"] = json!({ "cover": cover_asset_id });
+                child["assets"] = json!([{ "key": "cover", "value": cover_asset_id }]);
             }
             child
         }).collect();
@@ -1194,7 +1194,9 @@ fn resolve_source_metadata(input: &PluginInput) -> Value {
             "tags": Value::Array(tags),
             "children": children,
         });
-        if cover_asset_id > 0 { data["cover_asset_id"] = json!(cover_asset_id); }
+        if cover_asset_id > 0 {
+            data["assets"] = json!([{ "key": "cover", "value": cover_asset_id }]);
+        }
         HostBridge::progress(100, "元数据获取完成");
         json!({"success": true, "data": data})
     } else {
@@ -1261,7 +1263,9 @@ fn build_single_ep_result(
         "tags": Value::Array(tags),
         "children": children,
     });
-    if cover_asset_id > 0 { data["cover_asset_id"] = json!(cover_asset_id); }
+    if cover_asset_id > 0 {
+        data["assets"] = json!([{ "key": "cover", "value": cover_asset_id }]);
+    }
     HostBridge::progress(100, "元数据获取完成");
     json!({"success": true, "data": data})
 }

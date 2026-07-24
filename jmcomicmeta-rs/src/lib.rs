@@ -591,7 +591,7 @@ fn resolve_source_metadata(input: &PluginInput) -> Value {
                         });
                         // 每个档案复用合集封面（对齐 picacgmeta）
                         if cover_asset_id > 0 {
-                            child["assets"] = json!({ "cover": cover_asset_id });
+                            child["assets"] = json!([{ "key": "cover", "value": cover_asset_id }]);
                         }
                         Some(child)
                     }).collect();
@@ -625,7 +625,8 @@ fn resolve_source_metadata(input: &PluginInput) -> Value {
                         "children": children,
                     });
                     if cover_asset_id > 0 {
-                        data["cover_asset_id"] = json!(cover_asset_id);
+                        data["assets"] =
+                            json!([{ "key": "cover", "value": cover_asset_id }]);
                     }
                     HostBridge::progress(100, "元数据获取完成");
                     return json!({"success": true, "data": data});
@@ -669,7 +670,7 @@ fn resolve_source_metadata(input: &PluginInput) -> Value {
         "children": children,
     });
     if cover_asset_id > 0 {
-        data["cover_asset_id"] = json!(cover_asset_id);
+        data["assets"] = json!([{ "key": "cover", "value": cover_asset_id }]);
     }
 
     HostBridge::progress(100, "元数据获取完成");
@@ -729,7 +730,13 @@ fn execute_plugin(input: PluginInput) -> Result<Value, String> {
         metadata.insert("tags".to_string(), metadata_tags_from_csv(&tags_csv));
     }
     if fetch_cover && !cover.is_empty() {
-        metadata.insert("cover".to_string(), Value::String(cover));
+        let cover_asset_id = resolve_cover_asset(&cover, &album_id, &bypass_url);
+        if cover_asset_id > 0 {
+            metadata.insert(
+                "assets".to_string(),
+                json!([{ "key": "cover", "value": cover_asset_id }]),
+            );
+        }
     }
     metadata.insert("children".to_string(), Value::Array(Vec::new()));
     metadata.remove("archive");

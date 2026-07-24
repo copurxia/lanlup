@@ -429,7 +429,7 @@ fn resolve_source_metadata(input: &PluginInput) -> Value {
                 });
                 // 每个档案复用合集封面（对齐 picacgmeta/jmcomicmeta）
                 if cover_asset_id > 0 {
-                    child["assets"] = json!({ "cover": cover_asset_id });
+                    child["assets"] = json!([{ "key": "cover", "value": cover_asset_id }]);
                 }
                 child
             }).collect();
@@ -441,7 +441,7 @@ fn resolve_source_metadata(input: &PluginInput) -> Value {
                 "children": children,
             });
             if cover_asset_id > 0 {
-                data["cover_asset_id"] = json!(cover_asset_id);
+                data["assets"] = json!([{ "key": "cover", "value": cover_asset_id }]);
             }
             HostBridge::progress(100, "元数据获取完成");
             json!({"success": true, "data": data})
@@ -589,7 +589,13 @@ fn execute_plugin(input: PluginInput) -> Result<Value, String> {
         metadata.insert("description".to_string(), Value::String(detail.description));
     }
     if fetch_cover && !detail.cover.is_empty() {
-        metadata.insert("cover".to_string(), Value::String(detail.cover));
+        let cover_asset_id = resolve_cover_asset(&detail.cover, &comic_id);
+        if cover_asset_id > 0 {
+            metadata.insert(
+                "assets".to_string(),
+                json!([{ "key": "cover", "value": cover_asset_id }]),
+            );
+        }
     }
     metadata.insert("children".to_string(), Value::Array(Vec::new()));
     metadata.remove("archive");

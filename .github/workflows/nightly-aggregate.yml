@@ -27,7 +27,9 @@ jobs:
           # Find all plugin workflow files (excluding templates)
           plugins=()
           for wf in .github/workflows/*-rs-wasip1.yml; do
-            plugin="$(basename "${wf}" -rs-wasip1.yml)"
+            # Keep the `-rs` suffix because it is part of the plugin directory
+            # name (for example, ehentai-rs-wasip1.yml -> ehentai-rs).
+            plugin="$(basename "${wf}" -wasip1.yml)"
             plugins+=("${plugin}")
           done
           # If user specified plugins, filter
