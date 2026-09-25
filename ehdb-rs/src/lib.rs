@@ -228,6 +228,14 @@ struct TitleSearchContext {
     artist: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExpectedLang {
+    Chinese,
+    Korean,
+    English,
+    Japanese,
+}
+
 #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
 #[derive(Clone, Debug)]
 struct HostTcpStream {
@@ -919,14 +927,23 @@ fn plugin_info_json() -> Value {
         "name": "EHDB (Rust/WASM)",
         "type": "metadata",
         "namespace": "ehdb",
-        "author": "codex",
-        "version": "0.1.0",
-        "description": "Rust/WASM port of the EHDB metadata plugin.",
+        "author": "codex, 沐沐沐白",
+        "version": "0.1.2",
+        "description": "基于离线 PostgreSQL 数据库的 EHDB 元数据插件（支持语言偏好匹配） / Rust/WASM port of EHDB with smart language targeting.",
         "parameters": [
-            {"name": "connection_string", "type": "string", "desc": "PostgreSQL connection string (sslmode=disable only)"}
+            {
+                "name": "connection_string",
+                "type": "string",
+                "desc": "【数据库连接串 / Connection string】PostgreSQL connection string (如 postgresql://user:pass@host:5432/ehdb?sslmode=disable)"
+            },
+            {
+                "name": "keep_local_title",
+                "type": "bool",
+                "desc": "【保留本地压缩包原名 / Keep archive filename】开启后不覆盖本地原有标题，仅拉取标签、画师、更新时间等元数据"
+            }
         ],
         "permissions": permissions,
-        "oneshot_arg": "Gallery URL or GID/Token (Will match this exact gallery)",
+        "oneshot_arg": "画廊链接或 GID/Token (精准匹配此画廊 / Gallery URL or GID/Token)",
         "cooldown": 0,
         "runtime": runtime,
         "abi_version": 1
@@ -969,15 +986,23 @@ fn execute_plugin(input: PluginInput) -> Result<Value, String> {
     let config = parse_connection_string(&connection_string)?;
     let mut client = PgClient::connect(&config)?;
 
+    let keep_local_title = read_bool_param(&input.params, "keep_local_title");
+
     HostBridge::progress(5, "初始化数据库连接...");
     let target_type = normalized_target_type(&input.target_type, &input.params);
     let metadata = ensure_metadata_object(input.metadata);
     let result = if target_type == "tankoubon" || target_type == "tank" {
         HostBridge::progress(35, "处理合集成员...");
-        run_collection_mode(&mut client, target_id, metadata)?
+        run_collection_mode(&mut client, target_id, metadata, keep_local_title)?
     } else {
         HostBridge::progress(35, "开始搜索画廊...");
-        run_archive_mode(&mut client, target_id, input.oneshot_param.trim(), metadata)?
+        run_archive_mode(
+            &mut client,
+            target_id,
+            input.oneshot_param.trim(),
+            metadata,
+            keep_local_title,
+        )?
     };
     HostBridge::progress(100, "元数据获取完成");
     Ok(result)
@@ -988,18 +1013,30 @@ fn run_archive_mode(
     archive_id: &str,
     oneshot_param: &str,
     mut metadata: Map<String, Value>,
+    keep_local_title: bool,
 ) -> Result<Value, String> {
+    let orig_title = metadata_string(&metadata, "title");
     let search_payload = build_search_payload(
         client,
         archive_id,
-        metadata_string(&metadata, "title"),
+        orig_title.clone(),
         metadata_tags_to_csv(metadata.get("tags")),
         oneshot_param,
     )?;
 
-    if !search_payload.title.is_empty() {
-        metadata.insert("title".to_string(), Value::String(search_payload.title));
+    if keep_local_title {
+        metadata.remove("title");
+    } else {
+        let title_to_use = if !search_payload.title.is_empty() {
+            search_payload.title
+        } else {
+            orig_title
+        };
+        if !title_to_use.is_empty() {
+            metadata.insert("title".to_string(), Value::String(title_to_use));
+        }
     }
+
     metadata.insert(
         "tags".to_string(),
         Value::Array(
@@ -1025,6 +1062,7 @@ fn run_collection_mode(
     client: &mut PgClient,
     tankoubon_id: &str,
     mut root_metadata: Map<String, Value>,
+    keep_local_title: bool,
 ) -> Result<Value, String> {
     let archive_ids = HostBridge::list_tankoubon_archives(tankoubon_id)?
         .into_iter()
@@ -1047,23 +1085,27 @@ fn run_collection_mode(
 
         let archive_metadata =
             ensure_metadata_object(HostBridge::get_archive_metadata(archive_id)?);
+        let orig_title = metadata_string(&archive_metadata, "title");
         let search_payload = build_search_payload(
             client,
             archive_id,
-            metadata_string(&archive_metadata, "title"),
+            orig_title.clone(),
             metadata_tags_to_csv(archive_metadata.get("tags")),
             "",
         )?;
 
         let mut patch = Map::<String, Value>::new();
-        patch.insert(
-            "title".to_string(),
-            Value::String(if !search_payload.title.is_empty() {
+        if !keep_local_title {
+            let final_title = if !search_payload.title.is_empty() {
                 search_payload.title
             } else {
-                metadata_string(&archive_metadata, "title")
-            }),
-        );
+                orig_title
+            };
+            if !final_title.is_empty() {
+                patch.insert("title".to_string(), Value::String(final_title));
+            }
+        }
+
         patch.insert("type".to_string(), Value::from(0));
         patch.insert(
             "description".to_string(),
@@ -1117,8 +1159,9 @@ fn build_search_payload(
     existing_tags: String,
     oneshot_param: &str,
 ) -> Result<SearchPayload, String> {
-    let exact = extract_exact_gallery(oneshot_param)
-        .or_else(|| extract_exact_gallery_from_source_tags(&existing_tags));
+    // 只认手动输入的画廊链接(oneshot_param)直连；
+    // 不再解析已有 source: 标签，防止历史残留的旧链接截断搜索
+    let exact = extract_exact_gallery(oneshot_param);
 
     let gallery = match exact {
         Some(gallery) => gallery,
@@ -1146,6 +1189,7 @@ fn build_search_payload(
     let _ = archive_id;
     Ok(SearchPayload {
         tags_csv: tags,
+        // 优先使用日文/汉化原名 title_jpn
         title: if !search_data.title.is_empty() {
             search_data.title
         } else if !gallery.title_jpn.is_empty() {
@@ -1157,6 +1201,128 @@ fn build_search_payload(
     })
 }
 
+// ==================== 统一词库与特征检测中心 ====================
+
+// 1. 语言特征检测：返回 (是否中文, 是否韩文, 是否英文)
+fn match_language_flags(combined_title: &str, tags_json: &str) -> (bool, bool, bool) {
+    let lower = combined_title.to_ascii_lowercase();
+    let tags = parse_json_string_array(tags_json);
+
+    let has_tag = |lang: &str| {
+        let target = format!("language:{lang}");
+        tags.iter().any(|t| t.trim().eq_ignore_ascii_case(&target))
+    };
+
+    // 中文字词库
+    let zh_tokens = [
+        "chinese",
+        "中国翻訳",
+        "中国翻译",
+        "中国",
+        "机翻",
+        "汉化",
+        "漢化",
+        "中文",
+        "渣嵌",
+        "渣翻",
+        "重嵌",
+    ];
+    let is_zh = has_tag("chinese")
+        || zh_tokens
+            .iter()
+            .any(|&token| lower.contains(&token.to_ascii_lowercase()));
+
+    // 韩文字词库
+    let ko_tokens = ["korean", "韓国", "韩国", "한국"];
+    let is_ko = has_tag("korean")
+        || ko_tokens
+            .iter()
+            .any(|&token| lower.contains(&token.to_ascii_lowercase()));
+
+    // 英文字词库
+    let en_tokens = ["english", "英文", "英訳", "英翻"];
+    let is_en = has_tag("english")
+        || en_tokens
+            .iter()
+            .any(|&token| lower.contains(&token.to_ascii_lowercase()));
+
+    (is_zh, is_ko, is_en)
+}
+
+// 2. 根据原始标题识别期望语言
+fn detect_title_expected_lang(raw: &str) -> ExpectedLang {
+    let (is_zh, is_ko, is_en) = match_language_flags(raw, "[]");
+    if is_zh {
+        ExpectedLang::Chinese
+    } else if is_ko {
+        ExpectedLang::Korean
+    } else if is_en {
+        ExpectedLang::English
+    } else {
+        ExpectedLang::Japanese
+    }
+}
+
+// 4. 词边界匹配：避免 "dl" 之类的短词误命中 "goodluck" 等长单词内部
+fn contains_ascii_word(text_lower: &str, word: &str) -> bool {
+    text_lower
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|token| token == word)
+}
+
+// 3. 次级特征检测：返回 (是否无修正/去码, 是否Sample/見本, 是否连载/未完)
+fn match_secondary_flags(combined_title: &str, tags_json: &str) -> (bool, bool, bool) {
+    let lower = combined_title.to_ascii_lowercase();
+    let tags = parse_json_string_array(tags_json);
+
+    let has_any_tag = |target_tags: &[&str]| {
+        tags.iter().any(|t| {
+            let tl = t.trim().to_ascii_lowercase();
+            target_tags.iter().any(|&target| tl == target)
+        })
+    };
+
+    // 无修正/去码词库（数据库 tag 与标题关键词双重判定）
+    let uncensored_tokens = [
+        "無修正",
+        "无修正",
+        "去码",
+        "去碼",
+        "步兵",
+        "textless",
+        "uncensored",
+        "uncenseored",
+        "decensored",
+        "decensor",
+    ];
+    let is_uncensored = has_any_tag(&[
+        "uncensored",
+        "misc:uncensored",
+        "decensored",
+        "misc:decensored",
+        "textless",
+        "misc:textless",
+    ]) || uncensored_tokens
+        .iter()
+        .any(|&t| lower.contains(&t.to_ascii_lowercase()));
+
+    // 样本/見本词库
+    let sample_tokens = ["sample", "見本"];
+    let is_sample = has_any_tag(&["sample", "misc:sample"])
+        || sample_tokens
+            .iter()
+            .any(|&t| lower.contains(&t.to_ascii_lowercase()));
+
+    // 连载中/未完词库
+    let ongoing_tokens = ["未完", "进行中", "進行中", "ongoing"];
+    let is_ongoing = has_any_tag(&["ongoing", "misc:ongoing"])
+        || ongoing_tokens
+            .iter()
+            .any(|&t| lower.contains(&t.to_ascii_lowercase()));
+
+    (is_uncensored, is_sample, is_ongoing)
+}
+
 fn lookup_gallery_by_title_and_tags(
     client: &mut PgClient,
     title: &str,
@@ -1164,30 +1330,54 @@ fn lookup_gallery_by_title_and_tags(
 ) -> Result<GalleryMatch, String> {
     let context = preprocess_title(title);
     let artist = extract_artist_tag(existing_tags).unwrap_or_else(|| context.artist.clone());
+    let expected_lang = detect_title_expected_lang(title);
 
-    if let Some(found) = search_by_full_text(client, &context, &artist)? {
-        return Ok(found);
+    let mut all_rows = Vec::new();
+
+    // 1. 全文搜索阶段
+    if let Ok(rows) = search_by_full_text(client, &context, &artist) {
+        all_rows.extend(rows);
     }
-    if !context.keywords.is_empty() {
-        if let Some(found) = search_by_keywords(client, &context.keywords, &artist)? {
-            return Ok(found);
+
+    // 2. 关键词匹配阶段
+    if all_rows.len() < 10 && !context.keywords.is_empty() {
+        if let Ok(rows) = search_by_keywords(client, &context.keywords, &artist) {
+            all_rows.extend(rows);
         }
     }
-    if context.core.chars().count() >= 4 {
-        if let Some(found) = search_by_trigram(client, &context.core, &artist)? {
-            return Ok(found);
+
+    // 3. Trigram 模糊匹配阶段
+    if all_rows.len() < 10 && context.core.chars().count() >= 4 {
+        if let Ok(rows) = search_by_trigram(client, &context.core, &artist) {
+            all_rows.extend(rows);
         }
     }
-    Err("No gallery found in database".to_string())
+
+    // 4. 按 gid 去重
+    let mut seen_gids = std::collections::HashSet::new();
+    let unique_rows: Vec<QueryRow> = all_rows
+        .into_iter()
+        .filter(|row| {
+            let gid = row_string(row, "gid");
+            !gid.is_empty() && seen_gids.insert(gid)
+        })
+        .collect();
+
+    if unique_rows.is_empty() {
+        return Err("No gallery found in database".to_string());
+    }
+
+    // 传清洗后的 core 算相似度，传原始 title 探测期望标签
+    select_best_match(unique_rows, &context.core, title, expected_lang)
 }
 
 fn search_by_full_text(
     client: &mut PgClient,
     context: &TitleSearchContext,
     artist: &str,
-) -> Result<Option<GalleryMatch>, String> {
+) -> Result<Vec<QueryRow>, String> {
     if has_japanese(&context.core) {
-        return Ok(None);
+        return Ok(Vec::new());
     }
     let words = context
         .core
@@ -1200,62 +1390,43 @@ fn search_by_full_text(
         })
         .filter(|word| !word.is_empty())
         .collect::<Vec<_>>();
+
     if words.is_empty() {
-        return Ok(None);
+        return Ok(Vec::new());
     }
     let tsquery = words.join(" & ");
-    if let Some(found) = query_candidate_rows(
-        client,
-        &build_fulltext_query(&tsquery, artist),
-        &context.core,
-    )? {
-        return Ok(Some(found));
-    }
-    Ok(None)
+    client.query_rows(&build_fulltext_query(&tsquery, artist))
 }
 
 fn search_by_keywords(
     client: &mut PgClient,
     keywords: &[String],
     artist: &str,
-) -> Result<Option<GalleryMatch>, String> {
+) -> Result<Vec<QueryRow>, String> {
     if keywords.is_empty() {
-        return Ok(None);
+        return Ok(Vec::new());
     }
-    if let Some(found) = query_candidate_rows(
-        client,
-        &build_keywords_query(keywords, artist),
-        &keywords.join(" "),
-    )? {
-        return Ok(Some(found));
-    }
-    Ok(None)
+    client.query_rows(&build_keywords_query(keywords, artist))
 }
 
 fn search_by_trigram(
     client: &mut PgClient,
     core: &str,
     artist: &str,
-) -> Result<Option<GalleryMatch>, String> {
-    if let Some(found) = query_candidate_rows(client, &build_trigram_query(core, artist), core)? {
-        return Ok(Some(found));
-    }
-    Ok(None)
+) -> Result<Vec<QueryRow>, String> {
+    client.query_rows(&build_trigram_query(core, artist))
 }
 
-fn query_candidate_rows(
-    client: &mut PgClient,
-    sql: &str,
-    input: &str,
-) -> Result<Option<GalleryMatch>, String> {
-    let rows = client.query_rows(sql)?;
-    if rows.is_empty() {
-        return Ok(None);
-    }
-    select_best_match(rows, input).map(Some)
-}
+fn select_best_match(
+    rows: Vec<QueryRow>,
+    input_core: &str,
+    raw_title: &str,
+    expected_lang: ExpectedLang,
+) -> Result<GalleryMatch, String> {
+    // 1. 用最原始未清洗的标题探测期望特征（避免被提前擦除）
+    let (expects_uncensored, expects_sample, expects_ongoing) =
+        match_secondary_flags(raw_title, "[]");
 
-fn select_best_match(rows: Vec<QueryRow>, input: &str) -> Result<GalleryMatch, String> {
     let mut ranked = rows
         .into_iter()
         .filter_map(|row| {
@@ -1266,6 +1437,102 @@ fn select_best_match(rows: Vec<QueryRow>, input: &str) -> Result<GalleryMatch, S
             }
             let title = row_string(&row, "title");
             let title_jpn = row_string(&row, "title_jpn");
+            let tags_json = row_string(&row, "tags");
+
+            // 2. 算相似度时使用清洗后的纯净书名 input_core
+            let mut score = calculate_similarity(input_core, &title, &title_jpn);
+            let combined_title = format!("{title} {title_jpn}");
+
+            // 3. 调用统一语言函数
+            let (is_zh, is_ko, is_en) = match_language_flags(&combined_title, &tags_json);
+
+            let lower_comb = combined_title.to_ascii_lowercase();
+            let is_other_foreign = is_ko
+                || is_en
+                || lower_comb.contains("spanish")
+                || lower_comb.contains("russian")
+                || lower_comb.contains("french");
+
+            let is_pure_raw = !is_zh && !is_other_foreign;
+            let is_dl = contains_ascii_word(&lower_comb, "dl") || lower_comb.contains("digital");
+
+            // 一级加权：语言匹配
+            match expected_lang {
+                ExpectedLang::Chinese => {
+                    if is_zh {
+                        score += 1000;
+                    } else if is_pure_raw {
+                        score += 50;
+                    } else {
+                        score -= 500;
+                    }
+                }
+                ExpectedLang::Korean => {
+                    if is_ko {
+                        score += 1000;
+                    } else if is_pure_raw {
+                        score += 50;
+                    } else {
+                        score -= 500;
+                    }
+                }
+                ExpectedLang::English => {
+                    if is_en {
+                        score += 1000;
+                    } else if is_pure_raw {
+                        score += 50;
+                    } else {
+                        score -= 500;
+                    }
+                }
+                ExpectedLang::Japanese => {
+                    if is_pure_raw {
+                        if is_dl {
+                            score += 1200;
+                        } else {
+                            score += 1000;
+                        }
+                    } else if is_zh {
+                        score += 200;
+                    } else {
+                        score -= 500;
+                    }
+                }
+            }
+
+            // 4. 调用统一次级特征函数
+            let (is_candidate_uncensored, is_candidate_sample, is_candidate_ongoing) =
+                match_secondary_flags(&combined_title, &tags_json);
+
+            // 无修正次级匹配
+            if expects_uncensored {
+                if is_candidate_uncensored {
+                    score += 300;
+                }
+            } else if !is_candidate_uncensored {
+                score += 100;
+            }
+
+            // Sample 次级匹配（下全本避免错选 Sample）
+            if expects_sample {
+                if is_candidate_sample {
+                    score += 300;
+                }
+            } else if !is_candidate_sample {
+                score += 100;
+            } else {
+                score -= 300;
+            }
+
+            // Ongoing 次级匹配
+            if expects_ongoing {
+                if is_candidate_ongoing {
+                    score += 300;
+                }
+            } else if !is_candidate_ongoing {
+                score += 100;
+            }
+
             Some(EhdbCandidate {
                 gid,
                 token,
@@ -1279,60 +1546,68 @@ fn select_best_match(rows: Vec<QueryRow>, input: &str) -> Result<GalleryMatch, S
                 } else {
                     title_jpn.clone()
                 },
-                score: calculate_similarity(input, &row_string(&row, "title"), &title_jpn),
+                score,
                 posted: normalize_posted_value(&row_string(&row, "posted")),
                 cover: row_string(&row, "thumb"),
             })
         })
         .collect::<Vec<_>>();
+
     ranked.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.gid.cmp(&b.gid)));
 
     if ranked.is_empty() {
         return Err("No valid gallery rows found".to_string());
     }
-    if ranked[0].score < 35 {
-        return Err(format!(
-            "Best match score ({}) below threshold (35)",
-            ranked[0].score
-        ));
-    }
 
-    let fallback = ranked[0].clone();
-    let candidates = ranked
-        .into_iter()
-        .filter(|item| item.score >= 35)
-        .collect::<Vec<_>>();
-    let candidates = if candidates.is_empty() {
-        vec![fallback]
-    } else {
-        candidates
-    };
-    let picked = if candidates.len() == 1 {
-        candidates[0].clone()
-    } else {
-        let options = candidates
-            .iter()
-            .map(|item| {
-                json!({
-                    "label": if !item.title.is_empty() { item.title.clone() } else { format!("g/{}", item.gid) },
-                    "description": build_candidate_description(item),
-                    "cover": item.cover,
-                })
+    // 构建候选弹窗选项（调用统一函数生成标签）
+    let options = ranked
+        .iter()
+        .map(|item| {
+            let combined = format!("{} {}", item.title, item.title_alt);
+            let (is_zh, is_ko, is_en) = match_language_flags(&combined, "[]");
+            let mut tag = if is_zh {
+                "【中文/汉化】".to_string()
+            } else if is_en {
+                "【English】".to_string()
+            } else if is_ko {
+                "【한국어】".to_string()
+            } else {
+                "【日文/生肉】".to_string()
+            };
+
+            let (is_unc, is_sample, is_ongoing) = match_secondary_flags(&combined, "[]");
+            if is_unc {
+                tag.push_str("【无修正】");
+            }
+            if is_sample {
+                tag.push_str("【Sample】");
+            }
+            if is_ongoing {
+                tag.push_str("【连载中】");
+            }
+
+            json!({
+                "label": format!("{tag} {}", if !item.title.is_empty() { item.title.clone() } else { format!("g/{}", item.gid) }),
+                "description": build_candidate_description(item),
+                "cover": item.cover,
             })
-            .collect::<Vec<_>>();
-        let index = HostBridge::select_index(
-            "EHDB Candidate Match",
-            options,
-            &format!("Select EHDB match for \"{input}\""),
-            0,
-            120,
-        )?;
-        candidates
-            .get(index)
-            .cloned()
-            .or_else(|| candidates.first().cloned())
-            .ok_or_else(|| "No candidate selected".to_string())?
-    };
+        })
+        .collect::<Vec<_>>();
+
+    // 唤起候选选择面板
+    let index = HostBridge::select_index(
+        "EHDB 候选匹配",
+        options,
+        "检测到离线库匹配条目，请选择版本（按原标题语言偏好排在最前）：",
+        0,
+        120,
+    )?;
+
+    let picked = ranked
+        .get(index)
+        .cloned()
+        .or_else(|| ranked.first().cloned())
+        .ok_or_else(|| "No candidate selected".to_string())?;
 
     Ok(GalleryMatch {
         gid: picked.gid,
@@ -1442,6 +1717,18 @@ fn normalized_target_type(target_type: &str, params: &Value) -> String {
         .to_ascii_lowercase()
 }
 
+fn read_bool_param(params: &Value, key: &str) -> bool {
+    match params.get(key) {
+        Some(Value::Bool(v)) => *v,
+        Some(Value::Number(v)) => v.as_i64().unwrap_or(0) != 0,
+        Some(Value::String(v)) => matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "y" | "on"
+        ),
+        _ => false,
+    }
+}
+
 fn read_string_param(params: &Value, key: &str) -> Option<String> {
     params
         .get(key)
@@ -1521,20 +1808,6 @@ fn extract_exact_gallery(oneshot: &str) -> Option<GalleryMatch> {
         return None;
     }
     extract_gallery_from_text(input)
-}
-
-fn extract_exact_gallery_from_source_tags(tags_csv: &str) -> Option<GalleryMatch> {
-    for part in tags_csv.split(',') {
-        let trimmed = part.trim();
-        let source = trimmed
-            .strip_prefix("source:")
-            .or_else(|| trimmed.strip_prefix("Source:"))
-            .unwrap_or(trimmed);
-        if let Some(gallery) = extract_gallery_from_text(source.trim()) {
-            return Some(gallery);
-        }
-    }
-    None
 }
 
 fn extract_gallery_from_text(raw: &str) -> Option<GalleryMatch> {
@@ -1635,7 +1908,7 @@ fn has_japanese(text: &str) -> bool {
 }
 
 fn build_fulltext_query(tsquery: &str, artist: &str) -> String {
-    let select = "SELECT gid::text AS gid, token::text AS token, title::text AS title, title_jpn::text AS title_jpn, thumb::text AS thumb, posted::text AS posted FROM gallery";
+    let select = "SELECT gid::text AS gid, token::text AS token, title::text AS title, title_jpn::text AS title_jpn, thumb::text AS thumb, posted::text AS posted, tags::text AS tags FROM gallery";
     let rank_expr = format!(
         "ts_rank(title_tsv, to_tsquery('simple', {}))",
         sql_literal(tsquery)
@@ -1657,7 +1930,7 @@ fn build_fulltext_query(tsquery: &str, artist: &str) -> String {
 }
 
 fn build_keywords_query(keywords: &[String], artist: &str) -> String {
-    let select = "SELECT gid::text AS gid, token::text AS token, title::text AS title, title_jpn::text AS title_jpn, thumb::text AS thumb, posted::text AS posted FROM gallery";
+    let select = "SELECT gid::text AS gid, token::text AS token, title::text AS title, title_jpn::text AS title_jpn, thumb::text AS thumb, posted::text AS posted, tags::text AS tags FROM gallery";
     let conditions = keywords
         .iter()
         .map(|keyword| {
@@ -1684,7 +1957,7 @@ fn build_keywords_query(keywords: &[String], artist: &str) -> String {
 }
 
 fn build_trigram_query(core: &str, artist: &str) -> String {
-    let select = "SELECT gid::text AS gid, token::text AS token, title::text AS title, title_jpn::text AS title_jpn, thumb::text AS thumb, posted::text AS posted FROM gallery";
+    let select = "SELECT gid::text AS gid, token::text AS token, title::text AS title, title_jpn::text AS title_jpn, thumb::text AS thumb, posted::text AS posted, tags::text AS tags FROM gallery";
     let core_literal = sql_literal(core);
     let mut query =
         format!("{select} WHERE (title % {core_literal} OR title_jpn % {core_literal})");
@@ -1859,30 +2132,106 @@ fn looks_like_reasonable_artist(content: &str) -> bool {
 
 fn remove_suffix_markers(input: &str) -> String {
     let mut out = input.to_string();
+
     let suffix_tokens = [
+        // 版本与介质
+        "DL版",
         "DL",
         "Digital",
         "デジタル",
         "電子",
+        // 审查标记
         "无修正",
         "無修正",
+        "去码",
+        "去碼",
+        "步兵",
+        "Decensored",
+        "Uncensored",
+        // 中文翻译标记
+        "中国翻訳",
+        "中国翻译",
+        "Chinese",
         "中文",
         "汉化",
         "漢化",
-        "翻訳",
-        "翻译",
+        "机翻",
+        "渣翻",
+        "渣嵌",
+        "重嵌",
+        // 英文翻译标记
+        "English",
+        "英訳",
+        "英翻",
+        "英文",
+        // 韩文翻译标记
+        "韓国翻訳",
+        "한국어",
+        "Korean",
+        "韓国",
+        "韩国",
+        // 其他外语标记
+        "Spanish",
+        "Español",
+        "French",
+        "Français",
+        "Russian",
+        // 展会与刊物标记
         "COMIC",
         "Comiket",
+        // 状态标记（样本 / 未完连载）
+        "Sample",
+        "見本",
+        "未完",
+        "进行中",
+        "進行中",
+        "Ongoing",
     ];
+
     for token in suffix_tokens {
-        out = out.replace(token, " ");
+        out = replace_ignore_case(&out, token, " ");
     }
+
+    // 清除常见压缩包扩展名
     for ext in [".zip", ".rar", ".7z", ".cbz", ".cbr"] {
         if out.to_ascii_lowercase().ends_with(ext) {
             out.truncate(out.len() - ext.len());
         }
     }
+
     out
+}
+
+fn replace_ignore_case(text: &str, target: &str, replacement: &str) -> String {
+    if target.is_empty() || text.is_empty() {
+        return text.to_string();
+    }
+
+    let target_lower: Vec<char> = target.to_lowercase().chars().collect();
+    let text_chars: Vec<char> = text.chars().collect();
+    let target_len = target_lower.len();
+
+    let mut result = String::with_capacity(text.len());
+    let mut i = 0;
+
+    while i < text_chars.len() {
+        if i + target_len <= text_chars.len() {
+            let matched = text_chars[i..i + target_len]
+                .iter()
+                .flat_map(|c| c.to_lowercase())
+                .eq(target_lower.iter().copied());
+
+            if matched {
+                result.push_str(replacement);
+                i += target_len;
+                continue;
+            }
+        }
+        result.push(text_chars[i]);
+        i += 1;
+    }
+
+    result
 }
 
 fn remove_square_brackets(input: &str) -> String {
@@ -1945,8 +2294,8 @@ fn contains_marked_parenthesis_token(content: &str) -> bool {
         || lower.contains("digital")
         || lower.contains("comic")
         || lower.contains("c0")
-        || content.contains("翻訳")
-        || content.contains("翻译")
+        || content.contains("中国翻訳")
+        || content.contains("中国翻译")
 }
 
 fn collapse_spaces(input: &str) -> String {
