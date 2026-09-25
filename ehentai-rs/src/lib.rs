@@ -860,7 +860,7 @@ fn plugin_info_json() -> Value {
         "namespace": "ehentai",
         "source_id_regex": "^source:ehentaisource:.*$",
         "pre": ["ehlogin"],
-        "author": "Difegue and others",
+        "author": "Difegue and others, 沐沐沐白",
         "version": "2.6.2",
         "description": "搜索 E-Hentai 匹配画册元数据与标签 / Searches g.e-hentai for tags matching your archive.",
         "parameters": [

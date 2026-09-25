@@ -927,7 +927,7 @@ fn plugin_info_json() -> Value {
         "name": "EHDB (Rust/WASM)",
         "type": "metadata",
         "namespace": "ehdb",
-        "author": "codex",
+        "author": "codex, 沐沐沐白",
         "version": "0.1.2",
         "description": "基于离线 PostgreSQL 数据库的 EHDB 元数据插件（支持语言偏好匹配） / Rust/WASM port of EHDB with smart language targeting.",
         "parameters": [
