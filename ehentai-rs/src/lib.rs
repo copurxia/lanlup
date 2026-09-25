@@ -172,12 +172,22 @@ struct HttpResponseData {
     text: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExpectedLang {
+    Chinese,
+    Korean,
+    English,
+    Japanese,
+}
+
 #[derive(Clone, Debug)]
 struct Settings {
     lang: String,
     usethumbs: bool,
     search_gid: bool,
     enablepanda: bool,
+    keep_local_title: bool,
+    smart_lang_match: bool,
     jpntitle: bool,
     additionaltags: bool,
     expunged: bool,
@@ -517,9 +527,6 @@ fn resolve_cover_action(input: &PluginInput) -> Value {
         else if cover.to_ascii_lowercase().ends_with(".gif") { "gif" }
         else if cover.to_ascii_lowercase().ends_with(".webp") { "webp" }
         else { "jpg" };
-    let content_type = match ext {
-        "png" => "image/png", "gif" => "image/gif", "webp" => "image/webp", _ => "image/jpeg",
-    };
     let guest_path = format!("/plugin/ehentai_cover_{}_{}.{ext}", gallery.gid, gallery.token);
 
     let resp = match http_request_bytes_follow_redirects("GET", &cover, None, None, &login_cookies, &[]) {
@@ -854,19 +861,21 @@ fn plugin_info_json() -> Value {
         "source_id_regex": "^source:ehentaisource:.*$",
         "pre": ["ehlogin"],
         "author": "Difegue and others",
-        "version": "2.6",
-        "description": "Searches g.e-hentai for tags matching your archive. This plugin will use the source: tag of the archive if it exists.",
+        "version": "2.6.2",
+        "description": "搜索 E-Hentai 匹配画册元数据与标签 / Searches g.e-hentai for tags matching your archive.",
         "parameters": [
-            {"name": "lang", "type": "string", "desc": "Forced language to use in searches (Japanese won't work due to EH limitations)"},
-            {"name": "usethumbs", "type": "bool", "desc": "Fetch using thumbnail first (falls back to title)"},
-            {"name": "search_gid", "type": "bool", "desc": "Search using gID from title (falls back to title)"},
-            {"name": "enablepanda", "type": "bool", "desc": "Use ExHentai (enable to search for fjorded content without star cookie)"},
-            {"name": "jpntitle", "type": "bool", "desc": "Save the original title when available instead of the English or romanised title"},
-            {"name": "additionaltags", "type": "bool", "desc": "Fetch additional uploader metadata and set metadata.updated_at (time posted)"},
-            {"name": "expunged", "type": "bool", "desc": "Search only expunged galleries"},
-            {"name": "debug", "type": "bool", "desc": "Write verbose debug logs to data/logs/plugins.log"},
+            {"name": "lang", "type": "string", "desc": "【强制搜索语言 / Forced search language】限制搜索的语言，如 chinese、english（因 EH 限制填 japanese 无效）"},
+            {"name": "smart_lang_match", "type": "bool", "desc": "【按原标题智能匹配语言 / Match language by title】根据标题中的汉化/中字/英文/DL 等关键字，自动优先选择对应语言版本的画廊"},
+            {"name": "keep_local_title", "type": "bool", "desc": "【保留本地压缩包原名 / Keep archive filename】开启后不覆盖本地原有标题，仅抓取标签、画师、评分等元数据"},
+            {"name": "usethumbs", "type": "bool", "desc": "【优先以图搜本 / Fetch using thumbnail first】优先提取封面哈希搜图，未匹配到时自动回退为标题搜索"},
+            {"name": "search_gid", "type": "bool", "desc": "【从标题提取 GID 搜索 / Search using gID from title】自动识别压缩包标题中的 [123456] 形式画廊 ID 进行精准搜索"},
+            {"name": "enablepanda", "type": "bool", "desc": "【启用里站 ExHentai / Use ExHentai】开启后使用里站线路检索被屏蔽或下架的内容（需配合登录态）"},
+            {"name": "jpntitle", "type": "bool", "desc": "【优先使用日文原名 / Use Japanese title】默认开启：优先使用 EH 官方日文标题（title_jpn）；关闭后改用英文/罗马音标题"},
+            {"name": "additionaltags", "type": "bool", "desc": "【附加元数据 / Fetch additional tags】额外拉取上传者、更新时间（发布时间）等元数据标签"},
+            {"name": "expunged", "type": "bool", "desc": "【仅搜索已下架画廊 / Search only expunged】仅在已从公共列表清除的画廊中进行匹配"},
+            {"name": "debug", "type": "bool", "desc": "【调试日志 / Write verbose debug logs】向 data/logs/plugins.log 输出详尽的检索调试信息"},
         ],
-        "oneshot_arg": "E-H Gallery URL (Will attach tags matching this exact gallery to your archive)",
+        "oneshot_arg": "E-H Gallery URL (输入画廊完整链接，直接将该本子元数据精准绑定到当前画册)",
         "cooldown": 4,
         "permissions": [
             "net=e-hentai.org",
@@ -986,9 +995,10 @@ fn process_archive(
     login_cookies: &[LoginCookie],
 ) -> Result<Value, String> {
     HostBridge::progress(10, "准备搜索参数...");
+    let orig_title = metadata_title(&input.metadata);
     let lookup = LookupContext {
         archive_id: target_id.trim().to_string(),
-        archive_title: metadata_title(&input.metadata),
+        archive_title: orig_title.clone(),
         existing_tags: metadata_tags_csv(&input.metadata),
         thumbnail_hash: metadata_thumbnail_hash(&input.metadata),
         login_cookies: login_cookies.to_vec(),
@@ -1000,8 +1010,14 @@ fn process_archive(
     let payload = get_tags(&lookup, settings)?;
 
     let mut next = metadata_object_clone(&input.metadata);
-    if !payload.title.trim().is_empty() {
-        next.insert("title".to_string(), Value::String(payload.title));
+    // 如果勾选了保留原名，直接把 title 键删掉，绝不返回 title 给主程序
+    if !settings.keep_local_title {
+        let title = if payload.title.trim().is_empty() {
+            orig_title
+        } else {
+            payload.title
+        };
+        next.insert("title".to_string(), Value::String(title));
     }
     next.insert("tags".to_string(), tags_array_from_csv(&payload.tags_csv));
     if !payload.updated_at.trim().is_empty() {
@@ -1047,9 +1063,10 @@ fn process_collection(
         );
 
         let archive_metadata = HostBridge::get_archive_metadata(archive_id)?;
+        let orig_title = metadata_title(&archive_metadata);
         let lookup = LookupContext {
             archive_id: archive_id.clone(),
-            archive_title: metadata_title(&archive_metadata),
+            archive_title: orig_title.clone(),
             existing_tags: metadata_tags_csv(&archive_metadata),
             thumbnail_hash: metadata_thumbnail_hash(&archive_metadata),
             login_cookies: login_cookies.to_vec(),
@@ -1058,8 +1075,7 @@ fn process_collection(
         };
 
         let payload = get_tags(&lookup, settings)?;
-        patches.push(json!({
-            "title": if payload.title.trim().is_empty() { metadata_title(&archive_metadata) } else { payload.title.clone() },
+        let mut patch = json!({
             "type": 0,
             "description": metadata_description(&archive_metadata),
             "tags": tags_array_from_csv(&payload.tags_csv),
@@ -1072,7 +1088,17 @@ fn process_collection(
                 "entity_id": archive_id,
                 "volume_no": (index + 1) as i64,
             }
-        }));
+        });
+        // 合集模式下同样遵守 keep_local_title 开关
+        if !settings.keep_local_title {
+            let title = if payload.title.trim().is_empty() {
+                orig_title
+            } else {
+                payload.title
+            };
+            patch["title"] = Value::String(title);
+        }
+        patches.push(patch);
     }
 
     let mut next = metadata_object_clone(root_metadata);
@@ -1080,6 +1106,85 @@ fn process_collection(
     next.remove("archive");
     next.remove("archive_id");
     Ok(Value::Object(next))
+}
+
+// ==================== 语言与次级特征词库中心 ====================
+// 集中管理所有关键词判定，未来要加词或调整逻辑，只需要改这一处
+
+// 1. 语言词库：根据标题关键词判断是哪个语言的版本
+fn match_language_flags(lower_comb: &str) -> (bool, bool, bool) {
+    // 中文字词库
+    let zh_tokens = [
+        "chinese", "中国翻訳", "中国翻译", "中国", "机翻", "汉化", "漢化", "中文", "渣嵌",
+        "渣翻", "重嵌",
+    ];
+    let is_zh = zh_tokens
+        .iter()
+        .any(|&token| lower_comb.contains(&token.to_ascii_lowercase()));
+
+    // 韩文字词库
+    let ko_tokens = ["korean", "韓国", "韩国", "한국"];
+    let is_ko = ko_tokens
+        .iter()
+        .any(|&token| lower_comb.contains(&token.to_ascii_lowercase()));
+
+    // 英文字词库
+    let en_tokens = ["english", "英文", "英訳", "英翻"];
+    let is_en = en_tokens
+        .iter()
+        .any(|&token| lower_comb.contains(&token.to_ascii_lowercase()));
+
+    (is_zh, is_ko, is_en)
+}
+
+// 2. 根据标题文本识别期望语言
+fn detect_title_expected_lang(raw: &str) -> ExpectedLang {
+    let (is_zh, is_ko, is_en) = match_language_flags(raw);
+    if is_zh {
+        ExpectedLang::Chinese
+    } else if is_ko {
+        ExpectedLang::Korean
+    } else if is_en {
+        ExpectedLang::English
+    } else {
+        ExpectedLang::Japanese
+    }
+}
+
+// 3. 次级特征检测：返回 (是否无修正, 是否Sample/見本, 是否连载/未完)
+// 需要添加无修正、样本、连载新关键词只改这里！
+fn match_secondary_flags(text: &str) -> (bool, bool, bool) {
+    let lower = text.to_ascii_lowercase();
+
+    // 无修正/去码词库
+    let uncensored_tokens = [
+        "無修正", "无修正", "去码", "去碼", "步兵", "textless", "uncensored", "uncenseored",
+        "decensored", "decensor",
+    ];
+    let is_uncensored = uncensored_tokens
+        .iter()
+        .any(|&t| lower.contains(&t.to_ascii_lowercase()));
+
+    // 样本/見本词库
+    let sample_tokens = ["sample", "見本"];
+    let is_sample = sample_tokens
+        .iter()
+        .any(|&t| lower.contains(&t.to_ascii_lowercase()));
+
+    // 连载中/未完词库
+    let ongoing_tokens = ["未完", "进行中", "進行中", "ongoing"];
+    let is_ongoing = ongoing_tokens
+        .iter()
+        .any(|&t| lower.contains(&t.to_ascii_lowercase()));
+
+    (is_uncensored, is_sample, is_ongoing)
+}
+
+// 4. 词边界匹配：避免 "dl" 之类的短词误命中 "goodluck" 等长单词内部
+fn contains_ascii_word(text_lower: &str, word: &str) -> bool {
+    text_lower
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|token| token == word)
 }
 
 fn get_tags(lookup: &LookupContext, settings: &Settings) -> Result<SearchPayload, String> {
@@ -1101,29 +1206,18 @@ fn get_tags(lookup: &LookupContext, settings: &Settings) -> Result<SearchPayload
         }),
     );
 
-    let mut gallery = parse_oneshot_gallery(&lookup.oneshot_param)
-        .inspect(|gallery| {
-            debug_log(
-                lookup.debug,
-                "getTags:use_oneshot",
-                json!({
-                    "gID": gallery.gid,
-                    "gToken": abbreviate_value(&gallery.token, 6),
-                }),
-            );
-        })
-        .or_else(|| {
-            parse_source_gallery(&lookup.existing_tags).inspect(|gallery| {
-                debug_log(
-                    lookup.debug,
-                    "getTags:use_source_tag",
-                    json!({
-                        "gID": gallery.gid,
-                        "gToken": abbreviate_value(&gallery.token, 6),
-                    }),
-                );
-            })
-        });
+    let mut gallery = parse_oneshot_gallery(&lookup.oneshot_param).inspect(|gallery| {
+        debug_log(
+            lookup.debug,
+            "getTags:use_oneshot",
+            json!({
+                "gID": gallery.gid,
+                "gToken": abbreviate_value(&gallery.token, 6),
+            }),
+        );
+    });
+    // 不再解析已有 source: 标签，防止历史残留的旧链接截断搜索；
+    // 只认手动输入的画廊链接(oneshot_param)直连
 
     if gallery.is_none() {
         gallery = Some(lookup_gallery(lookup, settings, domain)?);
@@ -1176,7 +1270,12 @@ fn lookup_gallery(
                     "lookup:shash_search:start",
                     json!({ "sha1": abbreviate_value(&cover.original_sha1, 8) }),
                 );
-                if let Ok(found) = ehentai_parse(&url, &lookup.login_cookies) {
+                if let Ok(found) = ehentai_parse(
+                    &url,
+                    &lookup.login_cookies,
+                    &lookup.archive_title,
+                    settings.smart_lang_match,
+                ) {
                     return Ok(found);
                 }
                 debug_log(
@@ -1198,7 +1297,12 @@ fn lookup_gallery(
             let gid = captures.get(1).map(|m| m.as_str()).unwrap_or_default();
             let url = format!("{}?f_search=gid:{}", domain, gid);
             debug_log(lookup.debug, "lookup:gid_search:start", json!({ "gid": gid }));
-            if let Ok(found) = ehentai_parse(&url, &lookup.login_cookies) {
+            if let Ok(found) = ehentai_parse(
+                &url,
+                &lookup.login_cookies,
+                &lookup.archive_title,
+                settings.smart_lang_match,
+            ) {
                 return Ok(found);
             }
             debug_log(
@@ -1209,16 +1313,44 @@ fn lookup_gallery(
         }
     }
 
+    // 不再用双引号包死整个标题（强制全字匹配经常导致搜索为空），
+    // 改为清洗掉标题里的引号后做宽松搜索
+    let clean_title = lookup
+        .archive_title
+        .replace(['"', '\'', '“', '”', '‘', '’'], " ");
     let mut url = format!(
         "{}?advsearch=1&f_sfu=on&f_sft=on&f_sfl=on&f_search={}",
         domain,
-        urlencoding::encode(&format!("\"{}\"", lookup.archive_title))
+        urlencoding::encode(clean_title.trim())
     );
     debug_log(
         lookup.debug,
         "lookup:title_search:base",
         json!({ "title": truncate_for_log(&lookup.archive_title, 200) }),
     );
+
+    // 智能语言匹配：按原标题推断期望语言，把语言过滤直接注入 EH 服务端搜索
+    if settings.smart_lang_match {
+        let expected = detect_title_expected_lang(&lookup.archive_title);
+        let lang_filter = match expected {
+            ExpectedLang::Chinese => Some("language:chinese".to_string()),
+            ExpectedLang::Korean => Some("language:korean".to_string()),
+            ExpectedLang::English => Some("language:english".to_string()),
+            ExpectedLang::Japanese => {
+                // 日文期望：排除中英韩翻译版，留下日文原版
+                Some("-language:english -language:korean".to_string())
+            }
+        };
+        if let Some(filter) = lang_filter {
+            url.push('+');
+            url.push_str(&urlencoding::encode(&filter));
+            debug_log(
+                lookup.debug,
+                "lookup:title_search:smart_lang",
+                json!({ "filter": filter }),
+            );
+        }
+    }
 
     if let Some(artist) = extract_ascii_artist(&lookup.existing_tags) {
         url.push('+');
@@ -1245,48 +1377,172 @@ fn lookup_gallery(
         debug_log(lookup.debug, "lookup:title_search:expunged", json!({}));
     }
 
-    ehentai_parse(&url, &lookup.login_cookies)
+    ehentai_parse(
+        &url,
+        &lookup.login_cookies,
+        &lookup.archive_title,
+        settings.smart_lang_match,
+    )
 }
 
-fn ehentai_parse(url: &str, cookies: &[LoginCookie]) -> Result<GalleryMatch, String> {
+fn ehentai_parse(
+    url: &str,
+    cookies: &[LoginCookie],
+    orig_title: &str,
+    smart_lang: bool,
+) -> Result<GalleryMatch, String> {
     let response = HostBridge::http_fetch("GET", url, None, cookies, &[])?;
     if !is_http_success(&response) {
         return Err(format!("HTTP {}: search failed", response.status));
     }
-    parse_gallery_from_html(&response.text)
+    parse_gallery_from_html(&response.text, orig_title, smart_lang)
 }
 
-fn parse_gallery_from_html(html: &str) -> Result<GalleryMatch, String> {
+// 候选打分：标题语言特征 → 语言一级权重，无修正/Sample/连载 → 次级权重
+fn score_candidate_by_lang(candidate: &EhGalleryCandidate, orig_title: &str) -> i64 {
+    let combined = format!("{} {}", orig_title, candidate.title);
+    let lower_comb = combined.to_ascii_lowercase();
+    let (is_zh, is_ko, is_en) = match_language_flags(&lower_comb);
+    let is_pure_raw = !is_zh && !is_ko && !is_en;
+    let is_dl = contains_ascii_word(&lower_comb, "dl") || lower_comb.contains("digital");
+    let expected = detect_title_expected_lang(orig_title);
+
+    let mut score: i64 = 0;
+    match expected {
+        ExpectedLang::Chinese => {
+            if is_zh {
+                score += 1000;
+            } else if is_pure_raw {
+                score += 50;
+            } else {
+                score -= 500;
+            }
+        }
+        ExpectedLang::Korean => {
+            if is_ko {
+                score += 1000;
+            } else if is_pure_raw {
+                score += 50;
+            } else {
+                score -= 500;
+            }
+        }
+        ExpectedLang::English => {
+            if is_en {
+                score += 1000;
+            } else if is_pure_raw {
+                score += 50;
+            } else {
+                score -= 500;
+            }
+        }
+        ExpectedLang::Japanese => {
+            if is_pure_raw && is_dl {
+                score += 1200;
+            } else if is_pure_raw {
+                score += 1000;
+            } else if is_zh {
+                score += 50;
+            } else {
+                score -= 500;
+            }
+        }
+    }
+
+    let (title_uncensored, title_sample, title_ongoing) = match_secondary_flags(orig_title);
+    let (cand_uncensored, cand_sample, cand_ongoing) = match_secondary_flags(&candidate.title);
+    if title_uncensored && cand_uncensored {
+        score += 300;
+    }
+    if title_sample && cand_sample {
+        score += 100;
+    }
+    if title_ongoing && cand_ongoing {
+        score += 100;
+    }
+    if !title_sample && cand_sample {
+        score -= 300;
+    }
+    score
+}
+
+fn parse_gallery_from_html(
+    html: &str,
+    orig_title: &str,
+    smart_lang: bool,
+) -> Result<GalleryMatch, String> {
     if html.contains("Your IP address has been") {
         return Err("Temporarily banned from EH for excessive pageloads.".to_string());
     }
 
-    let candidates = extract_gallery_candidates(html);
-    if !candidates.is_empty() {
-        if candidates.len() == 1 {
-            let only = &candidates[0];
-            return Ok(GalleryMatch {
-                gid: only.gid.clone(),
-                token: only.token.clone(),
+    let mut candidates = extract_gallery_candidates(html);
+    // 搜索被重定向进单个画廊详情页时，也把它包装成候选之一，
+    // 统一走选择面板，绝不静默跳过
+    if candidates.is_empty() {
+        if let Some(direct) = extract_direct_gallery(html) {
+            candidates.push(EhGalleryCandidate {
+                gid: direct.gid,
+                token: direct.token,
+                title: String::new(),
+                url: String::new(),
+                cover: String::new(),
             });
         }
+    }
 
+    if !candidates.is_empty() {
+        // 智能语言匹配开启时，先按语言权重给候选重新排序
+        if smart_lang && !orig_title.trim().is_empty() {
+            candidates.sort_by_cached_key(|item| -score_candidate_by_lang(item, orig_title));
+        }
         let resolved = enrich_candidates_with_api_covers(&candidates).unwrap_or(candidates);
         let options = resolved
             .iter()
             .enumerate()
             .map(|(index, item)| {
+                let lower = item.title.to_ascii_lowercase();
+                let (is_zh, is_ko, is_en) = match_language_flags(&lower);
+                let mut tag_list: Vec<String> = Vec::new();
+                if is_zh {
+                    tag_list.push("中文/汉化".to_string());
+                }
+                if is_ko {
+                    tag_list.push("한국어".to_string());
+                }
+                if is_en {
+                    tag_list.push("English".to_string());
+                }
+                if !is_zh && !is_ko && !is_en {
+                    tag_list.push("日文/生肉".to_string());
+                }
+                let (is_uncensored, is_sample, is_ongoing) = match_secondary_flags(&item.title);
+                if is_uncensored {
+                    tag_list.push("无修正".to_string());
+                }
+                if is_sample {
+                    tag_list.push("Sample".to_string());
+                }
+                if is_ongoing {
+                    tag_list.push("连载中".to_string());
+                }
+                let tags_prefix = tag_list.join(" / ");
+                let label = if item.title.trim().is_empty() {
+                    format!("候选 {}", index + 1)
+                } else {
+                    item.title.clone()
+                };
                 json!({
-                    "label": if item.title.trim().is_empty() { format!("候选 {}", index + 1) } else { item.title.clone() },
+                    "label": format!("【{}】{}", tags_prefix, label),
                     "description": format!("gid:{} | {}", item.gid, item.url),
                     "cover": item.cover,
                 })
             })
             .collect::<Vec<_>>();
+        // 无论几个候选都强制弹出选择面板，绝不自动选定
         let picked = HostBridge::select_index(
             "E-Hentai 候选匹配",
             options,
-            "检测到多个匹配画廊，请选择最合适的一项",
+            "检测到匹配画廊，请人工确认（支持语言标签排序）",
             0,
             120,
         )?;
@@ -1295,10 +1551,6 @@ fn parse_gallery_from_html(html: &str) -> Result<GalleryMatch, String> {
             gid: chosen.gid.clone(),
             token: chosen.token.clone(),
         });
-    }
-
-    if let Some(direct) = extract_direct_gallery(html) {
-        return Ok(direct);
     }
 
     if html.contains("No hits found") {
@@ -2209,7 +2461,10 @@ fn settings_from_params(params: &Value) -> Settings {
         usethumbs: param_bool(params, "usethumbs"),
         search_gid: param_bool(params, "search_gid"),
         enablepanda: param_bool(params, "enablepanda"),
-        jpntitle: param_bool(params, "jpntitle"),
+        keep_local_title: param_bool(params, "keep_local_title"),
+        smart_lang_match: param_bool(params, "smart_lang_match"),
+        // jpntitle 默认开启：默认优先使用日文原名 title_jpn
+        jpntitle: param_bool_or(params, "jpntitle", true),
         additionaltags: param_bool(params, "additionaltags"),
         expunged: param_bool(params, "expunged"),
         debug: param_bool(params, "debug"),
@@ -2217,6 +2472,10 @@ fn settings_from_params(params: &Value) -> Settings {
 }
 
 fn param_bool(params: &Value, key: &str) -> bool {
+    param_bool_or(params, key, false)
+}
+
+fn param_bool_or(params: &Value, key: &str, default: bool) -> bool {
     match params.get(key) {
         Some(Value::Bool(value)) => *value,
         Some(Value::Number(value)) => value.as_i64().unwrap_or_default() != 0,
@@ -2224,7 +2483,8 @@ fn param_bool(params: &Value, key: &str) -> bool {
             value.trim().to_ascii_lowercase().as_str(),
             "1" | "true" | "yes" | "y" | "on"
         ),
-        _ => false,
+        None => default,
+        _ => default,
     }
 }
 
@@ -2312,18 +2572,6 @@ fn parse_oneshot_gallery(raw: &str) -> Option<GalleryMatch> {
         });
     }
     None
-}
-
-fn parse_source_gallery(existing_tags: &str) -> Option<GalleryMatch> {
-    let captures =
-        regex(r"source:\s*(?:https?://)?e(?:x|-)?hentai\.org/g/(\d+)/([0-9A-Za-z]+)/?")
-            .captures(existing_tags)?;
-    let gid = captures.get(1)?.as_str();
-    let token = captures.get(2)?.as_str();
-    Some(GalleryMatch {
-        gid: gid.to_string(),
-        token: token.to_string(),
-    })
 }
 
 fn extract_ascii_artist(existing_tags: &str) -> Option<String> {
