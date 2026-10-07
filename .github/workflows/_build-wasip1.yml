@@ -166,7 +166,7 @@ jobs:
           echo "| Ref | ${GITHUB_REF_NAME} |" >> "${GITHUB_STEP_SUMMARY}"
 
       - name: 🚀 Prepare release asset
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' && !startsWith(github.ref, 'refs/pull/')
         id: release_asset
         shell: bash
         run: |
@@ -175,7 +175,7 @@ jobs:
           echo "file=${asset}" >> "${GITHUB_OUTPUT}"
 
       - name: 🚀 Publish to shared nightly release
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' && !startsWith(github.ref, 'refs/pull/')
         uses: softprops/action-gh-release@v2
         with:
           tag_name: nightly
