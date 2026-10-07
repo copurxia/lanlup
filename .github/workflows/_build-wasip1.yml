@@ -42,8 +42,17 @@ jobs:
             curl -fL --retry 3 --connect-timeout 30 \
               -o "/tmp/${wasi_sdk_full}.tar.gz" \
               "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-34/${wasi_sdk_full}-x86_64-linux.tar.gz"
+            # 注意：压缩包顶层目录是 wasi-sdk-34.0-x86_64-linux（带平台后缀），
+            # 不是 wasi-sdk-34.0。解压后探测真实顶层目录并归一化到 ${prefix}。
+            # （用 sed 取第一行而非 head，避免 pipefail 下 SIGPIPE 误杀）
+            top_dir="$(tar -tzf "/tmp/${wasi_sdk_full}.tar.gz" | sed -n '1s#/.*##p')"
             tar -xzf "/tmp/${wasi_sdk_full}.tar.gz" -C /opt
+            if [ "/opt/${top_dir}" != "${prefix}" ]; then
+              mv "/opt/${top_dir}" "${prefix}"
+            fi
+            rm -f "/tmp/${wasi_sdk_full}.tar.gz"
           fi
+          df -h /opt /tmp /workspace || true
           # ring 的 build.rs 走 WASI_SDK_PATH；cc-rs 走 CC/AR_<target>，双保险都设
           {
             echo "WASI_SDK_PATH=${prefix}"
