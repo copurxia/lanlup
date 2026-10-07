@@ -30,6 +30,36 @@ jobs:
         with:
           targets: wasm32-wasip1
 
+      - name: Install wasi-sdk (wasm32-wasip1 C toolchain for ring)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          wasi_sdk_full="wasi-sdk-34.0"
+          prefix="/opt/${wasi_sdk_full}"
+          if [ ! -x "${prefix}/bin/clang" ]; then
+            # gitea/runner-images 可能没有 curl（lanlu 实测），回退 apt 安装
+            command -v curl >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq curl; }
+            curl -fL --retry 3 --connect-timeout 30 \
+              -o "/tmp/${wasi_sdk_full}.tar.gz" \
+              "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-34/${wasi_sdk_full}-x86_64-linux.tar.gz"
+            # 注意：压缩包顶层目录是 wasi-sdk-34.0-x86_64-linux（带平台后缀），
+            # 不是 wasi-sdk-34.0。解压后探测真实顶层目录并归一化到 ${prefix}。
+            # （用 sed 取第一行而非 head，避免 pipefail 下 SIGPIPE 误杀）
+            top_dir="$(tar -tzf "/tmp/${wasi_sdk_full}.tar.gz" | sed -n '1s#/.*##p')"
+            tar -xzf "/tmp/${wasi_sdk_full}.tar.gz" -C /opt
+            if [ "/opt/${top_dir}" != "${prefix}" ]; then
+              mv "/opt/${top_dir}" "${prefix}"
+            fi
+            rm -f "/tmp/${wasi_sdk_full}.tar.gz"
+          fi
+          df -h /opt /tmp /workspace || true
+          # ring 的 build.rs 走 WASI_SDK_PATH；cc-rs 走 CC/AR_<target>，双保险都设
+          {
+            echo "WASI_SDK_PATH=${prefix}"
+            echo "CC_wasm32-wasip1=${prefix}/bin/clang"
+            echo "AR_wasm32-wasip1=${prefix}/bin/llvm-ar"
+          } >> "${GITHUB_ENV}"
+
       - name: ⏳ Build wasm32-wasip1 release
         id: build
         shell: bash
@@ -103,14 +133,14 @@ jobs:
           echo "✅ Packaged: ${archive_name} ($(numfmt --to=iec-i "${archive_size}"))"
 
       - name: ⬆ Upload wasm artifact (raw)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v3
         with:
           name: ${{ inputs.plugin }}-wasip1
           path: ${{ inputs.plugin }}/${{ steps.locate.outputs.wasm_file }}
           if-no-files-found: error
 
       - name: ⬆ Upload compressed package
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v3
         with:
           name: ${{ inputs.plugin }}-wasip1-package
           path: ${{ steps.package.outputs.archive }}
@@ -136,7 +166,7 @@ jobs:
           echo "| Ref | ${GITHUB_REF_NAME} |" >> "${GITHUB_STEP_SUMMARY}"
 
       - name: 🚀 Prepare release asset
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' && !startsWith(github.ref, 'refs/pull/')
         id: release_asset
         shell: bash
         run: |
@@ -145,7 +175,7 @@ jobs:
           echo "file=${asset}" >> "${GITHUB_OUTPUT}"
 
       - name: 🚀 Publish to shared nightly release
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' && !startsWith(github.ref, 'refs/pull/')
         uses: softprops/action-gh-release@v2
         with:
           tag_name: nightly

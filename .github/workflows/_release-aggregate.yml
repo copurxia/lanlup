@@ -20,11 +20,13 @@ jobs:
           fetch-depth: 0
 
       - name: 📥 Download all plugin artifacts
-        uses: actions/download-artifact@v4
+        # v4 的 pattern/merge-multiple 为 v4 独有参数；Forgejo 只支持 v3 协议。
+        # v3 不带 name 即下载全部 artifact，每个落到 path/<artifact-name>/ 子目录，
+        # 与 v4 pattern="*-wasip1"+merge-multiple:false 的布局等价（同 run 上传的
+        # 本就只有 *-wasip1 系列）。
+        uses: actions/download-artifact@v3
         with:
           path: artifacts
-          pattern: "*-wasip1"
-          merge-multiple: false
 
       - name: 📦 Aggregate all plugins into master package
         id: aggregate
@@ -107,7 +109,7 @@ jobs:
           echo "   Package size: $(numfmt --to=iec-i ${package_size})"
 
       - name: ⬆ Upload aggregate package
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v3
         with:
           name: lanlu-plugins-wasip1-aggregate
           path: ${{ runner.temp }}/${{ steps.aggregate.outputs.package-name }}
