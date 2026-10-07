@@ -151,6 +151,10 @@ jobs:
       - name: 🚀 Publish aggregate to nightly release
         if: github.event_name != 'pull_request'
         uses: softprops/action-gh-release@v2
+        env:
+          # act_runner 给的 GITHUB_API_URL 是实例根地址，octokit 会把 API 调用打到
+          # web 路由上（POST /{o}/{r}/releases → 405）；Forgejo 只有 /api/v1。
+          GITHUB_API_URL: ${{ github.server_url }}/api/v1
         with:
           tag_name: nightly
           name: nightly
