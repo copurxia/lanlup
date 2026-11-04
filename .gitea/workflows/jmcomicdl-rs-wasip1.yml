@@ -1,0 +1,23 @@
+name: CI jmcomicdl-rs (wasip1)
+
+on:
+  push:
+    paths:
+      - 'jmcomicdl-rs/**'
+      - '.gitea/workflows/jmcomicdl-rs-wasip1.yml'
+      - '.gitea/workflows/_build-wasip1.yml'
+  pull_request:
+    paths:
+      - 'jmcomicdl-rs/**'
+      - '.gitea/workflows/jmcomicdl-rs-wasip1.yml'
+      - '.gitea/workflows/_build-wasip1.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    uses: ./.gitea/workflows/_build-wasip1.yml
+    with:
+      plugin: jmcomicdl-rs

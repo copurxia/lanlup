@@ -1,0 +1,23 @@
+name: CI ehentai-rs (wasip1)
+
+on:
+  push:
+    paths:
+      - 'ehentai-rs/**'
+      - '.gitea/workflows/ehentai-rs-wasip1.yml'
+      - '.gitea/workflows/_build-wasip1.yml'
+  pull_request:
+    paths:
+      - 'ehentai-rs/**'
+      - '.gitea/workflows/ehentai-rs-wasip1.yml'
+      - '.gitea/workflows/_build-wasip1.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    uses: ./.gitea/workflows/_build-wasip1.yml
+    with:
+      plugin: ehentai-rs

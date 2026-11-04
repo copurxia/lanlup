@@ -1,0 +1,23 @@
+name: CI comicinfo-rs (wasip1)
+
+on:
+  push:
+    paths:
+      - 'comicinfo-rs/**'
+      - '.gitea/workflows/comicinfo-rs-wasip1.yml'
+      - '.gitea/workflows/_build-wasip1.yml'
+  pull_request:
+    paths:
+      - 'comicinfo-rs/**'
+      - '.gitea/workflows/comicinfo-rs-wasip1.yml'
+      - '.gitea/workflows/_build-wasip1.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    uses: ./.gitea/workflows/_build-wasip1.yml
+    with:
+      plugin: comicinfo-rs

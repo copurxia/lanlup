@@ -1,0 +1,23 @@
+name: CI pixivlogin-rs (wasip1)
+
+on:
+  push:
+    paths:
+      - 'pixivlogin-rs/**'
+      - '.gitea/workflows/pixivlogin-rs-wasip1.yml'
+      - '.gitea/workflows/_build-wasip1.yml'
+  pull_request:
+    paths:
+      - 'pixivlogin-rs/**'
+      - '.gitea/workflows/pixivlogin-rs-wasip1.yml'
+      - '.gitea/workflows/_build-wasip1.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    uses: ./.gitea/workflows/_build-wasip1.yml
+    with:
+      plugin: pixivlogin-rs

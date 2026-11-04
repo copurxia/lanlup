@@ -133,14 +133,14 @@ jobs:
           echo "✅ Packaged: ${archive_name} ($(numfmt --to=iec-i "${archive_size}"))"
 
       - name: ⬆ Upload wasm artifact (raw)
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: ${{ inputs.plugin }}-wasip1
           path: ${{ inputs.plugin }}/${{ steps.locate.outputs.wasm_file }}
           if-no-files-found: error
 
       - name: ⬆ Upload compressed package
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: ${{ inputs.plugin }}-wasip1-package
           path: ${{ steps.package.outputs.archive }}
@@ -177,10 +177,6 @@ jobs:
       - name: 🚀 Publish to shared nightly release
         if: github.event_name != 'pull_request' && !startsWith(github.ref, 'refs/pull/')
         uses: softprops/action-gh-release@v2
-        env:
-          # act_runner 给的 GITHUB_API_URL 是实例根地址，octokit 会把 API 调用打到
-          # web 路由上（POST /{o}/{r}/releases → 405）；Forgejo 只有 /api/v1。
-          GITHUB_API_URL: ${{ github.server_url }}/api/v1
         with:
           tag_name: nightly
           name: nightly

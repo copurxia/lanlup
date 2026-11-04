@@ -1,0 +1,23 @@
+name: CI opfmeta-rs (wasip1)
+
+on:
+  push:
+    paths:
+      - 'opfmeta-rs/**'
+      - '.gitea/workflows/opfmeta-rs-wasip1.yml'
+      - '.gitea/workflows/_build-wasip1.yml'
+  pull_request:
+    paths:
+      - 'opfmeta-rs/**'
+      - '.gitea/workflows/opfmeta-rs-wasip1.yml'
+      - '.gitea/workflows/_build-wasip1.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    uses: ./.gitea/workflows/_build-wasip1.yml
+    with:
+      plugin: opfmeta-rs

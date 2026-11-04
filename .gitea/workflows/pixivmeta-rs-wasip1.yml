@@ -1,0 +1,23 @@
+name: CI pixivmeta-rs (wasip1)
+
+on:
+  push:
+    paths:
+      - 'pixivmeta-rs/**'
+      - '.gitea/workflows/pixivmeta-rs-wasip1.yml'
+      - '.gitea/workflows/_build-wasip1.yml'
+  pull_request:
+    paths:
+      - 'pixivmeta-rs/**'
+      - '.gitea/workflows/pixivmeta-rs-wasip1.yml'
+      - '.gitea/workflows/_build-wasip1.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    uses: ./.gitea/workflows/_build-wasip1.yml
+    with:
+      plugin: pixivmeta-rs
