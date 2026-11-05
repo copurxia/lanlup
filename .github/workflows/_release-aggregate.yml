@@ -37,6 +37,7 @@ jobs:
           artifact_count=0
           total_size=0
           declare -A plugin_sizes
+          declare -A plugin_shas
           plugin_list="[]"
 
           for dir in artifacts/*/; do
@@ -51,6 +52,7 @@ jobs:
             wasm_size="$(stat --printf='%s' "${wasm_file}")"
             cp "${wasm_file}" "${staging_dir}/${wasm_name}"
             plugin_sizes["${plugin_name}"]=${wasm_size}
+            plugin_shas["${plugin_name}"]="$(sha256sum "${wasm_file}" | cut -d' ' -f1)"
             total_size=$((total_size + wasm_size))
             artifact_count=$((artifact_count + 1))
             echo "  ✅ ${plugin_name}: ${wasm_name} ($(numfmt --to=iec-i ${wasm_size}))"
@@ -61,6 +63,8 @@ jobs:
           timestamp="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
           cat > "${staging_dir}/metadata.json" <<-EOF
           {
+            "schema": 1,
+            "channel": "nightly",
             "name": "lanlu-wasip1-plugins",
             "version": "${GITHUB_SHA::7}",
             "created": "${timestamp}",
@@ -84,11 +88,14 @@ jobs:
             else
               echo "," >> "${staging_dir}/metadata.json"
             fi
-            printf '    {"plugin":"%s","artifact":"%s","size_bytes":%d}' \
-              "${plugin_name}" "${wasm_name}" "${wasm_size}" >> "${staging_dir}/metadata.json"
+            printf '    {"plugin":"%s","artifact":"%s","size_bytes":%d,"sha256":"%s"}' \
+              "${plugin_name}" "${wasm_name}" "${wasm_size}" "${plugin_shas[${plugin_name}]}" >> "${staging_dir}/metadata.json"
           done
           echo "" >> "${staging_dir}/metadata.json"
           echo "]}" >> "${staging_dir}/metadata.json"
+
+          # 独立发布一份索引资产，供客户端下载在线插件列表
+          cp "${staging_dir}/metadata.json" "${{ runner.temp }}/plugins.json"
 
           # Create compressed master package
           version="${GITHUB_SHA::7}"
@@ -158,3 +165,4 @@ jobs:
           overwrite_files: true
           files: |
             ${{ runner.temp }}/${{ steps.aggregate.outputs.package-name }}
+            ${{ runner.temp }}/plugins.json
