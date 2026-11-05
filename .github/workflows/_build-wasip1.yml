@@ -30,6 +30,12 @@ jobs:
         with:
           targets: wasm32-wasip1
 
+      - name: Cache wasi-sdk tarball
+        uses: actions/cache@v4
+        with:
+          path: /tmp/wasi-sdk-34.0.tar.gz
+          key: wasi-sdk-34.0-x86_64-linux
+
       - name: Install wasi-sdk (wasm32-wasip1 C toolchain for ring)
         shell: bash
         run: |
@@ -37,20 +43,35 @@ jobs:
           wasi_sdk_full="wasi-sdk-34.0"
           prefix="/opt/${wasi_sdk_full}"
           if [ ! -x "${prefix}/bin/clang" ]; then
-            # gitea/runner-images 可能没有 curl（lanlu 实测），回退 apt 安装
-            command -v curl >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq curl; }
-            curl -fL --retry 3 --connect-timeout 30 \
-              -o "/tmp/${wasi_sdk_full}.tar.gz" \
-              "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-34/${wasi_sdk_full}-x86_64-linux.tar.gz"
+            tarball="/tmp/${wasi_sdk_full}.tar.gz"
+            # 缓存里若是上轮失败留下的半截文件，先校验再丢弃
+            if [ -s "${tarball}" ] && ! tar -tzf "${tarball}" >/dev/null 2>&1; then
+              echo "⚠️ cached ${tarball} is corrupt, re-downloading"
+              rm -f "${tarball}"
+            fi
+            if [ ! -s "${tarball}" ]; then
+              # gitea/runner-images 可能没有 curl（lanlu 实测），回退 apt 安装
+              command -v curl >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq curl; }
+              part="${tarball}.part"
+              rm -f "${part}"
+              curl -fL --retry 5 --retry-delay 5 --connect-timeout 30 \
+                -o "${part}" \
+                "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-34/${wasi_sdk_full}-x86_64-linux.tar.gz"
+              # 整包校验通过后再落到缓存路径，避免把半截文件写进 cache
+              tar -tzf "${part}" >/dev/null
+              mv "${part}" "${tarball}"
+            else
+              echo "✅ using cached ${tarball}"
+            fi
             # 注意：压缩包顶层目录是 wasi-sdk-34.0-x86_64-linux（带平台后缀），
             # 不是 wasi-sdk-34.0。解压后探测真实顶层目录并归一化到 ${prefix}。
             # （用 sed 取第一行而非 head，避免 pipefail 下 SIGPIPE 误杀）
-            top_dir="$(tar -tzf "/tmp/${wasi_sdk_full}.tar.gz" | sed -n '1s#/.*##p')"
-            tar -xzf "/tmp/${wasi_sdk_full}.tar.gz" -C /opt
+            top_dir="$(tar -tzf "${tarball}" | sed -n '1s#/.*##p')"
+            tar -xzf "${tarball}" -C /opt
             if [ "/opt/${top_dir}" != "${prefix}" ]; then
               mv "/opt/${top_dir}" "${prefix}"
             fi
-            rm -f "/tmp/${wasi_sdk_full}.tar.gz"
+            # 保留 tarball，供 actions/cache 在 job 结束后保存
           fi
           df -h /opt /tmp /workspace || true
           # ring 的 build.rs 走 WASI_SDK_PATH；cc-rs 走 CC/AR_<target>，双保险都设
