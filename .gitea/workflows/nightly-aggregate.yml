@@ -51,8 +51,29 @@ jobs:
           fi
           echo "matrix=$(printf '%s\n' "${plugins[@]}" | jq -R -s -c 'split("\n") | map(select(length > 0))')" >> "${GITHUB_OUTPUT}"
 
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.check.outputs.changed }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: check
+        shell: bash
+        run: |
+          last="$(git rev-list -n 1 refs/tags/nightly-build 2>/dev/null || true)"
+          if [ -n "${last}" ] && [ "${last}" = "${GITHUB_SHA}" ]; then
+            echo "changed=false" >> "${GITHUB_OUTPUT}"
+            echo "HEAD ${GITHUB_SHA} 与上次聚合一致，跳过"
+          else
+            echo "changed=true" >> "${GITHUB_OUTPUT}"
+            echo "HEAD ${GITHUB_SHA}，上次聚合 ${last:-<none>}"
+          fi
+
   build:
-    needs: list-plugins
+    needs: [list-plugins, check]
+    if: github.event_name == 'workflow_dispatch' || needs.check.outputs.changed == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -62,6 +83,20 @@ jobs:
       plugin: ${{ matrix.plugin }}
 
   aggregate:
-    needs: build
-    if: always()
+    needs: [check, build]
+    if: always() && (github.event_name == 'workflow_dispatch' || needs.check.outputs.changed == 'true')
     uses: ./.gitea/workflows/_release-aggregate.yml
+
+  mark-built:
+    needs: [build, aggregate]
+    if: github.event_name == 'schedule' && needs.build.result == 'success' && needs.aggregate.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: 🏷️ Record last aggregated commit
+        shell: bash
+        run: |
+          git tag -f nightly-build "${GITHUB_SHA}"
+          git push -f origin "refs/tags/nightly-build"
