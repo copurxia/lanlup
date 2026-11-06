@@ -66,23 +66,9 @@ jobs:
           done
           echo "::endgroup::"
 
-          # Create aggregate metadata
+          # 逐个读取插件元数据（名称/描述/图标/依赖），用 jq 组装 JSON
           timestamp="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-          cat > "${staging_dir}/metadata.json" <<-EOF
-          {
-            "schema": 1,
-            "channel": "nightly",
-            "name": "lanlu-wasip1-plugins",
-            "version": "${GITHUB_SHA::7}",
-            "created": "${timestamp}",
-            "plugin_count": ${artifact_count},
-            "total_size_bytes": ${total_size},
-            "commit": "${GITHUB_SHA}",
-            "ref": "${GITHUB_REF_NAME}",
-            "plugins": [
-          EOF
-
-          first=true
+          info_lines="$(mktemp)"
           for dir in artifacts/*-wasip1/; do
             [ -d "${dir}" ] || continue
             plugin_name="$(basename "${dir}")"
@@ -90,17 +76,58 @@ jobs:
             [ ${#wasm_files[@]} -eq 0 ] && continue
             wasm_file="${wasm_files[0]}"
             wasm_name="$(basename "${wasm_file}")"
-            wasm_size="${plugin_sizes[${plugin_name}]}"
-            if [ "${first}" = true ]; then
-              first=false
-            else
-              echo "," >> "${staging_dir}/metadata.json"
+            info_json='{}'
+            if command -v node >/dev/null 2>&1; then
+              info_json="$(node scripts/plugin-info.js "${wasm_file}" 2>/dev/null || printf '{}')"
             fi
-            printf '    {"plugin":"%s","artifact":"%s","size_bytes":%d,"sha256":"%s"}' \
-              "${plugin_name}" "${wasm_name}" "${wasm_size}" "${plugin_shas[${plugin_name}]}" >> "${staging_dir}/metadata.json"
+            if ! printf '%s' "${info_json}" | jq -e . >/dev/null 2>&1; then
+              info_json='{}'
+            fi
+            jq -cn \
+              --arg plugin "${plugin_name}" \
+              --arg asset "${plugin_name}.wasm" \
+              --arg artifact "${wasm_name}" \
+              --argjson size "${plugin_sizes[${plugin_name}]}" \
+              --arg sha "${plugin_shas[${plugin_name}]}" \
+              --argjson info "${info_json}" \
+              '{
+                plugin: $plugin,
+                asset: $asset,
+                artifact: $artifact,
+                size_bytes: $size,
+                sha256: $sha,
+                namespace: ($info.namespace // ""),
+                name: ($info.name // ""),
+                version: ($info.version // ""),
+                type: ($info.type // $info.plugin_type // ""),
+                description: ($info.description // ""),
+                icon: ($info.icon // ""),
+                author: ($info.author // ""),
+                tags: ($info.tags // ""),
+                pre: ($info.pre // [])
+              }' >> "${info_lines}"
           done
-          echo "" >> "${staging_dir}/metadata.json"
-          echo "]}" >> "${staging_dir}/metadata.json"
+
+          jq -s \
+            --argjson count "${artifact_count}" \
+            --argjson total "${total_size}" \
+            --arg version "${GITHUB_SHA::7}" \
+            --arg created "${timestamp}" \
+            --arg commit "${GITHUB_SHA}" \
+            --arg ref "${GITHUB_REF_NAME}" \
+            '{
+              schema: 1,
+              channel: "nightly",
+              name: "lanlu-wasip1-plugins",
+              version: $version,
+              created: $created,
+              plugin_count: $count,
+              total_size_bytes: $total,
+              commit: $commit,
+              ref: $ref,
+              plugins: .
+            }' "${info_lines}" > "${staging_dir}/metadata.json"
+          rm -f "${info_lines}"
 
           # 独立发布一份索引资产，供客户端下载在线插件列表
           cp "${staging_dir}/metadata.json" "${{ runner.temp }}/plugins.json"
