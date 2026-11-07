@@ -183,6 +183,8 @@ jobs:
       - name: 🚀 Publish aggregate to nightly release
         if: github.event_name != 'pull_request'
         uses: softprops/action-gh-release@v2
+        permissions:
+          contents: write
         with:
           tag_name: nightly
           name: nightly
