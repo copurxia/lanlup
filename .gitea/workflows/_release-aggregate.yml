@@ -12,8 +12,6 @@ permissions:
 jobs:
   aggregate:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     outputs:
       artifact-count: ${{ steps.aggregate.outputs.artifact-count }}
       total-size: ${{ steps.aggregate.outputs.total-size }}
