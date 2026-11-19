@@ -1,0 +1,47 @@
+name: Tooling (xtask)
+
+# Advisory workflow: validates the xtask skeleton and plugins.toml.
+# Not a required check yet; becomes blocking in P1/P2.
+
+on:
+  push:
+    paths:
+      - 'plugins.toml'
+      - 'xtask/**'
+      - 'ci/**'
+      - 'contracts/**'
+      - 'scripts/**'
+      - '.github/workflows/tooling.yml'
+  pull_request:
+    paths:
+      - 'plugins.toml'
+      - 'xtask/**'
+      - 'ci/**'
+      - 'contracts/**'
+      - 'scripts/**'
+      - '.github/workflows/tooling.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  xtask:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip1
+
+      - name: Build xtask
+        run: cargo build --manifest-path xtask/Cargo.toml
+
+      - name: Doctor
+        run: cargo run --manifest-path xtask/Cargo.toml -- doctor
+
+      - name: Manifest check
+        run: cargo run --manifest-path xtask/Cargo.toml -- list --check

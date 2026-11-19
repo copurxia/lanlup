@@ -1,0 +1,250 @@
+# lanlup 插件清单 —— xtask / CI 生成的唯一事实源
+#
+# 字段：
+#   name    —— 逻辑名（catalog 中的 canonical 名，含 -rs 后缀）
+#   dir     —— 仓库内的 crate 目录
+#   package —— Cargo.toml 的 [package].name（当前与 dir 相同）
+#   kind    —— 插件类型，对应 lanlu_plugin_info 的 type/plugin_type
+#              （metadata / download / login / source / script）
+#   max_size_bytes —— 可选，check-wasm 的体积上限；缺省只报告不阻断
+schema = 1
+
+[[plugin]]
+name = "artstation-rs"
+dir = "artstation-rs"
+package = "artstation-rs"
+kind = "download"
+
+[[plugin]]
+name = "audiometa-rs"
+dir = "audiometa-rs"
+package = "audiometa-rs"
+kind = "metadata"
+
+[[plugin]]
+name = "bofmeta-rs"
+dir = "bofmeta-rs"
+package = "bofmeta-rs"
+kind = "metadata"
+
+[[plugin]]
+name = "btvmeta-rs"
+dir = "btvmeta-rs"
+package = "btvmeta-rs"
+kind = "metadata"
+
+[[plugin]]
+name = "bzdl-rs"
+dir = "bzdl-rs"
+package = "bzdl-rs"
+kind = "download"
+
+[[plugin]]
+name = "bzlogin-rs"
+dir = "bzlogin-rs"
+package = "bzlogin-rs"
+kind = "login"
+
+[[plugin]]
+name = "bzmeta-rs"
+dir = "bzmeta-rs"
+package = "bzmeta-rs"
+kind = "metadata"
+
+[[plugin]]
+name = "bzsource-rs"
+dir = "bzsource-rs"
+package = "bzsource-rs"
+kind = "source"
+
+[[plugin]]
+name = "comicinfo-rs"
+dir = "comicinfo-rs"
+package = "comicinfo-rs"
+kind = "metadata"
+
+[[plugin]]
+name = "dlsitemeta-rs"
+dir = "dlsitemeta-rs"
+package = "dlsitemeta-rs"
+kind = "metadata"
+
+[[plugin]]
+name = "ehdb-rs"
+dir = "ehdb-rs"
+package = "ehdb-rs"
+kind = "metadata"
+
+[[plugin]]
+name = "ehdl-rs"
+dir = "ehdl-rs"
+package = "ehdl-rs"
+kind = "download"
+
+[[plugin]]
+name = "ehentai-rs"
+dir = "ehentai-rs"
+package = "ehentai-rs"
+kind = "metadata"
+
+[[plugin]]
+name = "ehentaisource-rs"
+dir = "ehentaisource-rs"
+package = "ehentaisource-rs"
+kind = "source"
+
+[[plugin]]
+name = "ehlogin-rs"
+dir = "ehlogin-rs"
+package = "ehlogin-rs"
+kind = "login"
+
+[[plugin]]
+name = "helloworld-rs"
+dir = "helloworld-rs"
+package = "helloworld-rs"
+kind = "script"
+
+[[plugin]]
+name = "jmcomicdl-rs"
+dir = "jmcomicdl-rs"
+package = "jmcomicdl-rs"
+kind = "download"
+
+[[plugin]]
+name = "jmcomiclogin-rs"
+dir = "jmcomiclogin-rs"
+package = "jmcomiclogin-rs"
+kind = "login"
+
+[[plugin]]
+name = "jmcomicmeta-rs"
+dir = "jmcomicmeta-rs"
+package = "jmcomicmeta-rs"
+kind = "metadata"
+
+[[plugin]]
+name = "jmcomicsource-rs"
+dir = "jmcomicsource-rs"
+package = "jmcomicsource-rs"
+kind = "source"
+
+[[plugin]]
+name = "nfo-rs"
+dir = "nfo-rs"
+package = "nfo-rs"
+kind = "metadata"
+
+[[plugin]]
+name = "nhentai-rs"
+dir = "nhentai-rs"
+package = "nhentai-rs"
+kind = "download"
+
+[[plugin]]
+name = "nhlogin-rs"
+dir = "nhlogin-rs"
+package = "nhlogin-rs"
+kind = "login"
+
+[[plugin]]
+name = "nhmeta-rs"
+dir = "nhmeta-rs"
+package = "nhmeta-rs"
+kind = "metadata"
+
+[[plugin]]
+name = "nhsource-rs"
+dir = "nhsource-rs"
+package = "nhsource-rs"
+kind = "source"
+
+[[plugin]]
+name = "opfmeta-rs"
+dir = "opfmeta-rs"
+package = "opfmeta-rs"
+kind = "metadata"
+
+[[plugin]]
+name = "picacgdl-rs"
+dir = "picacgdl-rs"
+package = "picacgdl-rs"
+kind = "download"
+
+[[plugin]]
+name = "picacglogin-rs"
+dir = "picacglogin-rs"
+package = "picacglogin-rs"
+kind = "login"
+
+[[plugin]]
+name = "picacgmeta-rs"
+dir = "picacgmeta-rs"
+package = "picacgmeta-rs"
+kind = "metadata"
+
+[[plugin]]
+name = "picacgsource-rs"
+dir = "picacgsource-rs"
+package = "picacgsource-rs"
+kind = "source"
+
+[[plugin]]
+name = "pixivdl-rs"
+dir = "pixivdl-rs"
+package = "pixivdl-rs"
+kind = "download"
+
+[[plugin]]
+name = "pixivlogin-rs"
+dir = "pixivlogin-rs"
+package = "pixivlogin-rs"
+kind = "login"
+
+[[plugin]]
+name = "pixivmeta-rs"
+dir = "pixivmeta-rs"
+package = "pixivmeta-rs"
+kind = "metadata"
+
+[[plugin]]
+name = "regexparse-rs"
+dir = "regexparse-rs"
+package = "regexparse-rs"
+kind = "metadata"
+
+[[plugin]]
+name = "tagmerge-rs"
+dir = "tagmerge-rs"
+package = "tagmerge-rs"
+kind = "script"
+
+[[plugin]]
+name = "whisper-rs"
+dir = "whisper-rs"
+package = "whisper-rs"
+kind = "metadata"
+
+[[plugin]]
+name = "wikidata-rs"
+dir = "wikidata-rs"
+package = "wikidata-rs"
+kind = "metadata"
+
+[[plugin]]
+name = "xdl-rs"
+dir = "xdl-rs"
+package = "xdl-rs"
+kind = "download"
+
+[[plugin]]
+name = "xlogin-rs"
+dir = "xlogin-rs"
+package = "xlogin-rs"
+kind = "login"
+
+[[plugin]]
+name = "xmeta-rs"
+dir = "xmeta-rs"
+package = "xmeta-rs"
+kind = "metadata"
