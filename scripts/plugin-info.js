@@ -49,4 +49,48 @@ if (!len) {
 }
 
 const bytes = new Uint8Array(ex.memory.buffer, ptr, len);
-process.stdout.write(Buffer.from(bytes).toString('utf8'));
+const rawInfo = Buffer.from(bytes).toString('utf8');
+
+function invalid(message) {
+  console.error('invalid plugin info (' + file + '): ' + message);
+  process.exit(1);
+}
+
+let info;
+try {
+  info = JSON.parse(rawInfo);
+} catch (e) {
+  invalid('invalid JSON: ' + e.message);
+}
+
+if (info === null || typeof info !== 'object' || Array.isArray(info)) {
+  invalid('payload must be a JSON object');
+}
+
+const hasOwn = (key) => Object.prototype.hasOwnProperty.call(info, key);
+const hasText = (value) => typeof value === 'string' && value.trim().length > 0;
+
+if (!hasText(info.name)) {
+  invalid('"name" must be a non-empty string');
+}
+if (!hasText(info.version)) {
+  invalid('"version" must be a non-empty string');
+}
+for (const key of ['type', 'plugin_type']) {
+  if (hasOwn(key) && typeof info[key] !== 'string') {
+    invalid('"' + key + '" must be a string when present');
+  }
+}
+if (!hasText(info.type) && !hasText(info.plugin_type)) {
+  invalid('one of "type" or "plugin_type" must be a non-empty string');
+}
+if (hasOwn('namespace') && typeof info.namespace !== 'string') {
+  invalid('"namespace" must be a string when present');
+}
+for (const key of ['permissions', 'pre', 'after']) {
+  if (hasOwn(key) && !Array.isArray(info[key])) {
+    invalid('"' + key + '" must be an array when present');
+  }
+}
+
+process.stdout.write(rawInfo);

@@ -41,7 +41,8 @@ jobs:
           plugin_list="[]"
 
           for dir in artifacts/*/; do
-            plugin_name="$(basename "${dir}")"
+            artifact_name="$(basename "${dir}")"
+            plugin_name="${artifact_name%-wasip1}"
             wasm_files=("${dir}"*.wasm)
             if [ ${#wasm_files[@]} -eq 0 ]; then
               echo "  ⚠️  ${plugin_name}: no .wasm found, skipping"
@@ -63,21 +64,46 @@ jobs:
           timestamp="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
           info_lines="$(mktemp)"
           for dir in artifacts/*/; do
-            plugin_name="$(basename "${dir}")"
+            artifact_name="$(basename "${dir}")"
+            plugin_name="${artifact_name%-wasip1}"
             wasm_files=("${dir}"*.wasm)
             [ ${#wasm_files[@]} -eq 0 ] && continue
             wasm_file="${wasm_files[0]}"
             wasm_name="$(basename "${wasm_file}")"
-            info_json='{}'
-            if command -v node >/dev/null 2>&1; then
-              info_json="$(node scripts/plugin-info.js "${wasm_file}" 2>/dev/null || printf '{}')"
+            if ! command -v node >/dev/null 2>&1; then
+              echo "❌ ${plugin_name}: node is required to read plugin info" >&2
+              rm -f "${info_lines}"
+              exit 1
             fi
-            if ! printf '%s' "${info_json}" | jq -e . >/dev/null 2>&1; then
-              info_json='{}'
+
+            info_err="$(mktemp)"
+            if ! info_json="$(node scripts/plugin-info.js "${wasm_file}" 2>"${info_err}")"; then
+              echo "❌ ${plugin_name}: failed to read plugin info from ${wasm_file}" >&2
+              cat "${info_err}" >&2
+              rm -f "${info_err}" "${info_lines}"
+              exit 1
+            fi
+            rm -f "${info_err}"
+
+            if ! printf '%s' "${info_json}" | jq -e '
+              def nonempty: type == "string" and length > 0;
+              type == "object" and
+              (.name | nonempty) and
+              (.version | nonempty) and
+              (((.type? // "") | nonempty) or ((.plugin_type? // "") | nonempty)) and
+              ((has("namespace") | not) or (.namespace | type == "string")) and
+              ((has("permissions") | not) or (.permissions | type == "array")) and
+              ((has("pre") | not) or (.pre | type == "array")) and
+              ((has("after") | not) or (.after | type == "array"))
+            ' >/dev/null 2>&1; then
+              echo "❌ ${plugin_name}: plugin info failed required-field validation" >&2
+              printf '%s\n' "${info_json}" >&2
+              rm -f "${info_lines}"
+              exit 1
             fi
             jq -cn \
               --arg plugin "${plugin_name}" \
-              --arg asset "${plugin_name}.wasm" \
+              --arg asset "${plugin_name}-wasip1.wasm" \
               --arg artifact "${wasm_name}" \
               --argjson size "${plugin_sizes[${plugin_name}]}" \
               --arg sha "${plugin_shas[${plugin_name}]}" \

@@ -80,13 +80,15 @@ jobs:
         id: locate
         shell: bash
         run: |
-          wasm_file="$(find target/wasm32-wasip1/release -maxdepth 1 -type f -name '*.wasm' | head -n 1)"
-          if [ -z "${wasm_file}" ]; then
-            echo "❌ No wasm artifact found in target/wasm32-wasip1/release"
+          plugin="${{ inputs.plugin }}"
+          wasm_name="${plugin//-/_}.wasm"
+          wasm_file="target/wasm32-wasip1/release/${wasm_name}"
+          if [ ! -f "${wasm_file}" ]; then
+            echo "❌ Expected wasm artifact not found: ${wasm_file}"
+            ls -1 target/wasm32-wasip1/release/*.wasm 2>/dev/null || true
             exit 1
           fi
           wasm_size="$(stat --printf='%s' "${wasm_file}")"
-          wasm_name="$(basename "${wasm_file}")"
           echo "wasm_file=${wasm_file}" >> "${GITHUB_OUTPUT}"
           echo "wasm_size=${wasm_size}" >> "${GITHUB_OUTPUT}"
           echo "wasm_name=${wasm_name}" >> "${GITHUB_OUTPUT}"
@@ -169,7 +171,7 @@ jobs:
           echo "| Ref | ${GITHUB_REF_NAME} |" >> "${GITHUB_STEP_SUMMARY}"
 
       - name: 🚀 Prepare release asset
-        if: github.event_name != 'pull_request' && !startsWith(github.ref, 'refs/pull/')
+        if: github.event_name != 'pull_request' && !startsWith(github.ref, 'refs/pull/') && github.ref == 'refs/heads/master'
         id: release_asset
         shell: bash
         run: |
@@ -178,7 +180,7 @@ jobs:
           echo "file=${asset}" >> "${GITHUB_OUTPUT}"
 
       - name: 🚀 Publish to shared nightly release
-        if: github.event_name != 'pull_request' && !startsWith(github.ref, 'refs/pull/')
+        if: github.event_name != 'pull_request' && !startsWith(github.ref, 'refs/pull/') && github.ref == 'refs/heads/master'
         shell: bash
         env:
           RELEASE_TOKEN: ${{ github.token }}
