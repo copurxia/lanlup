@@ -1,3 +1,4 @@
+use crate::env;
 use crate::manifest::Plugin;
 use crate::ui;
 use anyhow::{bail, Context, Result};
@@ -16,10 +17,22 @@ pub fn run(root: &Path, plugins: &[&Plugin]) -> Result<()> {
         return Ok(());
     }
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+    let wasi_sdk = env::find_wasi_sdk();
+    match &wasi_sdk {
+        Some(path) => {
+            let _ = ui::print_line(format_args!("wasi-sdk: {}", path.display()));
+        }
+        None => {
+            eprintln!(
+                "warning: wasi-sdk not found (ring-based crates may fail); \
+                 install wasi-sdk-34 to /opt/wasi-sdk-34.0 or set WASI_SDK_PATH"
+            );
+        }
+    }
     let mut failed = Vec::new();
 
     for plugin in plugins {
-        match build_one(root, plugin, &cargo) {
+        match build_one(root, plugin, &cargo, wasi_sdk.as_deref()) {
             Ok((source, dest)) => {
                 let size = std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
                 let dest_rel = dest.strip_prefix(root).unwrap_or(&dest);
@@ -48,7 +61,12 @@ pub fn run(root: &Path, plugins: &[&Plugin]) -> Result<()> {
     Ok(())
 }
 
-fn build_one(root: &Path, plugin: &Plugin, cargo: &str) -> Result<(PathBuf, PathBuf)> {
+fn build_one(
+    root: &Path,
+    plugin: &Plugin,
+    cargo: &str,
+    wasi_sdk: Option<&Path>,
+) -> Result<(PathBuf, PathBuf)> {
     let member = root.join(&plugin.dir);
     if !member.join("Cargo.toml").is_file() {
         bail!("missing Cargo.toml at {}", member.display());
@@ -108,7 +126,8 @@ fn build_one(root: &Path, plugin: &Plugin, cargo: &str) -> Result<(PathBuf, Path
         .and_then(|value| value.as_str())
         .context("cargo metadata: missing lib target name")?;
 
-    let status = Command::new(cargo)
+    let mut build = Command::new(cargo);
+    build
         .args([
             "build",
             "--locked",
@@ -116,12 +135,23 @@ fn build_one(root: &Path, plugin: &Plugin, cargo: &str) -> Result<(PathBuf, Path
             "--target",
             "wasm32-wasip1",
         ])
-        .current_dir(&member)
+        .current_dir(&member);
+    // Match CI: ring reads WASI_SDK_PATH, cc-rs reads CC_/AR_<target>.
+    if let Some(sdk) = wasi_sdk {
+        env::apply_wasi_sdk_env(&mut build, sdk);
+    }
+    let status = build
         .status()
         .with_context(|| format!("run cargo build in {}", member.display()))?;
     if !status.success() {
+        let hint = if wasi_sdk.is_none() {
+            "; wasi-sdk not found — install wasi-sdk-34 to /opt/wasi-sdk-34.0 \
+             or set WASI_SDK_PATH (required by ring-based crates)"
+        } else {
+            ""
+        };
         bail!(
-            "cargo build failed for {} (target wasm32-wasip1)",
+            "cargo build failed for {} (target wasm32-wasip1){hint}",
             plugin.name
         );
     }

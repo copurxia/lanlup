@@ -1,5 +1,6 @@
+use crate::env;
 use anyhow::Result;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, ExitCode};
 
 /// Report toolchain and environment status.
@@ -31,7 +32,7 @@ pub fn run() -> Result<ExitCode> {
         println!("      version: {version}");
     }
 
-    let wasi_sdk = find_wasi_sdk();
+    let wasi_sdk = env::find_wasi_sdk();
     report(
         "wasi-sdk (ring-based crates only)",
         wasi_sdk.is_some(),
@@ -111,21 +112,4 @@ fn has_wasm_target() -> bool {
         }
     }
     false
-}
-
-fn find_wasi_sdk() -> Option<PathBuf> {
-    let mut candidates: Vec<PathBuf> = Vec::new();
-    if let Ok(path) = std::env::var("WASI_SDK_PATH") {
-        if !path.trim().is_empty() {
-            candidates.push(PathBuf::from(path));
-        }
-    }
-    candidates.push(PathBuf::from("/opt/wasi-sdk-34.0"));
-    candidates.push(PathBuf::from("/opt/wasi-sdk"));
-    if let Ok(home) = std::env::var("HOME") {
-        candidates.push(PathBuf::from(home).join("wasi-sdk-34.0"));
-    }
-    candidates
-        .into_iter()
-        .find(|candidate| candidate.join("bin/clang").is_file())
 }
