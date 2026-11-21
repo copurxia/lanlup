@@ -5,6 +5,7 @@ name: Tooling (xtask)
 
 on:
   push:
+    branches: ['**']
     paths:
       - 'plugins.toml'
       - 'xtask/**'

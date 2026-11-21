@@ -1,229 +1,273 @@
 # Forgejo 专用副本：Gitea/Forgejo 只要存在 .gitea/workflows 就完全忽略 .github/workflows。
 # Forgejo 不支持 Artifact v4 协议，本目录必须保持 upload/download-artifact@v3。
 # GitHub 版本见 .github/workflows/ 下的同名文件。
-name: Reusable Aggregate Release
+name: Reusable Catalog Release
+
+# 从 nightly release 中已发布的 <plugin>-wasip1.wasm 重新生成 plugins.json
+# 与聚合 tar.gz，不编译任何插件。调用方通过 wait_mode 指定需要等待哪些
+# 资产刷新（none / all / list）。
 
 on:
   workflow_call:
+    inputs:
+      wait_mode:
+        required: true
+        type: string
+      wait_plugins:
+        required: false
+        type: string
+        default: ''
+    outputs:
+      published:
+        description: 'Whether this run published the catalog'
+        value: ${{ jobs.catalog.outputs.published }}
 
 permissions:
   contents: write
 
 jobs:
-  aggregate:
+  catalog:
     runs-on: ubuntu-latest
     outputs:
-      artifact-count: ${{ steps.aggregate.outputs.artifact-count }}
-      total-size: ${{ steps.aggregate.outputs.total-size }}
-      package-name: ${{ steps.aggregate.outputs.package-name }}
+      published: ${{ steps.guard.outputs.publish }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      API_BASE: ${{ github.server_url }}/api/v1
+      AUTH_HEADER: token ${{ github.token }}
+      WAIT_MODE: ${{ inputs.wait_mode }}
+      WAIT_PLUGINS: ${{ inputs.wait_plugins }}
+      RUNS_URL: ${{ github.server_url }}/api/v1/repos/${{ github.repository }}/actions/runs?limit=50
+      PAGE_SIZE: '50'
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
-      - name: 📥 Download all plugin artifacts
-        # v4 的 pattern/merge-multiple 为 v4 独有参数；Forgejo 只支持 v3 协议。
-        # v3 不带 name 即下载全部 artifact，每个落到 path/<artifact-name>/ 子目录，
-        # 与 v4 pattern="*-wasip1"+merge-multiple:false 的布局等价（同 run 上传的
-        # 本就只有 *-wasip1 系列）。
-        uses: actions/download-artifact@v3
-        with:
-          path: artifacts
-
-      - name: 📦 Aggregate all plugins into master package
-        id: aggregate
+      - name: Record baseline from commit timestamp
+        id: baseline
         shell: bash
         run: |
-          staging_dir="${{ runner.temp }}/lanlu-plugins-wasip1"
-          mkdir -p "${staging_dir}"
+          set -euo pipefail
+          # Commit time is always earlier than any build triggered by this commit,
+          # unlike "job start time" which can be later than the builds after queueing.
+          commit_epoch="$(git log -1 --format=%ct "${GITHUB_SHA}")"
+          now="$(date -u +%s)"
+          if [ "${commit_epoch}" -gt "${now}" ]; then
+            echo "commit timestamp ${commit_epoch} is in the future; clamping to now"
+            commit_epoch="${now}"
+          fi
+          epoch=$((commit_epoch - 60))
+          echo "epoch=${epoch}" >> "${GITHUB_OUTPUT}"
+          echo "baseline: $(date -u -d "@${epoch}" '+%Y-%m-%dT%H:%M:%SZ') (min(commit, now) - 60s)"
 
-          echo "::group::Collecting plugins"
-          artifact_count=0
-          total_size=0
-          declare -A plugin_sizes
-          declare -A plugin_shas
-          plugin_list="[]"
+      - name: Wait for published plugin assets
+        if: inputs.wait_mode != 'none'
+        shell: bash
+        env:
+          BASELINE: ${{ steps.baseline.outputs.epoch }}
+        run: |
+          set -euo pipefail
+          expected="$(mktemp)"
+          trap 'rm -f "${expected}"' EXIT
+          if [ "${WAIT_MODE}" = "list" ]; then
+            printf '%s\n' "${WAIT_PLUGINS}" | tr ',' '\n' | sed '/^$/d; s/$/-wasip1.wasm/' > "${expected}"
+          else
+            sed -nE 's/^name = "([^"]+)"$/\1-wasip1.wasm/p' plugins.toml > "${expected}"
+          fi
+          echo "wait_mode=${WAIT_MODE}; expecting $(wc -l < "${expected}") fresh asset(s); baseline epoch ${BASELINE}"
 
-          # v3 会同时下载 *-wasip1-package，这里只处理原始 wasm artifact
-          for dir in artifacts/*-wasip1/; do
-            [ -d "${dir}" ] || continue
-            artifact_name="$(basename "${dir}")"
-            plugin_name="${artifact_name%-wasip1}"
-            wasm_files=("${dir}"*.wasm)
-            if [ ${#wasm_files[@]} -eq 0 ]; then
-              echo "  ⚠️  ${plugin_name}: no .wasm found, skipping"
+          deadline=$(( $(date -u +%s) + 7200 ))
+          while :; do
+            release_json="$(curl -fsSL --max-time 30 -H "Authorization: ${AUTH_HEADER}" "${API_BASE}/repos/${REPO}/releases/tags/nightly" || true)"
+            if [ -z "${release_json}" ]; then
+              echo "release API request failed; retrying in 30s"
+              sleep 30
               continue
             fi
-            wasm_file="${wasm_files[0]}"
-            wasm_name="$(basename "${wasm_file}")"
-            wasm_size="$(stat --printf='%s' "${wasm_file}")"
-            cp "${wasm_file}" "${staging_dir}/${wasm_name}"
-            plugin_sizes["${plugin_name}"]=${wasm_size}
-            plugin_shas["${plugin_name}"]="$(sha256sum "${wasm_file}" | cut -d' ' -f1)"
-            total_size=$((total_size + wasm_size))
-            artifact_count=$((artifact_count + 1))
-            echo "  ✅ ${plugin_name}: ${wasm_name} ($(numfmt --to=iec-i ${wasm_size}))"
-          done
-          echo "::endgroup::"
-
-          # 逐个读取插件元数据（名称/描述/图标/依赖），用 jq 组装 JSON
-          timestamp="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-          info_lines="$(mktemp)"
-          for dir in artifacts/*-wasip1/; do
-            [ -d "${dir}" ] || continue
-            artifact_name="$(basename "${dir}")"
-            plugin_name="${artifact_name%-wasip1}"
-            wasm_files=("${dir}"*.wasm)
-            [ ${#wasm_files[@]} -eq 0 ] && continue
-            wasm_file="${wasm_files[0]}"
-            wasm_name="$(basename "${wasm_file}")"
-            if ! command -v node >/dev/null 2>&1; then
-              echo "❌ ${plugin_name}: node is required to read plugin info" >&2
-              rm -f "${info_lines}"
+            pending=0
+            while IFS= read -r name; do
+              [ -n "${name}" ] || continue
+              ts="$(printf '%s' "${release_json}" | jq -r --arg n "${name}" '.assets[]? | select(.name == $n) | (.updated_at // .created_at // empty)' | head -n 1)"
+              if [ -z "${ts}" ]; then
+                echo "  missing: ${name}"
+                pending=$((pending + 1))
+                continue
+              fi
+              epoch="$(date -u -d "${ts}" +%s)"
+              if [ "${epoch}" -lt "${BASELINE}" ]; then
+                echo "  stale:   ${name} (${ts})"
+                pending=$((pending + 1))
+              fi
+            done < "${expected}"
+            if [ "${pending}" -eq 0 ]; then
+              echo "all expected assets are fresh"
+              break
+            fi
+            if [ "$(date -u +%s)" -ge "${deadline}" ]; then
+              echo "timeout waiting for ${pending} asset(s)" >&2
               exit 1
             fi
-
-            info_err="$(mktemp)"
-            if ! info_json="$(node scripts/plugin-info.js "${wasm_file}" 2>"${info_err}")"; then
-              echo "❌ ${plugin_name}: failed to read plugin info from ${wasm_file}" >&2
-              cat "${info_err}" >&2
-              rm -f "${info_err}" "${info_lines}"
-              exit 1
-            fi
-            rm -f "${info_err}"
-
-            if ! printf '%s' "${info_json}" | jq -e '
-              def nonempty: type == "string" and length > 0;
-              type == "object" and
-              (.name | nonempty) and
-              (.version | nonempty) and
-              (((.type? // "") | nonempty) or ((.plugin_type? // "") | nonempty)) and
-              ((has("namespace") | not) or (.namespace | type == "string")) and
-              ((has("permissions") | not) or (.permissions | type == "array")) and
-              ((has("pre") | not) or (.pre | type == "array")) and
-              ((has("after") | not) or (.after | type == "array"))
-            ' >/dev/null 2>&1; then
-              echo "❌ ${plugin_name}: plugin info failed required-field validation" >&2
-              printf '%s\n' "${info_json}" >&2
-              rm -f "${info_lines}"
-              exit 1
-            fi
-            jq -cn \
-              --arg plugin "${plugin_name}" \
-              --arg asset "${plugin_name}-wasip1.wasm" \
-              --arg artifact "${wasm_name}" \
-              --argjson size "${plugin_sizes[${plugin_name}]}" \
-              --arg sha "${plugin_shas[${plugin_name}]}" \
-              --argjson info "${info_json}" \
-              '{
-                plugin: $plugin,
-                asset: $asset,
-                artifact: $artifact,
-                size_bytes: $size,
-                sha256: $sha,
-                namespace: ($info.namespace // ""),
-                name: ($info.name // ""),
-                version: ($info.version // ""),
-                type: ($info.type // $info.plugin_type // ""),
-                description: ($info.description // ""),
-                icon: ($info.icon // ""),
-                author: ($info.author // ""),
-                tags: ($info.tags // ""),
-                pre: ($info.pre // [])
-              }' >> "${info_lines}"
+            echo "  ${pending} asset(s) pending; sleeping 30s"
+            sleep 30
           done
 
-          jq -s \
-            --argjson count "${artifact_count}" \
-            --argjson total "${total_size}" \
-            --arg version "${GITHUB_SHA::7}" \
-            --arg created "${timestamp}" \
-            --arg commit "${GITHUB_SHA}" \
-            --arg ref "${GITHUB_REF_NAME}" \
-            '{
-              schema: 1,
-              channel: "nightly",
-              name: "lanlu-wasip1-plugins",
-              version: $version,
-              created: $created,
-              plugin_count: $count,
-              total_size_bytes: $total,
-              commit: $commit,
-              ref: $ref,
-              plugins: .
-            }' "${info_lines}" > "${staging_dir}/metadata.json"
-          rm -f "${info_lines}"
-
-          # 独立发布一份索引资产，供客户端下载在线插件列表
-          cp "${staging_dir}/metadata.json" "${{ runner.temp }}/plugins.json"
-
-          # Create compressed master package
-          version="${GITHUB_SHA::7}"
-          package_name="lanlu-plugins-wasip1-${version}.tar.gz"
-          package_path="${{ runner.temp }}/${package_name}"
-          tar -czf "${package_path}" -C "${{ runner.temp }}" "lanlu-plugins-wasip1"
-
-          package_size="$(stat --printf='%s' "${package_path}")"
-          echo "artifact-count=${artifact_count}" >> "${GITHUB_OUTPUT}"
-          echo "total-size=${total_size}" >> "${GITHUB_OUTPUT}"
-          echo "package-name=${package_name}" >> "${GITHUB_OUTPUT}"
-
-          echo "✅ Master package: ${package_name}"
-          echo "   Plugins: ${artifact_count}"
-          echo "   Total wasm size: $(numfmt --to=iec-i ${total_size})"
-          echo "   Package size: $(numfmt --to=iec-i ${package_size})"
-
-      - name: ⬆ Upload aggregate package
-        uses: actions/upload-artifact@v3
-        with:
-          name: lanlu-plugins-wasip1-aggregate
-          path: ${{ runner.temp }}/${{ steps.aggregate.outputs.package-name }}
-          if-no-files-found: error
-
-      - name: 📋 Aggregate build summary
-        if: always()
+      - name: Settle (no in-flight plugin builds on master)
         shell: bash
         run: |
-          count="${{ steps.aggregate.outputs.artifact-count }}"
-          total="${{ steps.aggregate.outputs.total-size }}"
-          pkg="${{ steps.aggregate.outputs.package-name }}"
-          echo "## 📦 Aggregate Release Summary" >> "${GITHUB_STEP_SUMMARY}"
-          echo "" >> "${GITHUB_STEP_SUMMARY}"
-          echo "| Item | Value |" >> "${GITHUB_STEP_SUMMARY}"
-          echo "|------|-------|" >> "${GITHUB_STEP_SUMMARY}"
-          echo "| Plugins bundled | ${count} |" >> "${GITHUB_STEP_SUMMARY}"
-          echo "| Total wasm size | $(numfmt --to=iec-i ${total}) (${total} bytes) |" >> "${GITHUB_STEP_SUMMARY}"
-          echo "| Package | ${pkg} |" >> "${GITHUB_STEP_SUMMARY}"
-          echo "| Commit | ${GITHUB_SHA::7} |" >> "${GITHUB_STEP_SUMMARY}"
-          echo "| Ref | ${GITHUB_REF_NAME} |" >> "${GITHUB_STEP_SUMMARY}"
-          echo "" >> "${GITHUB_STEP_SUMMARY}"
-          echo "### Plugins included" >> "${GITHUB_STEP_SUMMARY}"
-          echo "" >> "${GITHUB_STEP_SUMMARY}"
-          echo "| # | Plugin | Artifact | Size |" >> "${GITHUB_STEP_SUMMARY}"
-          echo "|---|--------|----------|------|" >> "${GITHUB_STEP_SUMMARY}"
-          index=0
-          for dir in artifacts/*-wasip1/; do
-            [ -d "${dir}" ] || continue
-            plugin_name="$(basename "${dir}")"
-            wasm_files=("${dir}"*.wasm)
-            [ ${#wasm_files[@]} -eq 0 ] && continue
-            wasm_file="${wasm_files[0]}"
-            wasm_name="$(basename "${wasm_file}")"
-            wasm_size="$(stat --printf='%s' "${wasm_file}")"
-            index=$((index + 1))
-            echo "| ${index} | ${plugin_name} | ${wasm_name} | $(numfmt --to=iec-i ${wasm_size}) |" >> "${GITHUB_STEP_SUMMARY}"
+          set -euo pipefail
+          # Give the scheduler a moment to register this push's workflow runs.
+          sleep 30
+          all_runs="$(mktemp)"
+          trap 'rm -f "${all_runs}"' EXIT
+          deadline=$(( $(date -u +%s) + 7200 ))
+          while :; do
+            : > "${all_runs}"
+            page=1
+            page_failed=0
+            while :; do
+              page_json="$(curl -fsSL --max-time 30 -H "Authorization: ${AUTH_HEADER}" "${RUNS_URL}&page=${page}" || true)"
+              if [ -z "${page_json}" ]; then
+                page_failed=1
+                break
+              fi
+              n="$(printf '%s' "${page_json}" | jq -r '(.workflow_runs // .runs // []) | length')"
+              printf '%s' "${page_json}" | jq -c '(.workflow_runs // .runs // [])' >> "${all_runs}"
+              [ "${n}" -lt "${PAGE_SIZE}" ] && break
+              page=$((page + 1))
+              [ "${page}" -gt 100 ] && break
+            done
+            if [ "${page_failed}" -eq 1 ]; then
+              echo "runs API request failed; retrying in 30s"
+              sleep 30
+              continue
+            fi
+            pending="$(jq -s --arg branch master '
+              add
+              | [ .[]?
+                  | select(((.head_branch // .prettyref // "") | tostring) == $branch)
+                  | select(.status != "completed" and .status != "success" and .status != "failure" and .status != "cancelled" and .status != "skipped")
+                  | select((((.path // .workflow_id // "") | tostring) | test("-wasip1\\.yml$")))
+                  | select((((.path // .workflow_id // "") | tostring) | test("_build-wasip1\\.yml$")) | not)
+                ] | length' "${all_runs}")"
+            echo "in-flight plugin build runs on master: ${pending}"
+            [ "${pending}" -eq 0 ] && break
+            if [ "$(date -u +%s)" -ge "${deadline}" ]; then
+              echo "timeout waiting for ${pending} in-flight plugin build(s)" >&2
+              exit 1
+            fi
+            sleep 30
           done
 
-      - name: 🚀 Publish aggregate to nightly release
-        if: github.event_name != 'pull_request'
+      - name: "Guard: master HEAD is this commit"
+        id: guard
+        shell: bash
+        run: |
+          set -euo pipefail
+          branch_json="$(curl -fsSL --max-time 30 -H "Authorization: ${AUTH_HEADER}" "${API_BASE}/repos/${REPO}/branches/master" || true)"
+          if [ -z "${branch_json}" ]; then
+            echo "cannot read master HEAD; refusing to publish" >&2
+            exit 1
+          fi
+          head_sha="$(printf '%s' "${branch_json}" | jq -r '.commit.sha // .commit.id // empty')"
+          if [ -z "${head_sha}" ]; then
+            echo "cannot parse master HEAD; refusing to publish" >&2
+            exit 1
+          fi
+          if [ "${head_sha}" != "${GITHUB_SHA}" ]; then
+            echo "master HEAD is ${head_sha}, this run is ${GITHUB_SHA}; skipping publish (newer run owns the catalog)"
+            echo "publish=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+          echo "publish=true" >> "${GITHUB_OUTPUT}"
+
+      - name: Remove stale aggregate packages
+        if: steps.guard.outputs.publish == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          current="lanlu-plugins-wasip1-${GITHUB_SHA::7}.tar.gz"
+          release_json="$(curl -fsSL --max-time 30 -H "Authorization: ${AUTH_HEADER}" "${API_BASE}/repos/${REPO}/releases/tags/nightly")"
+          release_id="$(printf '%s' "${release_json}" | jq -r '.id')"
+          printf '%s' "${release_json}" | jq -r --arg current "${current}" '
+            .assets[]?
+            | select(.name | test("^lanlu-plugins-wasip1-.*\\.tar\\.gz$"))
+            | select(.name != $current)
+            | [.id, .name] | @tsv
+          ' | while IFS=$'\t' read -r id name; do
+            [ -n "${id}" ] || continue
+            echo "deleting stale aggregate package ${name} (id=${id})"
+            curl -fsSL -X DELETE -H "Authorization: ${AUTH_HEADER}" "${API_BASE}/repos/${REPO}/releases/${release_id}/assets/${id}" >/dev/null
+          done
+
+      - name: Download published wasm assets
+        if: steps.guard.outputs.publish == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p wasm
+          release_json="$(curl -fsSL --max-time 30 -H "Authorization: ${AUTH_HEADER}" "${API_BASE}/repos/${REPO}/releases/tags/nightly")"
+          printf '%s' "${release_json}" | jq -r '.assets[]? | select(.name | endswith("-wasip1.wasm")) | [.name, .browser_download_url] | @tsv' > assets.tsv
+
+          expected="$(mktemp)"
+          sed -nE 's/^name = "([^"]+)"$/\1/p' plugins.toml | sort > "${expected}"
+          while IFS=$'\t' read -r name url; do
+            [ -n "${name}" ] || continue
+            plugin="${name%-wasip1.wasm}"
+            if ! grep -qx "${plugin}" "${expected}"; then
+              echo "skipping asset not listed in plugins.toml: ${name}"
+              continue
+            fi
+            echo "downloading ${name}"
+            curl -fsSL --retry 5 --retry-delay 3 --max-time 300 -H "Authorization: ${AUTH_HEADER}" -o "wasm/${name}" "${url}"
+          done < assets.tsv
+
+          expected_count="$(wc -l < "${expected}")"
+          actual_count="$(find wasm -maxdepth 1 -name '*-wasip1.wasm' | wc -l)"
+          echo "downloaded ${actual_count}/${expected_count} asset(s)"
+          [ "${actual_count}" -eq "${expected_count}" ] || { echo "asset count mismatch" >&2; exit 1; }
+
+      - name: Build catalog and package
+        if: steps.guard.outputs.publish == 'true'
+        shell: bash
+        run: |
+          bash scripts/build-plugin-catalog.sh \
+            --wasm-dir wasm \
+            --plugins-toml plugins.toml \
+            --out-dir out \
+            --commit "${GITHUB_SHA}" \
+            --ref "${GITHUB_REF_NAME}" \
+            --channel nightly
+
+      - name: 🚀 Publish catalog to nightly release
+        if: steps.guard.outputs.publish == 'true'
         shell: bash
         env:
           RELEASE_TOKEN: ${{ github.token }}
         run: |
-          # action-gh-release 在 Forgejo 上会把请求打到 web 路由（POST 405），
-          # 这里直接用 /api/v1 上传到 nightly release。
+          set -euo pipefail
+          # Forgejo 上 action-gh-release 会打到 web 路由（POST 405），直接走 /api/v1。
           bash "${{ github.workspace }}/.gitea/scripts/publish-nightly-release-asset.sh" \
-            "${{ runner.temp }}/${{ steps.aggregate.outputs.package-name }}"
+            "out/lanlu-plugins-wasip1-${GITHUB_SHA::7}.tar.gz"
           bash "${{ github.workspace }}/.gitea/scripts/publish-nightly-release-asset.sh" \
-            "${{ runner.temp }}/plugins.json"
+            "out/plugins.json"
+
+      - name: 📋 Catalog summary
+        if: always()
+        shell: bash
+        env:
+          PUBLISHED: ${{ steps.guard.outputs.publish }}
+        run: |
+          {
+            echo "## 📦 Catalog refresh"
+            echo ""
+            echo "| Item | Value |"
+            echo "|------|-------|"
+            echo "| Commit | ${GITHUB_SHA::7} |"
+            echo "| Ref | ${GITHUB_REF_NAME} |"
+            echo "| Wait mode | ${WAIT_MODE} |"
+            echo "| Published | ${PUBLISHED:-unknown} |"
+            if [ -f out/plugins.json ]; then
+              echo "| Plugins | $(jq -r '.plugin_count' out/plugins.json) |"
+              echo "| Total size | $(jq -r '.total_size_bytes' out/plugins.json) bytes |"
+            fi
+          } >> "${GITHUB_STEP_SUMMARY}"

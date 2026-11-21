@@ -1,99 +1,140 @@
-name: Nightly Aggregate Release
+name: Nightly Catalog Release
+
+# 轻量 catalog：master push 后不再重编 40 个插件，只等待本次受影响的
+# per-plugin 资产刷新，然后从已发布的 wasm 重新生成 plugins.json。
+# 插件 wasm 本身由各 <plugin>-wasip1.yml 在 push 时构建并发布。
 
 on:
-  schedule:
-    # Run daily at 02:00 UTC
-    - cron: '0 2 * * *'
+  push:
+    branches: [master]
   workflow_dispatch:
     inputs:
       plugins:
-        description: 'Comma-separated list of plugins to build (empty = all)'
+        description: 'Deprecated / no-op: catalog always rebuilds from all published assets'
         required: false
         type: string
 
 permissions:
   contents: write
 
-jobs:
-  list-plugins:
-    runs-on: ubuntu-latest
-    outputs:
-      matrix: ${{ steps.list.outputs.matrix }}
-    steps:
-      - uses: actions/checkout@v4
-      - id: list
-        shell: bash
-        run: |
-          # Find all plugin workflow files (excluding templates)
-          plugins=()
-          for wf in .github/workflows/*-rs-wasip1.yml; do
-            # Keep the `-rs` suffix because it is part of the plugin directory
-            # name (for example, ehentai-rs-wasip1.yml -> ehentai-rs).
-            plugin="$(basename "${wf}" -wasip1.yml)"
-            plugins+=("${plugin}")
-          done
-          # If user specified plugins, filter
-          if [ -n "${{ inputs.plugins }}" ]; then
-            IFS=',' read -ra specified <<< "${{ inputs.plugins }}"
-            filtered=()
-            for spec in "${specified[@]}"; do
-              spec="$(echo "${spec}" | xargs)"
-              for plugin in "${plugins[@]}"; do
-                if [ "${plugin}" = "${spec}" ]; then
-                  filtered+=("${plugin}")
-                fi
-              done
-            done
-            plugins=("${filtered[@]}")
-          fi
-          echo "matrix=$(printf '%s\n' "${plugins[@]}" | jq -R -s -c 'split("\n") | map(select(length > 0))')" >> "${GITHUB_OUTPUT}"
+concurrency:
+  group: catalog
+  cancel-in-progress: true
 
-  check:
+jobs:
+  changed:
+    if: github.ref == 'refs/heads/master'
     runs-on: ubuntu-latest
     outputs:
-      changed: ${{ steps.check.outputs.changed }}
+      mode: ${{ steps.compute.outputs.mode }}
+      plugins: ${{ steps.compute.outputs.plugins }}
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - id: check
+
+      - name: Compute wait scope
+        id: compute
         shell: bash
         run: |
-          last="$(git rev-list -n 1 refs/tags/nightly-build 2>/dev/null || true)"
-          if [ -n "${last}" ] && [ "${last}" = "${GITHUB_SHA}" ]; then
-            echo "changed=false" >> "${GITHUB_OUTPUT}"
-            echo "HEAD ${GITHUB_SHA} 与上次聚合一致，跳过"
-          else
-            echo "changed=true" >> "${GITHUB_OUTPUT}"
-            echo "HEAD ${GITHUB_SHA}，上次聚合 ${last:-<none>}"
+          set -euo pipefail
+          if [ "${GITHUB_EVENT_NAME}" != "push" ]; then
+            echo "mode=none" >> "${GITHUB_OUTPUT}"
+            echo "plugins=" >> "${GITHUB_OUTPUT}"
+            echo "workflow_dispatch: regenerating catalog from current assets"
+            exit 0
           fi
 
-  build:
-    needs: [list-plugins, check]
-    if: github.event_name == 'workflow_dispatch' || needs.check.outputs.changed == 'true'
-    strategy:
-      fail-fast: false
-      matrix:
-        plugin: ${{ fromJson(needs.list-plugins.outputs.matrix) }}
-    uses: ./.github/workflows/_build-wasip1.yml
-    with:
-      plugin: ${{ matrix.plugin }}
+          before="${{ github.event.before }}"
+          head="${GITHUB_SHA}"
+          if [ -z "${before}" ] || [ "${before}" = "0000000000000000000000000000000000000000" ]; then
+            before="$(git rev-parse "${head}^" 2>/dev/null || true)"
+          fi
+          # Force push / unreachable parent: fall back to waiting for all assets.
+          if [ -z "${before}" ] || ! git cat-file -e "${before}^{commit}" 2>/dev/null; then
+            echo "mode=all" >> "${GITHUB_OUTPUT}"
+            echo "plugins=" >> "${GITHUB_OUTPUT}"
+            echo "previous commit unreachable; waiting for all assets"
+            exit 0
+          fi
 
-  aggregate:
-    needs: [check, build]
-    if: always() && (github.event_name == 'workflow_dispatch' || needs.check.outputs.changed == 'true')
+          files="$(git diff --name-only "${before}" "${head}")"
+          printf 'changed files:\n%s\n' "${files}"
+
+          all=0
+          plugin_list="$(mktemp)"
+          while IFS= read -r f; do
+            [ -n "${f}" ] || continue
+            case "${f}" in
+              .github/workflows/_build-wasip1.yml)
+                all=1
+                ;;
+              .github/workflows/*-wasip1.yml)
+                base="${f##*/}"
+                plugin="${base%-wasip1.yml}"
+                [ -n "${plugin}" ] && printf '%s\n' "${plugin}" >> "${plugin_list}"
+                ;;
+              .github/*)
+                # Non-plugin GitHub workflow (aggregate/tooling): no builds triggered.
+                ;;
+              .gitea/*)
+                # Other forge workflow: GitHub runners will not build anything.
+                ;;
+              *)
+                case "${f%%/*}" in
+                  *-rs) printf '%s\n' "${f%%/*}" >> "${plugin_list}" ;;
+                esac
+                ;;
+            esac
+          done <<< "${files}"
+
+          if [ "${all}" -eq 1 ]; then
+            echo "mode=all" >> "${GITHUB_OUTPUT}"
+            echo "plugins=" >> "${GITHUB_OUTPUT}"
+            echo "shared build workflow changed: waiting for all plugin assets"
+          elif [ -s "${plugin_list}" ]; then
+            plugins="$(sort -u "${plugin_list}" | paste -sd, -)"
+            echo "mode=list" >> "${GITHUB_OUTPUT}"
+            echo "plugins=${plugins}" >> "${GITHUB_OUTPUT}"
+            echo "plugin changes: ${plugins}"
+          else
+            echo "mode=none" >> "${GITHUB_OUTPUT}"
+            echo "plugins=" >> "${GITHUB_OUTPUT}"
+            echo "no plugin changes: regenerating catalog from current assets"
+          fi
+
+  catalog:
+    needs: [changed]
     uses: ./.github/workflows/_release-aggregate.yml
+    with:
+      wait_mode: ${{ needs.changed.outputs.mode }}
+      wait_plugins: ${{ needs.changed.outputs.plugins }}
 
   mark-built:
-    needs: [build, aggregate]
-    if: github.event_name == 'schedule' && needs.build.result == 'success' && needs.aggregate.result == 'success'
+    needs: [catalog]
+    if: github.ref == 'refs/heads/master' && needs.catalog.outputs.published == 'true'
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: 🏷️ Record last aggregated commit
+
+      - name: 🏷️ Point nightly-build at this commit
         shell: bash
         run: |
+          set -euo pipefail
+          remote_head="$(git ls-remote origin refs/heads/master | awk '{print $1}')"
+          if [ -z "${remote_head}" ]; then
+            echo "cannot read remote master HEAD" >&2
+            exit 1
+          fi
+          if [ "${remote_head}" != "${GITHUB_SHA}" ]; then
+            echo "master HEAD is ${remote_head}, this run is ${GITHUB_SHA}; skipping nightly-build tag update"
+            exit 0
+          fi
           git tag -f nightly-build "${GITHUB_SHA}"
           git push -f origin "refs/tags/nightly-build"
