@@ -2,6 +2,7 @@ name: CI bzsource-rs (wasip1)
 
 on:
   push:
+    branches: [master]
     paths:
       - 'bzsource-rs/**'
       - '.github/workflows/bzsource-rs-wasip1.yml'

@@ -2,6 +2,7 @@ name: CI nhentai-rs (wasip1)
 
 on:
   push:
+    branches: [master]
     paths:
       - 'nhentai-rs/**'
       - '.gitea/workflows/nhentai-rs-wasip1.yml'

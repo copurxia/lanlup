@@ -2,6 +2,7 @@ name: CI pixivdl-rs (wasip1)
 
 on:
   push:
+    branches: [master]
     paths:
       - 'pixivdl-rs/**'
       - '.github/workflows/pixivdl-rs-wasip1.yml'

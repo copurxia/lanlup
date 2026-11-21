@@ -2,6 +2,7 @@ name: CI opfmeta-rs (wasip1)
 
 on:
   push:
+    branches: [master]
     paths:
       - 'opfmeta-rs/**'
       - '.gitea/workflows/opfmeta-rs-wasip1.yml'

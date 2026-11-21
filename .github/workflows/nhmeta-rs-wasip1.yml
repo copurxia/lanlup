@@ -2,6 +2,7 @@ name: CI nhmeta-rs (wasip1)
 
 on:
   push:
+    branches: [master]
     paths:
       - 'nhmeta-rs/**'
       - '.github/workflows/nhmeta-rs-wasip1.yml'

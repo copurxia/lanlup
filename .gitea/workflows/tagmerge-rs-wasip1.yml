@@ -2,6 +2,7 @@ name: CI tagmerge-rs (wasip1)
 
 on:
   push:
+    branches: [master]
     paths:
       - 'tagmerge-rs/**'
       - '.gitea/workflows/tagmerge-rs-wasip1.yml'

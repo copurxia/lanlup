@@ -2,6 +2,7 @@ name: CI dlsitemeta-rs (wasip1)
 
 on:
   push:
+    branches: [master]
     paths:
       - 'dlsitemeta-rs/**'
       - '.github/workflows/dlsitemeta-rs-wasip1.yml'

@@ -2,6 +2,7 @@ name: CI xmeta-rs (wasip1)
 
 on:
   push:
+    branches: [master]
     paths:
       - 'xmeta-rs/**'
       - '.gitea/workflows/xmeta-rs-wasip1.yml'

@@ -2,6 +2,7 @@ name: CI regexparse-rs (wasip1)
 
 on:
   push:
+    branches: [master]
     paths:
       - 'regexparse-rs/**'
       - '.gitea/workflows/regexparse-rs-wasip1.yml'

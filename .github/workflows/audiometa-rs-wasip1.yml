@@ -2,6 +2,7 @@ name: CI audiometa-rs (wasip1)
 
 on:
   push:
+    branches: [master]
     paths:
       - 'audiometa-rs/**'
       - '.github/workflows/audiometa-rs-wasip1.yml'

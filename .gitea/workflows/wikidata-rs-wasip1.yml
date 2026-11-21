@@ -2,6 +2,7 @@ name: CI wikidata-rs (wasip1)
 
 on:
   push:
+    branches: [master]
     paths:
       - 'wikidata-rs/**'
       - '.gitea/workflows/wikidata-rs-wasip1.yml'

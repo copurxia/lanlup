@@ -2,6 +2,7 @@ name: CI nhsource-rs (wasip1)
 
 on:
   push:
+    branches: [master]
     paths:
       - 'nhsource-rs/**'
       - '.gitea/workflows/nhsource-rs-wasip1.yml'

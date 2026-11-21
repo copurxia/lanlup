@@ -2,6 +2,7 @@ name: CI picacgmeta-rs (wasip1)
 
 on:
   push:
+    branches: [master]
     paths:
       - 'picacgmeta-rs/**'
       - '.gitea/workflows/picacgmeta-rs-wasip1.yml'

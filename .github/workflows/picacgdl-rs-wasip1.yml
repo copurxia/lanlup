@@ -2,6 +2,7 @@ name: CI picacgdl-rs (wasip1)
 
 on:
   push:
+    branches: [master]
     paths:
       - 'picacgdl-rs/**'
       - '.github/workflows/picacgdl-rs-wasip1.yml'

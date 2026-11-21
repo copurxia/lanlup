@@ -2,6 +2,7 @@ name: CI ehdl-rs (wasip1)
 
 on:
   push:
+    branches: [master]
     paths:
       - 'ehdl-rs/**'
       - '.gitea/workflows/ehdl-rs-wasip1.yml'

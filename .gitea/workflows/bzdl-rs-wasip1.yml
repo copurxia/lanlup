@@ -2,6 +2,7 @@ name: CI bzdl-rs (wasip1)
 
 on:
   push:
+    branches: [master]
     paths:
       - 'bzdl-rs/**'
       - '.gitea/workflows/bzdl-rs-wasip1.yml'

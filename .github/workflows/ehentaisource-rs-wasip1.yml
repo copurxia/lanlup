@@ -2,6 +2,7 @@ name: CI ehentaisource-rs (wasip1)
 
 on:
   push:
+    branches: [master]
     paths:
       - 'ehentaisource-rs/**'
       - '.github/workflows/ehentaisource-rs-wasip1.yml'

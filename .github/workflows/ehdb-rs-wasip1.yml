@@ -2,6 +2,7 @@ name: CI ehdb-rs (wasip1)
 
 on:
   push:
+    branches: [master]
     paths:
       - 'ehdb-rs/**'
       - '.github/workflows/ehdb-rs-wasip1.yml'

@@ -2,6 +2,7 @@ name: CI bzlogin-rs (wasip1)
 
 on:
   push:
+    branches: [master]
     paths:
       - 'bzlogin-rs/**'
       - '.github/workflows/bzlogin-rs-wasip1.yml'

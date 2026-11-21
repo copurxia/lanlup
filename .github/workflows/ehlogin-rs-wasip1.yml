@@ -2,6 +2,7 @@ name: CI ehlogin-rs (wasip1)
 
 on:
   push:
+    branches: [master]
     paths:
       - 'ehlogin-rs/**'
       - '.github/workflows/ehlogin-rs-wasip1.yml'

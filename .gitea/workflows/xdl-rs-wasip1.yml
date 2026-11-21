@@ -2,6 +2,7 @@ name: CI xdl-rs (wasip1)
 
 on:
   push:
+    branches: [master]
     paths:
       - 'xdl-rs/**'
       - '.gitea/workflows/xdl-rs-wasip1.yml'

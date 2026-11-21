@@ -2,6 +2,7 @@ name: CI nfo-rs (wasip1)
 
 on:
   push:
+    branches: [master]
     paths:
       - 'nfo-rs/**'
       - '.gitea/workflows/nfo-rs-wasip1.yml'

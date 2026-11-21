@@ -2,6 +2,7 @@ name: CI bzmeta-rs (wasip1)
 
 on:
   push:
+    branches: [master]
     paths:
       - 'bzmeta-rs/**'
       - '.github/workflows/bzmeta-rs-wasip1.yml'

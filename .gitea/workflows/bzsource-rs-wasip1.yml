@@ -2,6 +2,7 @@ name: CI bzsource-rs (wasip1)
 
 on:
   push:
+    branches: [master]
     paths:
       - 'bzsource-rs/**'
       - '.gitea/workflows/bzsource-rs-wasip1.yml'

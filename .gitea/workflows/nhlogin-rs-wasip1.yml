@@ -2,6 +2,7 @@ name: CI nhlogin-rs (wasip1)
 
 on:
   push:
+    branches: [master]
     paths:
       - 'nhlogin-rs/**'
       - '.gitea/workflows/nhlogin-rs-wasip1.yml'

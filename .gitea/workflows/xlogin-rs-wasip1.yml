@@ -2,6 +2,7 @@ name: CI xlogin-rs (wasip1)
 
 on:
   push:
+    branches: [master]
     paths:
       - 'xlogin-rs/**'
       - '.gitea/workflows/xlogin-rs-wasip1.yml'

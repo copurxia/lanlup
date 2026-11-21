@@ -2,6 +2,7 @@ name: CI pixivmeta-rs (wasip1)
 
 on:
   push:
+    branches: [master]
     paths:
       - 'pixivmeta-rs/**'
       - '.github/workflows/pixivmeta-rs-wasip1.yml'

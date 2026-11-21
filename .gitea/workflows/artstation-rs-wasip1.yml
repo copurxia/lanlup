@@ -2,6 +2,7 @@ name: CI artstation-rs (wasip1)
 
 on:
   push:
+    branches: [master]
     paths:
       - 'artstation-rs/**'
       - '.gitea/workflows/artstation-rs-wasip1.yml'

@@ -2,6 +2,7 @@ name: CI btvmeta-rs (wasip1)
 
 on:
   push:
+    branches: [master]
     paths:
       - 'btvmeta-rs/**'
       - '.gitea/workflows/btvmeta-rs-wasip1.yml'

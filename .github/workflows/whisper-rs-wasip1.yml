@@ -2,6 +2,7 @@ name: CI whisper-rs (wasip1)
 
 on:
   push:
+    branches: [master]
     paths:
       - 'whisper-rs/**'
       - '.github/workflows/whisper-rs-wasip1.yml'

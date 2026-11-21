@@ -2,6 +2,7 @@ name: CI jmcomicsource-rs (wasip1)
 
 on:
   push:
+    branches: [master]
     paths:
       - 'jmcomicsource-rs/**'
       - '.github/workflows/jmcomicsource-rs-wasip1.yml'

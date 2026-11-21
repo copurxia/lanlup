@@ -2,6 +2,7 @@ name: CI bofmeta-rs (wasip1)
 
 on:
   push:
+    branches: [master]
     paths:
       - 'bofmeta-rs/**'
       - '.github/workflows/bofmeta-rs-wasip1.yml'

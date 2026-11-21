@@ -2,6 +2,7 @@ name: CI jmcomicsource-rs (wasip1)
 
 on:
   push:
+    branches: [master]
     paths:
       - 'jmcomicsource-rs/**'
       - '.gitea/workflows/jmcomicsource-rs-wasip1.yml'
