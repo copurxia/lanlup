@@ -49,6 +49,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          mkdir -p out; echo "[step] $(date -u +%FT%TZ) trace-init" >> out/trace.log
           echo "[step] previous $(date -u +%FT%TZ)"
           release_json="$(curl -fsSL --max-time 30 -H "Authorization: ${AUTH_HEADER}" "${API_BASE}/repos/${REPO}/releases/tags/nightly" || true)"
           url=""
@@ -78,6 +79,7 @@ jobs:
           PREV_EPOCH: ${{ steps.previous.outputs.created_epoch }}
         run: |
           set -euo pipefail
+          mkdir -p out; echo "[step] $(date -u +%FT%TZ) trace-init" >> out/trace.log
           echo "[step] baseline $(date -u +%FT%TZ)"
           commit_epoch="$(git log -1 --format=%ct "${GITHUB_SHA}")"
           base="${commit_epoch}"
@@ -101,6 +103,7 @@ jobs:
           BASELINE: ${{ steps.baseline.outputs.epoch }}
         run: |
           set -euo pipefail
+          mkdir -p out; echo "[step] $(date -u +%FT%TZ) trace-init" >> out/trace.log
           echo "[step] wait $(date -u +%FT%TZ)"
           expected="$(mktemp)"
           trap 'rm -f "${expected}"' EXIT
@@ -151,7 +154,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo "[step] settle $(date -u +%FT%TZ)"
+          mkdir -p out
+          trace(){ echo "$*" | tee -a out/trace.log; }
+          trace "[step] settle $(date -u +%FT%TZ)"
           sleep 30
           all_runs="$(mktemp)"
           trap 'rm -f "${all_runs}"' EXIT
@@ -161,23 +166,34 @@ jobs:
             page=1
             page_failed=0
             while :; do
-              page_json="$(curl -fsSL --max-time 30 -H "Authorization: ${AUTH_HEADER}" "${RUNS_URL}&page=${page}" || true)"
-              if [ -z "${page_json}" ]; then
+              trace "[settle] $(date -u +%FT%TZ) curl-start page=${page}"
+              page_body="$(mktemp)"
+              http_code="$(curl -sSL --max-time 30 -o "${page_body}" -w '%{http_code}' -H "Authorization: ${AUTH_HEADER}" "${RUNS_URL}&page=${page}" || true)"
+              page_json="$(cat "${page_body}")"
+              trace "[settle] $(date -u +%FT%TZ) curl-done page=${page} http=${http_code} bytes=${#page_json} body=$(printf '%s' "${page_json}" | head -c 200 | tr '\n' ' ')"
+              rm -f "${page_body}"
+              if [ -z "${page_json}" ] || [ "${http_code}" != "200" ]; then
+                trace "[settle] $(date -u +%FT%TZ) page-failed page=${page} http=${http_code}"
                 page_failed=1
                 break
               fi
-              n="$(printf '%s' "${page_json}" | jq -r '(.workflow_runs // .runs // []) | length')"
-              printf '%s' "${page_json}" | jq -c '(.workflow_runs // .runs // [])[]' >> "${all_runs}"
+              trace "[settle] $(date -u +%FT%TZ) jq-count-start page=${page}"
+              n="$(printf '%s' "${page_json}" | jq -r '(.workflow_runs // .runs // []) | length')" || true
+              trace "[settle] $(date -u +%FT%TZ) jq-count-done page=${page} rc=$? count=${n:-?}"
+              trace "[settle] $(date -u +%FT%TZ) jq-append-start page=${page}"
+              printf '%s' "${page_json}" | jq -c '(.workflow_runs // .runs // [])[]' >> "${all_runs}" || true
+              trace "[settle] $(date -u +%FT%TZ) jq-append-done page=${page} rc=$? all_bytes=$(wc -c < "${all_runs}")"
               [ "${n}" -lt "${PAGE_SIZE}" ] && break
               page=$((page + 1))
               [ "${page}" -gt 100 ] && break
             done
             if [ "${page_failed}" -eq 1 ]; then
-              echo "[settle] $(date -u +%FT%TZ) runs API request failed; retrying in 30s"
+              trace "[settle] $(date -u +%FT%TZ) runs API request failed; retrying in 30s"
               sleep 30
               continue
             fi
 
+            trace "[settle] $(date -u +%FT%TZ) jq-failed-start all_bytes=$(wc -c < "${all_runs}")"
             failed="$(jq -s -r --arg branch master --arg sha "${GITHUB_SHA}" '
               [ .[]
                   | select(((.head_branch // .prettyref // "") | tostring) == $branch)
@@ -187,11 +203,13 @@ jobs:
                   | select((((.path // .workflow_id // "") | tostring) | test("_build-wasip1\\.yml$")) | not)
                   | ((.path // .workflow_id // "") | tostring | split("/") | last)
                 ] | join(", ")' "${all_runs}")"
+            trace "[settle] $(date -u +%FT%TZ) jq-failed-done rc=$? failed_len=${#failed}"
             if [ -n "${failed}" ]; then
               echo "[settle] $(date -u +%FT%TZ) plugin build(s) FAILED for current commit ${GITHUB_SHA:0:7}: ${failed}" >&2
               exit 1
             fi
 
+            trace "[settle] $(date -u +%FT%TZ) jq-details-start"
             details="$(jq -s -r --arg branch master '
               .[]
               | select(((.head_branch // .prettyref // "") | tostring) == $branch)
@@ -200,8 +218,9 @@ jobs:
               | select((((.path // .workflow_id // "") | tostring) | test("_build-wasip1\\.yml$")) | not)
               | [ ((.path // .workflow_id // "") | tostring | split("/") | last), .status, (((.head_sha // .commit_sha // "") | tostring)[0:7]) ]
               | @tsv' "${all_runs}")"
+            trace "[settle] $(date -u +%FT%TZ) jq-details-done rc=$? details_bytes=${#details}"
             pending="$(printf '%s' "${details}" | grep -c . || true)"
-            echo "[settle] $(date -u +%FT%TZ) in-flight=${pending}"
+            trace "[settle] $(date -u +%FT%TZ) in-flight=${pending}"
             printf '%s\n' "${details}" | while IFS=$'\t' read -r wf st sha; do
               if [ -n "${wf}" ]; then
                 echo "  plugin_run=${wf} status=${st} sha=${sha}"
@@ -220,6 +239,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          mkdir -p out; echo "[step] $(date -u +%FT%TZ) trace-init" >> out/trace.log
           echo "[step] guard $(date -u +%FT%TZ)"
           branch_json="$(curl -fsSL --max-time 30 -H "Authorization: ${AUTH_HEADER}" "${API_BASE}/repos/${REPO}/branches/master" || true)"
           if [ -z "${branch_json}" ]; then
@@ -322,6 +342,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          mkdir -p out; echo "[step] $(date -u +%FT%TZ) trace-init" >> out/trace.log
           echo "[step] build $(date -u +%FT%TZ)"
           refresh_arg=""
           case "${WAIT_MODE}" in
@@ -352,6 +373,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          mkdir -p out; echo "[step] $(date -u +%FT%TZ) trace-init" >> out/trace.log
           echo "[step] guard2 $(date -u +%FT%TZ)"
           branch_json="$(curl -fsSL --max-time 30 -H "Authorization: ${AUTH_HEADER}" "${API_BASE}/repos/${REPO}/branches/master" || true)"
           if [ -z "${branch_json}" ]; then
@@ -431,3 +453,13 @@ jobs:
               echo "| Total size | $(jq -r '.total_size_bytes' out/plugins.json) bytes |"
             fi
           } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: 📤 Upload catalog trace
+        if: always()
+        shell: bash
+        env:
+          RELEASE_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          echo "[trace] $(date -u +%FT%TZ) uploading catalog-trace.log" >> out/trace.log || true
+          bash "${{ github.workspace }}/.gitea/scripts/publish-nightly-release-asset.sh" out/trace.log

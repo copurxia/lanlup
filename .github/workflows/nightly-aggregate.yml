@@ -113,7 +113,7 @@ jobs:
 
   mark-built:
     needs: [catalog]
-    if: github.ref == 'refs/heads/master' && needs.catalog.outputs.published == 'true'
+    if: github.ref == 'refs/heads/master' && needs.catalog.result == 'success' && needs.catalog.outputs.published == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: write
