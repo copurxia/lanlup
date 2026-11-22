@@ -164,7 +164,7 @@ jobs:
                 break
               fi
               n="$(printf '%s' "${page_json}" | jq -r '(.workflow_runs // .runs // []) | length')"
-              printf '%s' "${page_json}" | jq -c '[ (.workflow_runs // .runs // [])[] ]' >> "${all_runs}"
+              printf '%s' "${page_json}" | jq -c '(.workflow_runs // .runs // [])[]' >> "${all_runs}"
               [ "${n}" -lt "${PAGE_SIZE}" ] && break
               page=$((page + 1))
               [ "${page}" -gt 100 ] && break
@@ -176,8 +176,7 @@ jobs:
             fi
 
             failed="$(jq -s -r --arg branch master --arg sha "${GITHUB_SHA}" '
-              add
-              | [ .[]?
+              [ .[]
                   | select(((.head_branch // .prettyref // "") | tostring) == $branch)
                   | select(((.head_sha // .commit_sha // "") | tostring) == $sha)
                   | select(.status == "failure" or .status == "cancelled")
@@ -191,8 +190,7 @@ jobs:
             fi
 
             details="$(jq -s -r --arg branch master '
-              add
-              | .[]?
+              .[]
               | select(((.head_branch // .prettyref // "") | tostring) == $branch)
               | select(.status != "completed" and .status != "success" and .status != "failure" and .status != "cancelled" and .status != "skipped")
               | select((((.path // .workflow_id // "") | tostring) | test("-wasip1\\.yml$")))
@@ -202,7 +200,9 @@ jobs:
             pending="$(printf '%s' "${details}" | grep -c . || true)"
             echo "[settle] $(date -u +%FT%TZ) in-flight=${pending}"
             printf '%s\n' "${details}" | while IFS=$'\t' read -r wf st sha; do
-              [ -n "${wf}" ] && echo "  plugin_run=${wf} status=${st} sha=${sha}"
+              if [ -n "${wf}" ]; then
+                echo "  plugin_run=${wf} status=${st} sha=${sha}"
+              fi
             done
             [ "${pending}" -eq 0 ] && break
             if [ "$(date -u +%s)" -ge "${deadline}" ]; then
